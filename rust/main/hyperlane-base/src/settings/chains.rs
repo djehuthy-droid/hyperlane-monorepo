@@ -29,6 +29,8 @@ use hyperlane_ethereum::{
     EthereumReorgPeriod, EthereumValidatorAnnounceAbi,
 };
 use hyperlane_fuel as h_fuel;
+#[cfg(feature = "kaspa")]
+use hyperlane_kaspa as h_kaspa;
 use hyperlane_radix::{self as h_radix, RadixProvider};
 use hyperlane_sealevel::{
     self as h_sealevel, fallback::SealevelFallbackRpcClient, SealevelProvider, TransactionSubmitter,
@@ -182,6 +184,9 @@ pub enum ChainConnectionConf {
     /// Aleo configuration
     #[cfg(feature = "aleo")]
     Aleo(h_aleo::ConnectionConf),
+    /// Kaspa configuration (via igra-service)
+    #[cfg(feature = "kaspa")]
+    Kaspa(h_kaspa::ConnectionConf),
 }
 
 impl ChainConnectionConf {
@@ -197,6 +202,8 @@ impl ChainConnectionConf {
             Self::Radix(_) => HyperlaneDomainProtocol::Radix,
             #[cfg(feature = "aleo")]
             Self::Aleo(_) => HyperlaneDomainProtocol::Aleo,
+            #[cfg(feature = "kaspa")]
+            Self::Kaspa(_) => HyperlaneDomainProtocol::Kaspa,
         }
     }
 
@@ -284,6 +291,10 @@ impl ChainConf {
                 h_aleo::application::AleoApplicationOperationVerifier::new(),
             )
                 as Box<dyn ApplicationOperationVerifier>),
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not support application operation verifier yet"))
+            }
         };
 
         result.context(ctx)
@@ -334,6 +345,11 @@ impl ChainConf {
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
+                Ok(Box::new(provider) as Box<dyn HyperlaneProvider>)
+            }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(conf) => {
+                let provider = h_kaspa::KaspaProvider::new(self.domain.clone(), conf)?;
                 Ok(Box::new(provider) as Box<dyn HyperlaneProvider>)
             }
         }
@@ -411,6 +427,11 @@ impl ChainConf {
                 let mailbox = h_aleo::AleoMailbox::new(provider, &locator, conf);
                 Ok(Box::new(mailbox) as Box<dyn Mailbox>)
             }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(conf) => {
+                let mailbox = h_kaspa::KaspaMailbox::new(self.domain.clone(), locator.address, conf)?;
+                Ok(Box::new(mailbox) as Box<dyn Mailbox>)
+            }
         }
         .context(ctx)
     }
@@ -472,6 +493,10 @@ impl ChainConf {
                 let hook = h_aleo::AleoMerkleTreeHook::new(provider, &locator, conf)?;
 
                 Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
+            }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not use traditional MerkleTreeHook; igra-service handles this"))
             }
         }
         .context(ctx)
@@ -556,6 +581,11 @@ impl ChainConf {
 
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<HyperlaneMessage>>)
             }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(conf) => {
+                let indexer = h_kaspa::KaspaMessageIndexer::new(conf)?;
+                Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<HyperlaneMessage>>)
+            }
         }
         .context(ctx)
     }
@@ -635,6 +665,11 @@ impl ChainConf {
 
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<H256>>)
             }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(conf) => {
+                let indexer = h_kaspa::KaspaDeliveryIndexer::new(conf)?;
+                Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<H256>>)
+            }
         }
         .context(ctx)
     }
@@ -705,6 +740,10 @@ impl ChainConf {
                 let indexer = h_aleo::AleoInterchainGasIndexer::new(provider, &locator, conf)?;
 
                 Ok(Box::new(indexer) as Box<dyn InterchainGasPaymaster>)
+            }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not support InterchainGasPaymaster; gas is handled by igra-service"))
             }
         }
         .context(ctx)
@@ -780,6 +819,10 @@ impl ChainConf {
                 let indexer = h_aleo::AleoInterchainGasIndexer::new(provider, &locator, conf)?;
 
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
+            }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not support InterchainGasPayment indexing"))
             }
         }
         .context(ctx)
@@ -864,6 +907,10 @@ impl ChainConf {
 
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<MerkleTreeInsertion>>)
             }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not support MerkleTreeHook indexing; igra-service handles this"))
+            }
         }
         .context(ctx)
     }
@@ -946,6 +993,10 @@ impl ChainConf {
                     h_aleo::AleoValidatorAnnounce::new(provider, &locator, conf);
                 Ok(Box::new(validator_announce) as Box<dyn ValidatorAnnounce>)
             }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not support ValidatorAnnounce; validator configuration is done in igra-service"))
+            }
         }
         .context("Building ValidatorAnnounce")
     }
@@ -1014,6 +1065,11 @@ impl ChainConf {
                 let ism = h_aleo::AleoIsm::new(provider, &locator, conf)?;
                 Ok(Box::new(ism) as Box<dyn InterchainSecurityModule>)
             }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(conf) => {
+                let ism = h_kaspa::KaspaMultisigIsm::new(self.domain.clone(), locator.address, conf)?;
+                Ok(Box::new(ism) as Box<dyn InterchainSecurityModule>)
+            }
         }
         .context(ctx)
     }
@@ -1074,6 +1130,11 @@ impl ChainConf {
                 let ism = h_aleo::AleoIsm::new(provider, &locator, conf)?;
                 Ok(Box::new(ism) as Box<dyn MultisigIsm>)
             }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(conf) => {
+                let ism = h_kaspa::KaspaMultisigIsm::new(self.domain.clone(), locator.address, conf)?;
+                Ok(Box::new(ism) as Box<dyn MultisigIsm>)
+            }
         }
         .context(ctx)
     }
@@ -1129,6 +1190,10 @@ impl ChainConf {
                 let ism = h_aleo::AleoIsm::new(provider, &locator, conf)?;
                 Ok(Box::new(ism) as Box<dyn RoutingIsm>)
             }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not support routing ISM yet"))
+            }
         }
         .context(ctx)
     }
@@ -1180,6 +1245,10 @@ impl ChainConf {
             }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(_) => Err(eyre!("Aleo support missing")).context(ctx),
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not support aggregation ISM yet"))
+            }
         }
         .context(ctx)
     }
@@ -1219,6 +1288,10 @@ impl ChainConf {
             }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(_) => Err(eyre!("Aleo support missing")).context(ctx),
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                Err(eyre!("Kaspa does not support CCIP read ISM"))
+            }
         }
         .context(ctx)
     }
@@ -1254,6 +1327,11 @@ impl ChainConf {
                 }
                 #[cfg(feature = "aleo")]
                 ChainConnectionConf::Aleo(_) => Box::new(conf.build::<h_aleo::AleoSigner>().await?),
+                #[cfg(feature = "kaspa")]
+                ChainConnectionConf::Kaspa(_) => {
+                    // Kaspa signing is handled by igra-service, not the relayer
+                    return Err(eyre!("Kaspa signing is handled by igra-service, not external signers"));
+                }
             };
             Ok(Some(chain_signer))
         } else {

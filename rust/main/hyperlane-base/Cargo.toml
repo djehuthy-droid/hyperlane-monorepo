@@ -63,6 +63,7 @@ hyperlane-aleo = { path = "../chains/hyperlane-aleo", optional = true }
 hyperlane-ethereum = { path = "../chains/hyperlane-ethereum" }
 hyperlane-fuel = { path = "../chains/hyperlane-fuel" }
 hyperlane-cosmos = { path = "../chains/hyperlane-cosmos" }
+hyperlane-kaspa = { path = "../chains/hyperlane-kaspa", optional = true }
 hyperlane-starknet = { path = "../chains/hyperlane-starknet" }
 hyperlane-sealevel = { path = "../chains/hyperlane-sealevel" }
 hyperlane-radix = { path = "../chains/hyperlane-radix" }
@@ -89,3 +90,4 @@ oneline-eyre = ["backtrace-oneline", "backtrace"]
 oneline-errors = ["oneline-eyre"]
 test-utils = ["dep:tempfile"]
 aleo = ["dep:hyperlane-aleo"]
+kaspa = ["dep:hyperlane-kaspa"]

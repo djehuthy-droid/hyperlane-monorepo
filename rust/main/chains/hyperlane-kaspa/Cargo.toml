@@ -1,0 +1,41 @@
+[package]
+name = "hyperlane-kaspa"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hyperlane Contributors"]
+license = "Apache-2.0"
+description = "Hyperlane integration for Kaspa blockchain via igra-service"
+repository = "https://github.com/hyperlane-xyz/hyperlane-monorepo"
+
+[dependencies]
+# Hyperlane core
+hyperlane-core = { path = "../../hyperlane-core", features = ["async"] }
+
+# Async runtime
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+# HTTP client
+reqwest = { workspace = true, features = ["json"] }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+eyre = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+hex = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+
+[features]
+default = []

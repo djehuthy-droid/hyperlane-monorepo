@@ -13,6 +13,9 @@ use hyperlane_core::{config::ConfigParsingError, HyperlaneDomainProtocol, Native
 
 use hyperlane_starknet as h_starknet;
 
+#[cfg(feature = "kaspa")]
+use hyperlane_kaspa as h_kaspa;
+
 use crate::settings::envs::*;
 use crate::settings::ChainConnectionConf;
 
@@ -670,9 +673,103 @@ pub fn build_connection_conf(
         HyperlaneDomainProtocol::Aleo => {
             build_aleo_connection_conf(rpcs, chain, err, operation_batch)
         }
+        #[cfg(feature = "kaspa")]
+        HyperlaneDomainProtocol::Kaspa => {
+            build_kaspa_connection_conf(rpcs, chain, err, operation_batch)
+        }
         #[allow(unreachable_patterns)]
         _ => unreachable!("Unsupported protocol chains are pre-filtered"),
     }
+}
+
+#[cfg(feature = "kaspa")]
+pub fn build_kaspa_connection_conf(
+    rpcs: &[Url],
+    chain: &ValueParser,
+    err: &mut ConfigParsingError,
+    _operation_batch: OpSubmissionConfig,
+) -> Option<ChainConnectionConf> {
+    let mut local_err = ConfigParsingError::default();
+
+    // Get the RPC URL (igra-service URL)
+    let Some(rpc_url) = rpcs.iter().next().cloned() else {
+        local_err.push(
+            (&chain.cwp).add("rpcUrls"),
+            eyre!("Missing RPC URL for Kaspa chain"),
+        );
+        err.merge(local_err);
+        return None;
+    };
+
+    // Optional RPC token for authentication
+    let rpc_token = chain
+        .chain(&mut local_err)
+        .get_opt_key("rpcToken")
+        .parse_string()
+        .end()
+        .map(|s| s.to_string());
+
+    // Timeout in seconds (default 30)
+    let timeout_seconds = chain
+        .chain(&mut local_err)
+        .get_opt_key("timeoutSeconds")
+        .parse_u64()
+        .unwrap_or(30);
+
+    // Network prefix (e.g., "kaspa", "kaspatest")
+    let network_prefix = chain
+        .chain(&mut local_err)
+        .get_opt_key("networkPrefix")
+        .parse_string()
+        .unwrap_or("kaspa")
+        .to_string();
+
+    // Retry configuration
+    let max_retries = chain
+        .chain(&mut local_err)
+        .get_opt_key("retry")
+        .get_opt_key("maxRetries")
+        .parse_u32()
+        .unwrap_or(3);
+
+    let initial_backoff_ms = chain
+        .chain(&mut local_err)
+        .get_opt_key("retry")
+        .get_opt_key("initialBackoffMs")
+        .parse_u64()
+        .unwrap_or(1000);
+
+    let max_backoff_ms = chain
+        .chain(&mut local_err)
+        .get_opt_key("retry")
+        .get_opt_key("maxBackoffMs")
+        .parse_u64()
+        .unwrap_or(10000);
+
+    let backoff_multiplier = chain
+        .chain(&mut local_err)
+        .get_opt_key("retry")
+        .get_opt_key("backoffMultiplier")
+        .parse_f64()
+        .unwrap_or(2.0);
+
+    if !local_err.is_ok() {
+        err.merge(local_err);
+        return None;
+    }
+
+    Some(ChainConnectionConf::Kaspa(h_kaspa::ConnectionConf {
+        rpc_url,
+        rpc_token,
+        timeout_seconds,
+        network_prefix,
+        retry_config: h_kaspa::RetryConfig {
+            max_retries,
+            initial_backoff_ms,
+            max_backoff_ms,
+            backoff_multiplier,
+        },
+    }))
 }
 
 /// Check if a protocol is supported in this build.
@@ -683,5 +780,7 @@ pub fn is_protocol_supported(protocol: HyperlaneDomainProtocol) -> bool {
         Ethereum | Fuel | Sealevel | Cosmos | CosmosNative | Starknet | Radix => true,
         // Aleo is feature-gated - only supported when the "aleo" feature is enabled
         Aleo => cfg!(feature = "aleo"),
+        // Kaspa is feature-gated - only supported when the "kaspa" feature is enabled
+        Kaspa => cfg!(feature = "kaspa"),
     }
 }

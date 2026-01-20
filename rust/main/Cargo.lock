@@ -5948,6 +5948,7 @@ dependencies = [
  "hyperlane-cosmos",
  "hyperlane-ethereum",
  "hyperlane-fuel",
+ "hyperlane-kaspa",
  "hyperlane-metric",
  "hyperlane-operation-verifier",
  "hyperlane-radix",
@@ -6162,6 +6163,25 @@ dependencies = [
  "thiserror 1.0.63",
  "tracing",
  "tracing-futures",
+ "url",
+]
+
+[[package]]
+name = "hyperlane-kaspa"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "eyre",
+ "hex 0.4.3",
+ "hyperlane-core",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "sha2 0.10.8",
+ "thiserror 1.0.63",
+ "tokio",
+ "tokio-test",
+ "tracing",
  "url",
 ]
 

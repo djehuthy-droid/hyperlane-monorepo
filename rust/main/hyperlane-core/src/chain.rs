@@ -383,6 +383,8 @@ pub enum HyperlaneDomainProtocol {
     Radix,
     /// Aleo chain
     Aleo,
+    /// A Kaspa-based chain type which uses hyperlane-kaspa (via igra-service).
+    Kaspa,
 }
 
 impl HyperlaneDomainProtocol {
@@ -721,7 +723,7 @@ impl HyperlaneDomain {
         let protocol = self.domain_protocol();
         match protocol {
             Ethereum | Cosmos | CosmosNative | Starknet => IndexMode::Block,
-            Fuel | Sealevel | Radix | Aleo => IndexMode::Sequence,
+            Fuel | Sealevel | Radix | Aleo | Kaspa => IndexMode::Sequence,
         }
     }
 }
