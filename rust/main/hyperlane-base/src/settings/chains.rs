@@ -45,6 +45,22 @@ use crate::{
 
 use super::ChainSigner;
 
+#[cfg(feature = "kaspa")]
+#[derive(Debug, Default)]
+struct AllowAllApplicationOperationVerifier;
+
+#[cfg(feature = "kaspa")]
+#[async_trait]
+impl ApplicationOperationVerifier for AllowAllApplicationOperationVerifier {
+    async fn verify(
+        &self,
+        _app_context: &Option<String>,
+        _message: &HyperlaneMessage,
+    ) -> Option<hyperlane_operation_verifier::ApplicationOperationVerifierReport> {
+        None
+    }
+}
+
 /// A trait for converting to a type from a chain configuration with metrics
 #[async_trait]
 pub trait TryFromWithMetrics<T>: Sized {
@@ -293,7 +309,7 @@ impl ChainConf {
                 as Box<dyn ApplicationOperationVerifier>),
             #[cfg(feature = "kaspa")]
             ChainConnectionConf::Kaspa(_) => {
-                Err(eyre!("Kaspa does not support application operation verifier yet"))
+                Ok(Box::new(AllowAllApplicationOperationVerifier) as Box<dyn ApplicationOperationVerifier>)
             }
         };
 
