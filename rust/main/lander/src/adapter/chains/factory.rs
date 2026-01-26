@@ -65,6 +65,7 @@ impl AdapterFactory {
                 let adapter = AleoAdapter::from_conf(conf, core_metrics, &connection_conf)?;
                 Arc::new(adapter)
             }
+            other => return Err(eyre::eyre!("unsupported chain connection protocol={:?}", other.protocol())),
         };
         Ok(adapter)
     }
