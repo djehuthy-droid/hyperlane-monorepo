@@ -344,8 +344,29 @@ impl BaseAgent for Relayer {
             let db = match self.origins.get(dest_domain) {
                 Some(origin) => origin.database.clone(),
                 None => {
-                    tracing::error!(domain=?dest_domain.name(), "DB missing");
-                    continue;
+                    // NOTE (Kaspa devnet): Kaspa is currently supported as a *destination-only*
+                    // chain in our local IGRA setup (EVM -> Kaspa). It does not implement the full
+                    // "origin" indexing surface that the relayer expects (e.g. `ValidatorAnnounce`
+                    // contract + MerkleTreeHook event stream), so building `Origin` for Kaspa
+                    // fails by design.
+                    //
+                    // The destination processor does not rely on those origin capabilities; it
+                    // only needs its own destination-scoped DB + mailbox processing entrypoint.
+                    // For Kaspa destinations, fall back to the destination DB to allow message
+                    // processing to start.
+                    //
+                    // Security: This does not relax verification semantics. It only changes where
+                    // the destination processor persists its pending-operations state.
+                    if dest_domain.domain_protocol() == HyperlaneDomainProtocol::Kaspa {
+                        tracing::warn!(
+                            domain = ?dest_domain.name(),
+                            "Origin DB missing for Kaspa destination; using destination-scoped DB"
+                        );
+                        destination.database.clone()
+                    } else {
+                        tracing::error!(domain = ?dest_domain.name(), "DB missing");
+                        continue;
+                    }
                 }
             };
 
