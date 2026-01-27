@@ -32,8 +32,8 @@ use hyperlane_base::{
 };
 use hyperlane_core::{
     rpc_clients::call_and_retry_n_times, ChainCommunicationError, ChainResult, ContractSyncCursor,
-    HyperlaneDomain, HyperlaneMessage, InterchainGasPayment, MerkleTreeInsertion, PendingOperation,
-    QueueOperation, H512, U256,
+    HyperlaneDomain, HyperlaneDomainProtocol, HyperlaneMessage, InterchainGasPayment,
+    MerkleTreeInsertion, PendingOperation, QueueOperation, H512, U256,
 };
 use lander::{CommandEntrypoint, DispatcherMetrics};
 
