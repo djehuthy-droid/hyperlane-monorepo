@@ -7,14 +7,15 @@ use ethers::prelude::Selector;
 use ethers_prometheus::middleware::{ContractInfo, PrometheusMiddlewareConf};
 use eyre::{eyre, Context, Report, Result};
 use serde_json::Value;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use hyperlane_core::{
     config::OpSubmissionConfig, AggregationIsm, CcipReadIsm, ChainResult, ContractLocator,
     HyperlaneAbi, HyperlaneDomain, HyperlaneDomainProtocol, HyperlaneMessage, HyperlaneProvider,
-    IndexMode, InterchainGasPaymaster, InterchainGasPayment, InterchainSecurityModule, Mailbox,
-    MerkleTreeHook, MerkleTreeInsertion, MultisigIsm, ReorgPeriod, RoutingIsm,
-    SequenceAwareIndexer, SubmitterType, ValidatorAnnounce, H256,
+    IndexMode, Indexer, InterchainGasPaymaster, InterchainGasPayment, InterchainSecurityModule,
+    Mailbox, MerkleTreeHook, MerkleTreeInsertion, MultisigIsm, NativeToken, ReorgPeriod,
+    RoutingIsm, SameChainCcrSwap, SequenceAwareIndexer, SubmitterType, ValidatorAnnounce, H160,
+    H256,
 };
 use hyperlane_metric::prometheus_metric::ChainInfo;
 use hyperlane_operation_verifier::ApplicationOperationVerifier;
@@ -28,7 +29,6 @@ use hyperlane_ethereum::{
     self as h_eth, BuildableWithProvider, EthereumInterchainGasPaymasterAbi, EthereumMailboxAbi,
     EthereumReorgPeriod, EthereumValidatorAnnounceAbi,
 };
-use hyperlane_fuel as h_fuel;
 #[cfg(feature = "kaspa")]
 use hyperlane_kaspa as h_kaspa;
 use hyperlane_radix::{self as h_radix, RadixProvider};
@@ -36,6 +36,7 @@ use hyperlane_sealevel::{
     self as h_sealevel, fallback::SealevelFallbackRpcClient, SealevelProvider, TransactionSubmitter,
 };
 use hyperlane_starknet::{self as h_starknet, StarknetProvider};
+use hyperlane_tron::{self as h_tron, TronProvider};
 
 use crate::{
     metrics::AgentMetricsConf,
@@ -92,6 +93,10 @@ pub struct ChainConf {
     pub domain: HyperlaneDomain,
     /// Signer configuration for this chain
     pub signer: Option<SignerConf>,
+    /// Identity keypair used as the relayer's on-chain identity (e.g. for TrustedRelayer ISMs).
+    /// Only valid for Sealevel chains — an error is returned if set on other protocols.
+    /// Falls back to `signer` if not set.
+    pub identity: Option<SignerConf>,
     /// Submitter type for this chain
     pub submitter: SubmitterType,
     /// The estimated block time, i.e. the average time the next block is added to the chain
@@ -108,9 +113,15 @@ pub struct ChainConf {
     pub metrics_conf: PrometheusMiddlewareConf,
     /// Settings for event indexing
     pub index: IndexSettings,
+    /// Number of blocks to wait before considering a transaction confirmed
+    pub confirmations: u32,
+    /// The chain ID (may differ from domain ID, e.g. Cosmos string chain IDs)
+    pub chain_id: String,
     /// Whether to ignore reorg reports from this chain
     /// when it is the origin of a message.
     pub ignore_reorg_reports: bool,
+    /// The native token denomination and decimal places
+    pub native_token: NativeToken,
 }
 
 /// A sequence-aware indexer for messages
@@ -185,8 +196,6 @@ impl TryFromWithMetrics<ChainConf> for MerkleTreeHookIndexer {
 pub enum ChainConnectionConf {
     /// Ethereum configuration
     Ethereum(h_eth::ConnectionConf),
-    /// Fuel configuration
-    Fuel(h_fuel::ConnectionConf),
     /// Sealevel configuration.
     Sealevel(h_sealevel::ConnectionConf),
     /// Cosmos configuration.
@@ -200,6 +209,8 @@ pub enum ChainConnectionConf {
     /// Aleo configuration
     #[cfg(feature = "aleo")]
     Aleo(h_aleo::ConnectionConf),
+    /// Tron configuration
+    Tron(h_tron::ConnectionConf),
     /// Kaspa configuration (via igra-service)
     #[cfg(feature = "kaspa")]
     Kaspa(h_kaspa::ConnectionConf),
@@ -210,12 +221,12 @@ impl ChainConnectionConf {
     pub fn protocol(&self) -> HyperlaneDomainProtocol {
         match self {
             Self::Ethereum(_) => HyperlaneDomainProtocol::Ethereum,
-            Self::Fuel(_) => HyperlaneDomainProtocol::Fuel,
             Self::Sealevel(_) => HyperlaneDomainProtocol::Sealevel,
             Self::Cosmos(_) => HyperlaneDomainProtocol::Cosmos,
             Self::Starknet(_) => HyperlaneDomainProtocol::Starknet,
             Self::CosmosNative(_) => HyperlaneDomainProtocol::CosmosNative,
             Self::Radix(_) => HyperlaneDomainProtocol::Radix,
+            Self::Tron(_) => HyperlaneDomainProtocol::Tron,
             #[cfg(feature = "aleo")]
             Self::Aleo(_) => HyperlaneDomainProtocol::Aleo,
             #[cfg(feature = "kaspa")]
@@ -249,7 +260,7 @@ pub struct CoreContractAddresses {
 }
 
 /// Indexing settings
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct IndexSettings {
     /// The height at which to start indexing contracts for watermark synchs.
     /// The lowest sequence to index for sequence-aware synchs.
@@ -258,6 +269,28 @@ pub struct IndexSettings {
     pub chunk_size: u32,
     /// The indexing mode.
     pub mode: IndexMode,
+    /// How long a cursor sleeps when it's caught up and has nothing new to
+    /// index. Defaults to 5s, overridable via `index.interval` (seconds) in
+    /// the chain config.
+    pub idle_sleep_duration: Duration,
+    /// The raw `index.interval` as explicitly configured, if any. `None` means the chain didn't
+    /// set it, distinct from `idle_sleep_duration` (which always has the 5s default baked in) -
+    /// callers that need to distinguish "operator opted into a faster/slower poll" from "using
+    /// the default" (e.g. the rate-limited cursor's near-tip tip-refresh throttle, which
+    /// otherwise defaults to 30s) should use this instead.
+    pub configured_interval: Option<Duration>,
+}
+
+impl Default for IndexSettings {
+    fn default() -> Self {
+        Self {
+            from: 0,
+            chunk_size: 0,
+            mode: IndexMode::default(),
+            idle_sleep_duration: Duration::from_secs(5),
+            configured_interval: None,
+        }
+    }
 }
 
 impl ChainConf {
@@ -278,7 +311,10 @@ impl ChainConf {
                 h_eth::application::EthereumApplicationOperationVerifier::new(),
             )
                 as Box<dyn ApplicationOperationVerifier>),
-            ChainConnectionConf::Fuel(_) => todo!(),
+            ChainConnectionConf::Tron(_conf) => Ok(Box::new(
+                h_eth::application::EthereumApplicationOperationVerifier::new(),
+            )
+                as Box<dyn ApplicationOperationVerifier>),
             ChainConnectionConf::Sealevel(conf) => {
                 let provider =
                     Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
@@ -308,9 +344,8 @@ impl ChainConf {
             )
                 as Box<dyn ApplicationOperationVerifier>),
             #[cfg(feature = "kaspa")]
-            ChainConnectionConf::Kaspa(_) => {
-                Ok(Box::new(AllowAllApplicationOperationVerifier) as Box<dyn ApplicationOperationVerifier>)
-            }
+            ChainConnectionConf::Kaspa(_) => Ok(Box::new(AllowAllApplicationOperationVerifier)
+                as Box<dyn ApplicationOperationVerifier>),
         };
 
         result.context(ctx)
@@ -328,7 +363,6 @@ impl ChainConf {
                 self.build_ethereum(conf, &locator, metrics, h_eth::HyperlaneProviderBuilder {})
                     .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let provider = build_sealevel_provider(
                     self,
@@ -358,6 +392,10 @@ impl ChainConf {
                 let provider = build_radix_provider(self, conf, metrics, &locator, None)?;
                 Ok(Box::new(provider) as Box<dyn HyperlaneProvider>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                Ok(Box::new(provider) as Box<dyn HyperlaneProvider>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -372,9 +410,26 @@ impl ChainConf {
         .context(ctx)
     }
 
+    /// Validate mailbox configuration before constructing providers or signers.
+    pub fn validate_mailbox_config(&self) -> Result<()> {
+        if self.identity.is_some()
+            && self.connection.protocol() != HyperlaneDomainProtocol::Sealevel
+        {
+            return Err(eyre!(
+                "'identity' is only supported for Sealevel chains, but chain '{}' uses protocol '{:?}'",
+                self.domain.name(),
+                self.connection.protocol()
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Try to convert the chain setting into a Mailbox contract
     pub async fn build_mailbox(&self, metrics: &CoreMetrics) -> Result<Box<dyn Mailbox>> {
         let ctx = "Building mailbox";
+        self.validate_mailbox_config()?;
+
         let locator = self.locator(self.addresses.mailbox);
 
         match &self.connection {
@@ -382,15 +437,9 @@ impl ChainConf {
                 self.build_ethereum(conf, &locator, metrics, h_eth::MailboxBuilder {})
                     .await
             }
-            ChainConnectionConf::Fuel(conf) => {
-                let wallet = self.fuel_signer().await.context(ctx)?;
-                hyperlane_fuel::FuelMailbox::new(conf, locator, wallet)
-                    .await
-                    .map(|m| Box::new(m) as Box<dyn Mailbox>)
-                    .map_err(Into::into)
-            }
             ChainConnectionConf::Sealevel(conf) => {
                 let keypair = self.sealevel_signer().await.context(ctx)?;
+                let identity_keypair = self.sealevel_identity_signer().await.context(ctx)?;
 
                 let provider =
                     Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
@@ -403,6 +452,7 @@ impl ChainConf {
                     conf,
                     &locator,
                     keypair.map(h_sealevel::SealevelKeypair::new),
+                    identity_keypair.map(h_sealevel::SealevelKeypair::new),
                 )
                 .map(|m| Box::new(m) as Box<dyn Mailbox>)
                 .map_err(Into::into)
@@ -436,6 +486,12 @@ impl ChainConf {
                 let mailbox = h_radix::RadixMailbox::new(provider, &locator, conf)?;
                 Ok(Box::new(mailbox) as Box<dyn Mailbox>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let signer = self.tron_signer().await.context(ctx)?;
+                let provider = build_tron_provider(self, conf, metrics, &locator, signer)?;
+                let mailbox = h_tron::TronMailbox::new(provider, &locator);
+                Ok(Box::new(mailbox) as Box<dyn Mailbox>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let signer = self.aleo_signer().await?;
@@ -445,7 +501,8 @@ impl ChainConf {
             }
             #[cfg(feature = "kaspa")]
             ChainConnectionConf::Kaspa(conf) => {
-                let mailbox = h_kaspa::KaspaMailbox::new(self.domain.clone(), locator.address, conf)?;
+                let mailbox =
+                    h_kaspa::KaspaMailbox::new(self.domain.clone(), locator.address, conf)?;
                 Ok(Box::new(mailbox) as Box<dyn Mailbox>)
             }
         }
@@ -465,16 +522,13 @@ impl ChainConf {
                 self.build_ethereum(conf, &locator, metrics, h_eth::MerkleTreeHookBuilder {})
                     .await
             }
-            ChainConnectionConf::Fuel(_conf) => {
-                todo!("Fuel does not support merkle tree hooks yet")
-            }
             ChainConnectionConf::Sealevel(conf) => {
                 let provider =
                     Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
                 let tx_submitter =
                     build_sealevel_tx_submitter(&provider, self, conf, &locator, metrics);
 
-                h_sealevel::SealevelMailbox::new(provider, tx_submitter, conf, &locator, None)
+                h_sealevel::SealevelMailbox::new(provider, tx_submitter, conf, &locator, None, None)
                     .map(|m| Box::new(m) as Box<dyn MerkleTreeHook>)
                     .map_err(Into::into)
             }
@@ -503,6 +557,12 @@ impl ChainConf {
 
                 Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let hook = h_tron::TronMerkleTreeHook::new(provider, &locator);
+
+                Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -511,9 +571,9 @@ impl ChainConf {
                 Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
             }
             #[cfg(feature = "kaspa")]
-            ChainConnectionConf::Kaspa(_) => {
-                Err(eyre!("Kaspa does not use traditional MerkleTreeHook; igra-service handles this"))
-            }
+            ChainConnectionConf::Kaspa(_) => Err(eyre!(
+                "Kaspa does not use traditional MerkleTreeHook; igra-service handles this"
+            )),
         }
         .context(ctx)
     }
@@ -539,7 +599,6 @@ impl ChainConf {
                 )
                 .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let provider =
                     Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
@@ -590,6 +649,12 @@ impl ChainConf {
 
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<HyperlaneMessage>>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let indexer = h_tron::TronMailboxIndexer::new(provider, &locator);
+
+                Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<HyperlaneMessage>>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -627,7 +692,6 @@ impl ChainConf {
                 )
                 .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let provider =
                     Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
@@ -674,6 +738,12 @@ impl ChainConf {
 
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<H256>>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let indexer = h_tron::TronMailboxIndexer::new(provider, &locator);
+
+                Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<H256>>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -709,7 +779,6 @@ impl ChainConf {
                 )
                 .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let provider =
                     Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
@@ -750,6 +819,12 @@ impl ChainConf {
                 )?);
                 Ok(indexer as Box<dyn InterchainGasPaymaster>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let paymaster =
+                    Box::new(h_tron::TronInterchainGasPaymaster::new(provider, &locator));
+                Ok(paymaster as Box<dyn InterchainGasPaymaster>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -758,9 +833,9 @@ impl ChainConf {
                 Ok(Box::new(indexer) as Box<dyn InterchainGasPaymaster>)
             }
             #[cfg(feature = "kaspa")]
-            ChainConnectionConf::Kaspa(_) => {
-                Err(eyre!("Kaspa does not support InterchainGasPaymaster; gas is handled by igra-service"))
-            }
+            ChainConnectionConf::Kaspa(_) => Err(eyre!(
+                "Kaspa does not support InterchainGasPaymaster; gas is handled by igra-service"
+            )),
         }
         .context(ctx)
     }
@@ -789,7 +864,6 @@ impl ChainConf {
                 )
                 .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let provider =
                     Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
@@ -811,8 +885,13 @@ impl ChainConf {
                 ));
                 Ok(indexer as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
             }
-            ChainConnectionConf::Starknet(_) => {
-                let indexer = Box::new(h_starknet::StarknetInterchainGasPaymasterIndexer {});
+            ChainConnectionConf::Starknet(conf) => {
+                let provider = build_starknet_provider(self, conf, metrics, &locator)?;
+                let indexer = Box::new(h_starknet::StarknetInterchainGasPaymasterIndexer::new(
+                    provider,
+                    locator.address,
+                    &self.reorg_period,
+                )?);
                 Ok(indexer as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
             }
             ChainConnectionConf::CosmosNative(conf) => {
@@ -829,6 +908,11 @@ impl ChainConf {
                 )?);
                 Ok(indexer as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let indexer = Box::new(h_tron::TronInterchainGasPaymaster::new(provider, &locator));
+                Ok(indexer as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -837,11 +921,52 @@ impl ChainConf {
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
             }
             #[cfg(feature = "kaspa")]
-            ChainConnectionConf::Kaspa(_) => {
-                Err(eyre!("Kaspa does not support InterchainGasPayment indexing"))
-            }
+            ChainConnectionConf::Kaspa(_) => Err(eyre!(
+                "Kaspa does not support InterchainGasPayment indexing"
+            )),
         }
         .context(ctx)
+    }
+
+    /// Build a CCR same-chain swap indexer for EVM chains.
+    /// Only supported for Ethereum connections; returns `Ok(None)` for other chain types.
+    pub async fn build_ccr_swap_indexer(
+        &self,
+        metrics: &CoreMetrics,
+        local_domain: u32,
+        ccr_to_erc20: std::collections::HashMap<H160, H160>,
+    ) -> Result<Option<Box<dyn Indexer<SameChainCcrSwap>>>> {
+        let ctx = "Building CCR swap indexer";
+        // Use a zero address as the locator — CcrSwapIndexer uses ccr_to_erc20 keys instead.
+        let locator = self.locator(H256::zero());
+
+        match &self.connection {
+            ChainConnectionConf::Ethereum(conf) => {
+                let reorg_period =
+                    EthereumReorgPeriod::try_from(&self.reorg_period).context(ctx)?;
+                let indexer = self
+                    .build_ethereum(
+                        conf,
+                        &locator,
+                        metrics,
+                        h_eth::CcrSwapIndexerBuilder {
+                            local_domain,
+                            ccr_to_erc20,
+                            reorg_period,
+                        },
+                    )
+                    .await
+                    .context(ctx)?;
+                Ok(Some(indexer))
+            }
+            _ => {
+                warn!(
+                    domain = %self.domain.name(),
+                    "CCR swap indexer is only supported for Ethereum chains; skipping"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Try to convert the chain settings into a merkle tree hook indexer
@@ -865,7 +990,6 @@ impl ChainConf {
                 )
                 .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let provider =
                     Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
@@ -916,6 +1040,11 @@ impl ChainConf {
                 )?);
                 Ok(indexer as Box<dyn SequenceAwareIndexer<MerkleTreeInsertion>>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let indexer = Box::new(h_tron::TronMerkleTreeHookIndexer::new(provider, &locator));
+                Ok(indexer as Box<dyn SequenceAwareIndexer<MerkleTreeInsertion>>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -924,11 +1053,30 @@ impl ChainConf {
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<MerkleTreeInsertion>>)
             }
             #[cfg(feature = "kaspa")]
-            ChainConnectionConf::Kaspa(_) => {
-                Err(eyre!("Kaspa does not support MerkleTreeHook indexing; igra-service handles this"))
-            }
+            ChainConnectionConf::Kaspa(_) => Err(eyre!(
+                "Kaspa does not support MerkleTreeHook indexing; igra-service handles this"
+            )),
         }
         .context(ctx)
+    }
+
+    /// Build an announcement reader without Ethereum transaction middleware.
+    pub async fn build_validator_announce_reader(
+        &self,
+        metrics: &CoreMetrics,
+    ) -> Result<Box<dyn ValidatorAnnounce>> {
+        if let ChainConnectionConf::Ethereum(conf) = &self.connection {
+            let locator = self.locator(self.addresses.validator_announce);
+            self.build_ethereum(
+                conf,
+                &locator,
+                metrics,
+                h_eth::ValidatorAnnounceReaderBuilder {},
+            )
+            .await
+        } else {
+            self.build_validator_announce(metrics).await
+        }
     }
 
     /// Try to convert the chain settings into a ValidatorAnnounce
@@ -943,7 +1091,6 @@ impl ChainConf {
                 self.build_ethereum(conf, &locator, metrics, h_eth::ValidatorAnnounceBuilder {})
                     .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let signer = self.sealevel_signer().await.context(ctx)?;
                 let provider =
@@ -1001,6 +1148,12 @@ impl ChainConf {
                     h_radix::RadixValidatorAnnounce::new(provider, &locator, conf)?;
                 Ok(Box::new(validator_announce) as Box<dyn ValidatorAnnounce>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let signer = self.tron_signer().await.context(ctx)?;
+                let provider = build_tron_provider(self, conf, metrics, &locator, signer)?;
+                let validator_announce = h_tron::TronValidatorAnnounce::new(provider, &locator);
+                Ok(Box::new(validator_announce) as Box<dyn ValidatorAnnounce>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let signer = self.aleo_signer().await?;
@@ -1037,7 +1190,6 @@ impl ChainConf {
                 )
                 .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let keypair = self.sealevel_signer().await.context(ctx)?;
                 let provider =
@@ -1075,6 +1227,12 @@ impl ChainConf {
                 let ism = h_radix::RadixIsm::new(provider, &locator, conf)?;
                 Ok(Box::new(ism) as Box<dyn InterchainSecurityModule>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let signer = self.tron_signer().await.context(ctx)?;
+                let provider = build_tron_provider(self, conf, metrics, &locator, signer)?;
+                let ism = h_tron::TronInterchainSecurityModule::new(provider, &locator);
+                Ok(Box::new(ism) as Box<dyn InterchainSecurityModule>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -1083,7 +1241,8 @@ impl ChainConf {
             }
             #[cfg(feature = "kaspa")]
             ChainConnectionConf::Kaspa(conf) => {
-                let ism = h_kaspa::KaspaMultisigIsm::new(self.domain.clone(), locator.address, conf)?;
+                let ism =
+                    h_kaspa::KaspaMultisigIsm::new(self.domain.clone(), locator.address, conf)?;
                 Ok(Box::new(ism) as Box<dyn InterchainSecurityModule>)
             }
         }
@@ -1104,7 +1263,6 @@ impl ChainConf {
                 self.build_ethereum(conf, &locator, metrics, h_eth::MultisigIsmBuilder {})
                     .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(conf) => {
                 let keypair = self.sealevel_signer().await.context(ctx)?;
                 let provider =
@@ -1140,6 +1298,11 @@ impl ChainConf {
                 let ism = h_radix::RadixIsm::new(provider, &locator, conf)?;
                 Ok(Box::new(ism) as Box<dyn MultisigIsm>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let ism = h_tron::TronMultisigIsm::new(provider, &locator);
+                Ok(Box::new(ism) as Box<dyn MultisigIsm>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -1148,11 +1311,40 @@ impl ChainConf {
             }
             #[cfg(feature = "kaspa")]
             ChainConnectionConf::Kaspa(conf) => {
-                let ism = h_kaspa::KaspaMultisigIsm::new(self.domain.clone(), locator.address, conf)?;
+                let ism =
+                    h_kaspa::KaspaMultisigIsm::new(self.domain.clone(), locator.address, conf)?;
                 Ok(Box::new(ism) as Box<dyn MultisigIsm>)
             }
         }
         .context(ctx)
+    }
+
+    /// Creates a [`h_sealevel::SealevelCompositeIsm`] for a composite ISM program.
+    ///
+    /// Only valid for Sealevel chains; returns an error for all others.
+    pub async fn build_sealevel_composite_ism(
+        &self,
+        address: H256,
+        metrics: &CoreMetrics,
+    ) -> Result<h_sealevel::SealevelCompositeIsm> {
+        let ctx = "Building Sealevel composite ISM";
+        let locator = self.locator(address);
+
+        match &self.connection {
+            ChainConnectionConf::Sealevel(conf) => {
+                let keypair = self.sealevel_signer().await.context(ctx)?;
+                let identity_keypair = self.sealevel_identity_signer().await.context(ctx)?;
+                let provider =
+                    Arc::new(build_sealevel_provider(self, &locator, &[], conf, metrics));
+                Ok(h_sealevel::SealevelCompositeIsm::new(
+                    provider,
+                    locator,
+                    keypair.map(h_sealevel::SealevelKeypair::new),
+                    identity_keypair.map(h_sealevel::SealevelKeypair::new),
+                ))
+            }
+            _ => eyre::bail!("SealevelCompositeIsm is only supported on Sealevel chains"),
+        }
     }
 
     /// Try to convert the chain setting into a RoutingIsm Ism contract
@@ -1172,7 +1364,6 @@ impl ChainConf {
                 self.build_ethereum(conf, &locator, metrics, h_eth::RoutingIsmBuilder {})
                     .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(_) => {
                 Err(eyre!("Sealevel does not support routing ISM yet")).context(ctx)
             }
@@ -1200,6 +1391,11 @@ impl ChainConf {
                 let ism = h_radix::RadixIsm::new(provider, &locator, conf)?;
                 Ok(Box::new(ism) as Box<dyn RoutingIsm>)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let ism = h_tron::TronRoutingIsm::new(provider, &locator);
+                Ok(Box::new(ism) as Box<dyn RoutingIsm>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -1207,9 +1403,7 @@ impl ChainConf {
                 Ok(Box::new(ism) as Box<dyn RoutingIsm>)
             }
             #[cfg(feature = "kaspa")]
-            ChainConnectionConf::Kaspa(_) => {
-                Err(eyre!("Kaspa does not support routing ISM yet"))
-            }
+            ChainConnectionConf::Kaspa(_) => Err(eyre!("Kaspa does not support routing ISM yet")),
         }
         .context(ctx)
     }
@@ -1231,7 +1425,6 @@ impl ChainConf {
                 self.build_ethereum(conf, &locator, metrics, h_eth::AggregationIsmBuilder {})
                     .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(_) => {
                 Err(eyre!("Sealevel does not support aggregation ISM yet")).context(ctx)
             }
@@ -1258,6 +1451,11 @@ impl ChainConf {
             }
             ChainConnectionConf::Radix(_) => {
                 todo!("Radix aggregation ISM not yet implemented")
+            }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let ism = h_tron::TronAggregationIsm::new(provider, &locator);
+                Ok(Box::new(ism) as Box<dyn AggregationIsm>)
             }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(_) => Err(eyre!("Aleo support missing")).context(ctx),
@@ -1286,7 +1484,6 @@ impl ChainConf {
                 self.build_ethereum(conf, &locator, metrics, h_eth::CcipReadIsmBuilder {})
                     .await
             }
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(_) => {
                 Err(eyre!("Sealevel does not support CCIP read ISM yet")).context(ctx)
             }
@@ -1302,12 +1499,15 @@ impl ChainConf {
             ChainConnectionConf::Radix(_) => {
                 Err(eyre!("Radix does not support CCIP read ISM yet")).context(ctx)
             }
+            ChainConnectionConf::Tron(conf) => {
+                let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                let ism = h_tron::TronCcipReadIsm::new(provider, &locator);
+                Ok(Box::new(ism) as Box<dyn CcipReadIsm>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(_) => Err(eyre!("Aleo support missing")).context(ctx),
             #[cfg(feature = "kaspa")]
-            ChainConnectionConf::Kaspa(_) => {
-                Err(eyre!("Kaspa does not support CCIP read ISM"))
-            }
+            ChainConnectionConf::Kaspa(_) => Err(eyre!("Kaspa does not support CCIP read ISM")),
         }
         .context(ctx)
     }
@@ -1326,9 +1526,6 @@ impl ChainConf {
         if let Some(conf) = &self.signer {
             let chain_signer: Box<dyn ChainSigner> = match &self.connection {
                 ChainConnectionConf::Ethereum(_) => Box::new(conf.build::<h_eth::Signers>().await?),
-                ChainConnectionConf::Fuel(_) => {
-                    Box::new(conf.build::<fuels::prelude::WalletUnlocked>().await?)
-                }
                 ChainConnectionConf::Sealevel(_) => {
                     Box::new(conf.build::<h_sealevel::Keypair>().await?)
                 }
@@ -1341,12 +1538,15 @@ impl ChainConf {
                 ChainConnectionConf::Radix(_) => {
                     Box::new(conf.build::<h_radix::RadixSigner>().await?)
                 }
+                ChainConnectionConf::Tron(_) => Box::new(conf.build::<h_tron::TronSigner>().await?),
                 #[cfg(feature = "aleo")]
                 ChainConnectionConf::Aleo(_) => Box::new(conf.build::<h_aleo::AleoSigner>().await?),
                 #[cfg(feature = "kaspa")]
                 ChainConnectionConf::Kaspa(_) => {
                     // Kaspa signing is handled by igra-service, not the relayer
-                    return Err(eyre!("Kaspa signing is handled by igra-service, not external signers"));
+                    return Err(eyre!(
+                        "Kaspa signing is handled by igra-service, not external signers"
+                    ));
                 }
             };
             Ok(Some(chain_signer))
@@ -1360,14 +1560,23 @@ impl ChainConf {
         self.signer().await
     }
 
-    async fn fuel_signer(&self) -> Result<fuels::prelude::WalletUnlocked> {
-        self.signer().await.and_then(|opt| {
-            opt.ok_or_else(|| eyre!("Fuel requires a signer to construct contract instances"))
-        })
-    }
-
     async fn sealevel_signer(&self) -> Result<Option<h_sealevel::Keypair>> {
         self.signer().await
+    }
+
+    /// Returns the identity keypair for Sealevel chains — the relayer's on-chain identity used
+    /// e.g. by TrustedRelayer ISMs.
+    ///
+    /// Returns `None` when `identity` is not configured.  Callers that need a fallback (e.g.
+    /// `SealevelMailbox`) handle the None case themselves.  This matches the lander path in
+    /// `create_identity_keypair`: both return None when identity is absent, so the two paths
+    /// always agree on whether a distinct identity key is in use.
+    async fn sealevel_identity_signer(&self) -> Result<Option<h_sealevel::Keypair>> {
+        if let Some(conf) = &self.identity {
+            Ok(Some(conf.build::<h_sealevel::Keypair>().await?))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn cosmos_signer(&self) -> Result<Option<h_cosmos::Signer>> {
@@ -1387,6 +1596,10 @@ impl ChainConf {
         self.signer().await
     }
 
+    async fn tron_signer(&self) -> Result<Option<h_tron::TronSigner>> {
+        self.signer().await
+    }
+
     /// Try to build an agent metrics configuration from the chain config
     pub async fn agent_metrics_conf(&self, agent_name: String) -> Result<AgentMetricsConf> {
         let chain_signer_address = self.chain_signer().await?.map(|s| s.address_string());
@@ -1394,6 +1607,11 @@ impl ChainConf {
             address: chain_signer_address,
             domain: self.domain.clone(),
             name: agent_name,
+            reorg_period: self.reorg_period.clone(),
+            estimated_block_time: self.estimated_block_time,
+            confirmations: self.confirmations,
+            chain_id: self.chain_id.clone(),
+            native_token: self.native_token.clone(),
         })
     }
 
@@ -1463,7 +1681,7 @@ impl ChainConf {
         B: BuildableWithProvider + Sync,
     {
         let mut signer = None;
-        if B::NEEDS_SIGNER {
+        if B::SIGNER_REQUIREMENT != h_eth::SignerRequirement::None {
             signer = self.ethereum_signer().await?;
         }
         let metrics_conf = self.metrics_conf();
@@ -1482,7 +1700,7 @@ impl ChainConf {
 /// Helper to build a sealevel provider
 fn build_sealevel_provider(
     chain_conf: &ChainConf,
-    locator: &ContractLocator,
+    locator: &ContractLocator<'_>,
     contract_addresses: &[H256],
     conf: &h_sealevel::ConnectionConf,
     metrics: &CoreMetrics,
@@ -1492,7 +1710,12 @@ fn build_sealevel_provider(
 
     let chain = middleware_metrics.chain.clone();
     let urls = conf.urls.clone();
-    let rpc_client = SealevelFallbackRpcClient::from_urls(chain, urls, client_metrics);
+    let rpc_client = SealevelFallbackRpcClient::from_urls(
+        chain,
+        urls,
+        client_metrics,
+        conf.max_supported_transaction_version,
+    );
     SealevelProvider::new(rpc_client, locator.domain.clone(), contract_addresses, conf)
 }
 
@@ -1600,6 +1823,24 @@ fn build_aleo_provider(
         locator.domain.clone(),
         signer,
         metrics.clone(),
+        middleware_metrics.chain.clone(),
+    )
+}
+
+fn build_tron_provider(
+    chain_conf: &ChainConf,
+    connection_conf: &h_tron::ConnectionConf,
+    metrics: &CoreMetrics,
+    locator: &ContractLocator,
+    signer: Option<h_tron::TronSigner>,
+) -> ChainResult<TronProvider> {
+    let middleware_metrics = chain_conf.metrics_conf();
+    let metrics = metrics.client_metrics();
+    TronProvider::new(
+        connection_conf,
+        locator,
+        signer,
+        metrics,
         middleware_metrics.chain.clone(),
     )
 }

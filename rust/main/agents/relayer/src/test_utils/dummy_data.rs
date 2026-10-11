@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 
-use prometheus::{CounterVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
+use prometheus::Registry;
 use tokio::sync::RwLock;
 
 use hyperlane_base::{
@@ -10,7 +10,7 @@ use hyperlane_base::{
     settings::{ChainConf, ChainConnectionConf, Settings},
     CoreMetrics,
 };
-use hyperlane_core::{HyperlaneDomain, H256};
+use hyperlane_core::{HyperlaneDomain, KnownHyperlaneDomain, H256};
 use hyperlane_test::mocks::{MockMailboxContract, MockValidatorAnnounceContract};
 
 use crate::{
@@ -31,6 +31,7 @@ pub fn dummy_chain_conf(domain: &HyperlaneDomain) -> ChainConf {
     ChainConf {
         domain: domain.clone(),
         signer: Default::default(),
+        identity: None,
         submitter: Default::default(),
         estimated_block_time: Duration::from_secs_f64(1.1),
         reorg_period: Default::default(),
@@ -42,10 +43,14 @@ pub fn dummy_chain_conf(domain: &HyperlaneDomain) -> ChainConf {
             transaction_overrides: Default::default(),
             op_submission_config: Default::default(),
             consider_null_transaction_receipt: false,
+            fallback_hedge: None,
         }),
         metrics_conf: Default::default(),
         index: Default::default(),
+        confirmations: Default::default(),
+        chain_id: Default::default(),
         ignore_reorg_reports: false,
+        native_token: Default::default(),
     }
 }
 
@@ -84,8 +89,9 @@ pub fn dummy_metadata_builder(
         false,
         Arc::new(core_metrics),
         cache,
+        Default::default(),
         db.clone(),
-        IsmAwareAppContextClassifier::new(default_ism_getter.clone(), vec![]),
+        IsmAwareAppContextClassifier::new(default_ism_getter.clone(), vec![].into()),
         IsmCachePolicyClassifier::new(default_ism_getter, Default::default()),
         None,
         false,
@@ -93,22 +99,12 @@ pub fn dummy_metadata_builder(
 }
 
 pub fn dummy_submission_metrics() -> MessageSubmissionMetrics {
-    MessageSubmissionMetrics {
-        origin: "".to_string(),
-        destination: "".to_string(),
-        last_known_nonce: IntGauge::new("last_known_nonce_gauge", "help string").unwrap(),
-        messages_processed: IntCounter::new("message_processed_gauge", "help string").unwrap(),
-        metadata_build_count: IntCounterVec::new(
-            Opts::new("metadata_build_count", "help string"),
-            &["app_context", "origin", "remote", "status"],
-        )
-        .unwrap(),
-        metadata_build_duration: CounterVec::new(
-            Opts::new("metadata_build_duration", "help string"),
-            &["app_context", "origin", "remote", "status"],
-        )
-        .unwrap(),
-    }
+    let core_metrics = CoreMetrics::new("dummy_relayer", 37582, Registry::new()).unwrap();
+    MessageSubmissionMetrics::new(
+        &core_metrics,
+        &HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum),
+        &HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum),
+    )
 }
 
 pub fn dummy_message_context(

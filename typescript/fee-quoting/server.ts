@@ -1,0 +1,9 @@
+// Server exports (pulls in Fastify, pino, prom-client, etc.)
+export { FeeQuotingServer } from './FeeQuotingServer.js';
+export { QuoteService } from './src/services/quoteService.js';
+export type { QuoteServiceOptions } from './src/services/quoteService.js';
+export { ServerConfigSchema, QuoteMode } from './src/config.js';
+export type { ServerConfig } from './src/config.js';
+
+// Client types have been moved to @hyperlane-xyz/sdk
+// (FeeQuotingClient, FeeQuotingCommand, etc.)

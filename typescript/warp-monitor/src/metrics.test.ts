@@ -1,19 +1,25 @@
 import { expect } from 'chai';
 import { Registry } from 'prom-client';
 
-import { TokenStandard } from '@hyperlane-xyz/sdk';
-
-import {
-  metricsRegister,
-  updateNativeWalletBalanceMetrics,
-  updateTokenBalanceMetrics,
-  updateXERC20LimitsMetrics,
-} from './metrics.js';
 import type {
   NativeWalletBalance,
   WarpRouteBalance,
   XERC20Limit,
-} from './types.js';
+} from '@hyperlane-xyz/metrics';
+import { TokenStandard } from '@hyperlane-xyz/sdk';
+
+import {
+  metricsRegister,
+  replacePendingDestinationMetricsForRoute,
+  resetInventoryBalanceMetrics,
+  resetPendingDestinationMetrics,
+  updateInventoryBalanceMetrics,
+  updateNativeWalletBalanceMetrics,
+  updatePendingDestinationMetrics,
+  updateProjectedDeficitMetrics,
+  updateTokenBalanceMetrics,
+  updateXERC20LimitsMetrics,
+} from './metrics.js';
 
 describe('Warp Monitor Metrics', () => {
   // Note: We don't clear the registry between tests because the gauges are
@@ -299,6 +305,149 @@ describe('Warp Monitor Metrics', () => {
       expect(metrics).to.include(
         'bridge_address="0xZeroLimits123456789012345678901234567890"',
       );
+    });
+  });
+
+  describe('pending destination metrics', () => {
+    it('should record pending amount/count/age', async () => {
+      resetPendingDestinationMetrics();
+      updatePendingDestinationMetrics({
+        warpRouteId: 'MULTI/stableswap',
+        nodeId: 'USDC|base|0xrouter',
+        chainName: 'base',
+        routerAddress: '0xrouter',
+        tokenAddress: '0xtoken',
+        tokenSymbol: 'USDC',
+        tokenName: 'USD Coin',
+        pendingAmount: 123.45,
+        pendingCount: 3,
+        oldestPendingSeconds: 120,
+      });
+
+      const metrics = await metricsRegister.metrics();
+      expect(metrics).to.include(
+        'hyperlane_warp_route_pending_destination_amount',
+      );
+      expect(metrics).to.include(
+        'hyperlane_warp_route_pending_destination_count',
+      );
+      expect(metrics).to.include(
+        'hyperlane_warp_route_pending_destination_oldest_seconds',
+      );
+      expect(metrics).to.include('node_id="USDC|base|0xrouter"');
+      expect(metrics).to.include('token_symbol="USDC"');
+    });
+
+    it('replacing one route does not wipe a sibling route mid-cycle', async () => {
+      resetPendingDestinationMetrics();
+
+      const base = {
+        chainName: 'base',
+        routerAddress: '0xrouter',
+        tokenAddress: '0xtoken',
+        tokenSymbol: 'USDC',
+        tokenName: 'USD Coin',
+        pendingCount: 1,
+        oldestPendingSeconds: 10,
+      };
+
+      // Route A and route B each publish one node.
+      replacePendingDestinationMetricsForRoute(
+        'MULTI/routeA',
+        [
+          {
+            ...base,
+            warpRouteId: 'MULTI/routeA',
+            nodeId: 'A|base',
+            pendingAmount: 111,
+          },
+        ],
+        [],
+      );
+      replacePendingDestinationMetricsForRoute(
+        'MULTI/routeB',
+        [
+          {
+            ...base,
+            warpRouteId: 'MULTI/routeB',
+            nodeId: 'B|base',
+            pendingAmount: 222,
+          },
+        ],
+        [],
+      );
+
+      // Route A's next cycle fails/times out, so its collected set is empty and
+      // we do NOT call replace for it — its prior series must stay. Route B
+      // re-publishes. Sibling A must remain visible either way; here we simulate
+      // A being untouched while B refreshes.
+      replacePendingDestinationMetricsForRoute(
+        'MULTI/routeB',
+        [
+          {
+            ...base,
+            warpRouteId: 'MULTI/routeB',
+            nodeId: 'B|base',
+            pendingAmount: 333,
+          },
+        ],
+        [],
+      );
+
+      const metrics = await metricsRegister.metrics();
+      const lines = metrics
+        .split('\n')
+        .filter((line) =>
+          line.startsWith('hyperlane_warp_route_pending_destination_amount{'),
+        );
+      const aLine = lines.find((line) => line.includes('node_id="A|base"'));
+      const bLine = lines.find((line) => line.includes('node_id="B|base"'));
+      expect(aLine, 'sibling route A must survive route B replacement').to
+        .exist;
+      expect(aLine!.trim().endsWith(' 111')).to.equal(true);
+      expect(bLine).to.exist;
+      expect(bLine!.trim().endsWith(' 333')).to.equal(true);
+    });
+
+    it('should record projected deficit separately', async () => {
+      resetPendingDestinationMetrics();
+      updateProjectedDeficitMetrics({
+        warpRouteId: 'MULTI/stableswap',
+        nodeId: 'USDC|base|0xrouter',
+        chainName: 'base',
+        routerAddress: '0xrouter',
+        tokenAddress: '0xtoken',
+        tokenSymbol: 'USDC',
+        tokenName: 'USD Coin',
+        projectedDeficit: 23.45,
+      });
+
+      const metrics = await metricsRegister.metrics();
+      expect(metrics).to.include('hyperlane_warp_route_projected_deficit');
+      expect(metrics).to.include('node_id="USDC|base|0xrouter"');
+      expect(metrics).to.include('23.45');
+    });
+  });
+
+  describe('inventory balance metrics', () => {
+    it('should record configured inventory address balances', async () => {
+      resetInventoryBalanceMetrics();
+      updateInventoryBalanceMetrics({
+        warpRouteId: 'MULTI/stableswap',
+        nodeId: 'USDT|arbitrum|0xrouter2',
+        chainName: 'arbitrum',
+        routerAddress: '0xrouter2',
+        tokenAddress: '0xtoken2',
+        tokenSymbol: 'USDT',
+        tokenName: 'Tether USD',
+        inventoryAddress: '0xrebalancer',
+        inventoryBalance: 77.7,
+      });
+
+      const metrics = await metricsRegister.metrics();
+      expect(metrics).to.include('hyperlane_warp_route_inventory_balance');
+      expect(metrics).to.include('inventory_address="0xrebalancer"');
+      expect(metrics).to.include('node_id="USDT|arbitrum|0xrouter2"');
     });
   });
 });

@@ -1,0 +1,502 @@
+import {
+  getAddressEncoder,
+  getProgramDerivedAddress,
+  getU32Encoder,
+  getUtf8Encoder,
+  type Address,
+  type ReadonlyUint8Array,
+} from '@solana/kit';
+
+import { assert } from '@hyperlane-xyz/utils';
+
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
+  LOADER_V3_PROGRAM_ADDRESS,
+  SPL_TOKEN_PROGRAM_ADDRESS,
+} from './constants.js';
+import type { PdaWithBump } from './types.js';
+
+const utf8 = getUtf8Encoder();
+const u32 = getU32Encoder();
+const addressEncoder = getAddressEncoder();
+// Intentionally using @solana/kit re-exports for consistency with package-wide imports.
+
+async function derive(
+  programAddress: Address,
+  seeds: ReadonlyUint8Array[],
+): Promise<PdaWithBump> {
+  const pda = await getProgramDerivedAddress({ programAddress, seeds });
+  return { pda, address: pda[0], bump: pda[1] };
+}
+
+// Seeds mirror `access_control_pda_seeds!` in rust/sealevel/programs/ism/multisig-ism-message-id/src/processor.rs.
+export async function deriveMultisigIsmAccessControlPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('multisig_ism_message_id'),
+    utf8.encode('-'),
+    utf8.encode('access_control'),
+  ]);
+}
+
+// Seeds mirror `domain_data_pda_seeds!` in rust/sealevel/programs/ism/multisig-ism-message-id/src/processor.rs.
+export async function deriveMultisigIsmDomainDataPda(
+  programAddress: Address,
+  domain: number,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('multisig_ism_message_id'),
+    utf8.encode('-'),
+    u32.encode(domain),
+    utf8.encode('-'),
+    utf8.encode('domain_data'),
+  ]);
+}
+
+export async function deriveTestIsmStoragePda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('test_ism'),
+    utf8.encode('-'),
+    utf8.encode('storage'),
+  ]);
+}
+
+/**
+ * Composite ISM's storage PDA uses the shared VAM (VerifyAccountMetas) seed
+ * convention (`VERIFY_ACCOUNT_METAS_PDA_SEEDS` in
+ * hyperlane_sealevel_interchain_security_module_interface) rather than a
+ * program-specific seed — this is what lets the relayer discover any Sealevel
+ * ISM's account-metas PDA generically. No collision risk with
+ * `deriveTestIsmStoragePda`/`deriveMultisigIsmAccessControlPda` above since
+ * each uses its own distinct seed string relative to the same program ID.
+ */
+export async function deriveCompositeIsmStoragePda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_ism'),
+    utf8.encode('-'),
+    utf8.encode('verify'),
+    utf8.encode('-'),
+    utf8.encode('account_metas'),
+  ]);
+}
+
+/** Per-domain override PDA for a composite ISM's `Routing`/`FallbackRouting` node. */
+export async function deriveCompositeIsmDomainPda(
+  programAddress: Address,
+  domain: number,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('domain_ism'),
+    u32.encode(domain),
+  ]);
+}
+
+export async function deriveHyperlaneTokenPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_message_recipient'),
+    utf8.encode('-'),
+    utf8.encode('handle'),
+    utf8.encode('-'),
+    utf8.encode('account_metas'),
+  ]);
+}
+
+export async function deriveMailboxDispatchAuthorityPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_dispatcher'),
+    utf8.encode('-'),
+    utf8.encode('dispatch_authority'),
+  ]);
+}
+
+export async function deriveIgpQuoteAuthorityPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_dispatcher'),
+    utf8.encode('-'),
+    utf8.encode('igp_quote_authority'),
+  ]);
+}
+
+export async function deriveMailboxInboxPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane'),
+    utf8.encode('-'),
+    utf8.encode('inbox'),
+  ]);
+}
+
+export async function deriveMailboxOutboxPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane'),
+    utf8.encode('-'),
+    utf8.encode('outbox'),
+  ]);
+}
+
+export async function deriveMailboxProcessAuthorityPda(
+  mailboxProgramAddress: Address,
+  recipientProgramAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(mailboxProgramAddress, [
+    utf8.encode('hyperlane'),
+    utf8.encode('-'),
+    utf8.encode('process_authority'),
+    utf8.encode('-'),
+    addressEncoder.encode(recipientProgramAddress),
+  ]);
+}
+
+/** Mailbox-signed authority requested by stateful composite ISM nodes. */
+export async function deriveIsmProcessAuthorityPda(
+  mailboxProgramAddress: Address,
+  ismProgramAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(mailboxProgramAddress, [
+    utf8.encode('process_authority'),
+    addressEncoder.encode(ismProgramAddress),
+  ]);
+}
+
+export async function deriveMailboxDispatchedMessagePda(
+  mailboxProgramAddress: Address,
+  uniqueMessageAccount: Address,
+): Promise<PdaWithBump> {
+  return derive(mailboxProgramAddress, [
+    utf8.encode('hyperlane'),
+    utf8.encode('-'),
+    utf8.encode('dispatched_message'),
+    utf8.encode('-'),
+    addressEncoder.encode(uniqueMessageAccount),
+  ]);
+}
+
+export async function deriveIgpProgramDataPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_igp'),
+    utf8.encode('-'),
+    utf8.encode('program_data'),
+  ]);
+}
+
+export async function deriveIgpGasPaymentPda(
+  igpProgramAddress: Address,
+  uniqueMessageAccount: Address,
+): Promise<PdaWithBump> {
+  return derive(igpProgramAddress, [
+    utf8.encode('hyperlane_igp'),
+    utf8.encode('-'),
+    utf8.encode('gas_payment'),
+    utf8.encode('-'),
+    addressEncoder.encode(uniqueMessageAccount),
+  ]);
+}
+
+export async function deriveFeeTransientQuotePda(
+  feeProgramAddress: Address,
+  feeAccount: Address,
+  scopedSalt: Uint8Array,
+): Promise<PdaWithBump> {
+  assert(
+    scopedSalt.length === 32,
+    `scopedSalt must be 32 bytes, got ${scopedSalt.length}`,
+  );
+  return derive(feeProgramAddress, [
+    utf8.encode('hyperlane_fee'),
+    utf8.encode('-'),
+    utf8.encode('transient'),
+    utf8.encode('-'),
+    addressEncoder.encode(feeAccount),
+    utf8.encode('-'),
+    scopedSalt,
+  ]);
+}
+
+export async function deriveIgpAccountPda(
+  programAddress: Address,
+  salt: Uint8Array,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_igp'),
+    utf8.encode('-'),
+    utf8.encode('igp'),
+    utf8.encode('-'),
+    salt,
+  ]);
+}
+
+export async function deriveOverheadIgpAccountPda(
+  programAddress: Address,
+  salt: Uint8Array,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_igp'),
+    utf8.encode('-'),
+    utf8.encode('overhead_igp'),
+    utf8.encode('-'),
+    salt,
+  ]);
+}
+
+/** Derives the IGP standing-quote PDA for a (igp, mint, domain, sender) tuple. */
+export async function deriveIgpStandingQuotePda(
+  programAddress: Address,
+  igpAccount: Address,
+  feeTokenMint: Address,
+  destinationDomain: number,
+  sender: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_igp'),
+    utf8.encode('-'),
+    utf8.encode('standing_quote'),
+    utf8.encode('-'),
+    addressEncoder.encode(igpAccount),
+    utf8.encode('-'),
+    addressEncoder.encode(feeTokenMint),
+    utf8.encode('-'),
+    u32.encode(destinationDomain),
+    utf8.encode('-'),
+    addressEncoder.encode(sender),
+  ]);
+}
+
+/** Derives the IGP transient-quote PDA for a (igp, scoped_salt) tuple. */
+export async function deriveIgpTransientQuotePda(
+  programAddress: Address,
+  igpAccount: Address,
+  scopedSalt: Uint8Array,
+): Promise<PdaWithBump> {
+  assert(
+    scopedSalt.length === 32,
+    `scopedSalt must be 32 bytes, got ${scopedSalt.length}`,
+  );
+  return derive(programAddress, [
+    utf8.encode('hyperlane_igp'),
+    utf8.encode('-'),
+    utf8.encode('transient_quote'),
+    utf8.encode('-'),
+    addressEncoder.encode(igpAccount),
+    utf8.encode('-'),
+    scopedSalt,
+  ]);
+}
+
+export async function deriveValidatorAnnouncePda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_validator_announce'),
+    utf8.encode('-'),
+    utf8.encode('validator_announce'),
+  ]);
+}
+
+export async function deriveValidatorStorageLocationsPda(
+  programAddress: Address,
+  validatorH160: Uint8Array,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_validator_announce'),
+    utf8.encode('-'),
+    utf8.encode('storage_locations'),
+    utf8.encode('-'),
+    validatorH160,
+  ]);
+}
+
+export async function deriveReplayProtectionPda(
+  programAddress: Address,
+  replayIdBytes: Uint8Array,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_validator_announce'),
+    utf8.encode('-'),
+    utf8.encode('replay_protection'),
+    utf8.encode('-'),
+    replayIdBytes,
+  ]);
+}
+
+export async function deriveNativeCollateralPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_token'),
+    utf8.encode('-'),
+    utf8.encode('native_collateral'),
+  ]);
+}
+
+export async function deriveSyntheticMintPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_token'),
+    utf8.encode('-'),
+    utf8.encode('mint'),
+  ]);
+}
+
+export async function deriveAtaPayerPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_token'),
+    utf8.encode('-'),
+    utf8.encode('ata_payer'),
+  ]);
+}
+
+/**
+ * Derives the SPL Associated Token Account address for a (wallet, mint)
+ * pair. `tokenProgram` defaults to the classic SPL Token program — pass
+ * Token-2022 explicitly for Token-2022 mints.
+ */
+export async function deriveAssociatedTokenAddress(args: {
+  wallet: Address;
+  mint: Address;
+  tokenProgram?: Address;
+}): Promise<PdaWithBump> {
+  const tokenProgram = args.tokenProgram ?? SPL_TOKEN_PROGRAM_ADDRESS;
+  return derive(ASSOCIATED_TOKEN_PROGRAM_ADDRESS, [
+    addressEncoder.encode(args.wallet),
+    addressEncoder.encode(tokenProgram),
+    addressEncoder.encode(args.mint),
+  ]);
+}
+
+export async function deriveEscrowPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_token'),
+    utf8.encode('-'),
+    utf8.encode('escrow'),
+  ]);
+}
+
+export async function deriveCrossCollateralStatePda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_token'),
+    utf8.encode('-'),
+    utf8.encode('cross_collateral'),
+  ]);
+}
+
+export async function deriveCrossCollateralDispatchAuthorityPda(
+  programAddress: Address,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_cc'),
+    utf8.encode('-'),
+    utf8.encode('dispatch_authority'),
+  ]);
+}
+
+// ====== Fee Program PDAs ======
+
+export async function deriveFeeAccountPda(
+  programAddress: Address,
+  salt: ReadonlyUint8Array,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_fee'),
+    utf8.encode('-'),
+    utf8.encode('fee'),
+    utf8.encode('-'),
+    salt,
+  ]);
+}
+
+export async function deriveRouteDomainPda(
+  programAddress: Address,
+  feeAccount: Address,
+  domain: number,
+): Promise<PdaWithBump> {
+  return derive(programAddress, [
+    utf8.encode('hyperlane_fee'),
+    utf8.encode('-'),
+    utf8.encode('route'),
+    utf8.encode('-'),
+    addressEncoder.encode(feeAccount),
+    utf8.encode('-'),
+    u32.encode(domain),
+  ]);
+}
+
+export async function deriveStandingQuotePda(
+  programAddress: Address,
+  feeAccount: Address,
+  domain: number,
+  targetRouter: ReadonlyUint8Array,
+): Promise<PdaWithBump> {
+  assert(
+    targetRouter.length === 32,
+    `targetRouter must be 32 bytes, got ${targetRouter.length}`,
+  );
+  return derive(programAddress, [
+    utf8.encode('hyperlane_fee'),
+    utf8.encode('-'),
+    utf8.encode('standing'),
+    utf8.encode('-'),
+    addressEncoder.encode(feeAccount),
+    utf8.encode('-'),
+    u32.encode(domain),
+    utf8.encode('-'),
+    targetRouter,
+  ]);
+}
+
+export async function deriveCrossCollateralRoutePda(
+  programAddress: Address,
+  feeAccount: Address,
+  destination: number,
+  targetRouter: ReadonlyUint8Array,
+): Promise<PdaWithBump> {
+  assert(
+    targetRouter.length === 32,
+    `targetRouter must be 32 bytes, got ${targetRouter.length}`,
+  );
+  return derive(programAddress, [
+    utf8.encode('hyperlane_fee'),
+    utf8.encode('-'),
+    utf8.encode('cc_route'),
+    utf8.encode('-'),
+    addressEncoder.encode(feeAccount),
+    utf8.encode('-'),
+    u32.encode(destination),
+    utf8.encode('-'),
+    targetRouter,
+  ]);
+}
+
+// ====== BPF Loader PDAs ======
+
+export async function deriveProgramDataAddress(
+  programAddress: Address,
+): Promise<Address> {
+  const pda = await getProgramDerivedAddress({
+    programAddress: LOADER_V3_PROGRAM_ADDRESS,
+    seeds: [addressEncoder.encode(programAddress)],
+  });
+  return pda[0];
+}

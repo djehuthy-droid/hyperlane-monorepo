@@ -1,6 +1,8 @@
 import { getArbitrumNetwork } from '@arbitrum/sdk';
 import { BigNumber, ethers } from 'ethers';
 
+import { compareVersions } from 'compare-versions';
+
 import {
   AmountRoutingHook,
   ArbL2ToL1Hook,
@@ -19,8 +21,11 @@ import {
   Ownable__factory,
   PausableHook,
   PausableHook__factory,
+  ProxyAdmin__factory,
   ProtocolFee,
   ProtocolFee__factory,
+  RateLimitedHook,
+  RateLimitedHook__factory,
   StaticAggregationHook,
   StaticAggregationHookFactory__factory,
   StaticAggregationHook__factory,
@@ -36,6 +41,7 @@ import {
   addressToBytes32,
   assert,
   deepEquals,
+  difference,
   eqAddress,
   isZeroishAddress,
   rootLogger,
@@ -51,8 +57,13 @@ import {
 import { CoreAddresses } from '../core/contracts.js';
 import { HyperlaneDeployer } from '../deploy/HyperlaneDeployer.js';
 import { ProxyFactoryFactories } from '../deploy/contracts.js';
+import { isProxy, proxyAdmin } from '../deploy/proxy.js';
 import { ContractVerifier } from '../deploy/verify/ContractVerifier.js';
-import { IgpConfig } from '../gas/types.js';
+import {
+  IgpConfig,
+  assertTokenOracleConfigHasNativeRemotes,
+  igpSupportsOffchainFeeQuoting,
+} from '../gas/types.js';
 import { EvmIsmModule } from '../ism/EvmIsmModule.js';
 import { HyperlaneIsmFactory } from '../ism/HyperlaneIsmFactory.js';
 import { ArbL2ToL1IsmConfig, IsmType, OpStackIsmConfig } from '../ism/types.js';
@@ -60,9 +71,19 @@ import { MultiProvider } from '../providers/MultiProvider.js';
 import { AnnotatedEV5Transaction } from '../providers/ProviderType.js';
 import { ChainName, ChainNameOrId } from '../types.js';
 import { normalizeConfig } from '../utils/ism.js';
+import { fetchPackageVersion } from '../utils/contract.js';
+
+import {
+  VERSION_ERROR_MESSAGE,
+  contractVersionMatchesDependency,
+} from '../token/types.js';
 
 import { EvmHookReader } from './EvmHookReader.js';
 import { DeployedHook, HookFactories, hookFactories } from './contracts.js';
+import {
+  collapseMatchingHybridHookNodes,
+  resolveHybridHookNodesToAddress,
+} from './utils.js';
 import {
   AggregationHookConfig,
   AmountRoutingHookConfig,
@@ -76,16 +97,21 @@ import {
   HookType,
   HookTypeToContractNameMap,
   IgpHookConfig,
+  IgpVersion,
   MUTABLE_HOOK_TYPE,
+  OFFCHAIN_QUOTED_IGP_VERSION,
   OpStackHookConfig,
   PausableHookConfig,
   ProtocolFeeHookConfig,
+  RateLimitedHookConfig,
 } from './types.js';
 
 type HookModuleAddresses = {
   deployedHook: Address;
   mailbox: Address;
   proxyAdmin: Address;
+  // Injected by warp deploy path; used as constructor arg for RateLimitedHook.
+  rateLimitedSender?: Address;
 };
 
 class HookDeployer extends HyperlaneDeployer<{}, HookFactories> {
@@ -96,11 +122,34 @@ class HookDeployer extends HyperlaneDeployer<{}, HookFactories> {
   }
 }
 
+function stripIgpVersion(config: unknown): unknown {
+  if (Array.isArray(config)) {
+    return config.map(stripIgpVersion);
+  }
+
+  if (config !== null && typeof config === 'object') {
+    const stripped: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(config)) {
+      if (key !== 'igpVersion') {
+        stripped[key] = stripIgpVersion(value);
+      }
+    }
+    return stripped;
+  }
+
+  return config;
+}
+
+function hookConfigsEqual(a: unknown, b: unknown): boolean {
+  return deepEquals(stripIgpVersion(a), stripIgpVersion(b));
+}
+
 export class EvmHookModule extends HyperlaneModule<
   ProtocolType.Ethereum,
   HookConfig,
   HyperlaneAddresses<ProxyFactoryFactories> & HookModuleAddresses
 > {
+  static protocols = [ProtocolType.Ethereum, ProtocolType.Tron];
   protected readonly logger = rootLogger.child({ module: 'EvmHookModule' });
   protected readonly reader: EvmHookReader;
   // "ISM" Factory has aggregation hook factories too
@@ -144,13 +193,29 @@ export class EvmHookModule extends HyperlaneModule<
   }
 
   public async read(): Promise<DerivedHookConfig | string> {
-    return typeof this.args.config === 'string'
-      ? this.args.addresses.deployedHook
-      : this.reader.deriveHookConfig(this.args.addresses.deployedHook);
+    if (typeof this.args.config === 'string') {
+      return this.args.addresses.deployedHook;
+    }
+
+    // For IGP hooks with tokenOracleConfig, pass fee tokens to the reader
+    if (
+      typeof this.args.config === 'object' &&
+      this.args.config.type === HookType.INTERCHAIN_GAS_PAYMASTER &&
+      this.args.config.tokenOracleConfig
+    ) {
+      const feeTokens = Object.keys(this.args.config.tokenOracleConfig);
+      return this.reader.deriveIgpConfig(
+        this.args.addresses.deployedHook,
+        feeTokens,
+      );
+    }
+
+    return this.reader.deriveHookConfig(this.args.addresses.deployedHook);
   }
 
   public async update(
     targetConfig: HookConfig,
+    opaqueHybridAddresses: Address[] = [],
   ): Promise<AnnotatedEV5Transaction[]> {
     // Nothing to do if its the default hook
     if (typeof targetConfig === 'string' && isZeroishAddress(targetConfig)) {
@@ -158,15 +223,24 @@ export class EvmHookModule extends HyperlaneModule<
     }
 
     // We need to normalize the current and target configs to compare.
-    const normalizedTargetConfig: DerivedHookConfig = normalizeConfig(
+    let normalizedTargetConfig: HookConfig = normalizeConfig(
       await this.reader.deriveHookConfig(targetConfig),
     );
-    const normalizedCurrentConfig: DerivedHookConfig | string = normalizeConfig(
-      await this.read(),
-    );
+    for (const address of opaqueHybridAddresses) {
+      normalizedTargetConfig = resolveHybridHookNodesToAddress(
+        normalizedTargetConfig,
+        address,
+      );
+    }
+    normalizedTargetConfig = normalizeConfig(normalizedTargetConfig);
+    let currentConfig: HookConfig = await this.read();
+    for (const address of opaqueHybridAddresses) {
+      currentConfig = collapseMatchingHybridHookNodes(currentConfig, address);
+    }
+    const normalizedCurrentConfig: HookConfig = normalizeConfig(currentConfig);
 
     // If configs match, no updates needed
-    if (deepEquals(normalizedCurrentConfig, normalizedTargetConfig)) {
+    if (hookConfigsEqual(normalizedCurrentConfig, normalizedTargetConfig)) {
       return [];
     }
 
@@ -180,11 +254,21 @@ export class EvmHookModule extends HyperlaneModule<
       return [];
     }
 
+    // Special case: RATE_LIMITED duration is immutable (set in the
+    // constructor) — must redeploy a fresh hook if it changes.
+    const rateLimitedDurationChanged =
+      typeof normalizedCurrentConfig !== 'string' &&
+      normalizedCurrentConfig.type === HookType.RATE_LIMITED &&
+      normalizedTargetConfig.type === HookType.RATE_LIMITED &&
+      normalizedCurrentConfig.duration !== normalizedTargetConfig.duration;
+
     // Conditions for deploying a new hook:
     // - If updating from an address/custom config to a proper hook config.
     // - If updating a proper hook config whose types are different.
     // - If it is not a mutable Hook.
+    // - If an immutable RATE_LIMITED field (duration) changed.
     if (
+      rateLimitedDurationChanged ||
       typeof normalizedCurrentConfig === 'string' ||
       normalizedCurrentConfig.type !== normalizedTargetConfig.type ||
       !MUTABLE_HOOK_TYPE.includes(normalizedTargetConfig.type)
@@ -217,7 +301,9 @@ export class EvmHookModule extends HyperlaneModule<
     chain: ChainNameOrId;
     config: HookConfig;
     proxyFactoryFactories: HyperlaneAddresses<ProxyFactoryFactories>;
-    coreAddresses: Omit<CoreAddresses, 'validatorAnnounce'>;
+    coreAddresses: Omit<CoreAddresses, 'validatorAnnounce' | 'quotedCalls'> & {
+      rateLimitedSender?: Address;
+    };
     multiProvider: MultiProvider;
     ccipContractCache?: CCIPContractCache;
     contractVerifier?: ContractVerifier;
@@ -263,7 +349,7 @@ export class EvmHookModule extends HyperlaneModule<
 
       // If the domain is not in the current config or the config has changed, deploy a new hook
       // TODO: in-place updates per domain as a future optimization
-      if (!deepEquals(currentDomains[dest], targetDomainConfig)) {
+      if (!hookConfigsEqual(currentDomains[dest], targetDomainConfig)) {
         const domainHook = await this.deploy({
           config: targetDomainConfig,
         });
@@ -327,6 +413,14 @@ export class EvmHookModule extends HyperlaneModule<
         currentConfig: current,
         targetConfig: target,
       });
+    } else if (
+      current.type === HookType.RATE_LIMITED &&
+      target.type === HookType.RATE_LIMITED
+    ) {
+      updateTxs = await this.updateRateLimitedHook({
+        currentConfig: current,
+        targetConfig: target,
+      });
     } else {
       throw new Error(`Unsupported hook type: ${target.type}`);
     }
@@ -381,6 +475,32 @@ export class EvmHookModule extends HyperlaneModule<
     return updateTxs;
   }
 
+  protected async updateRateLimitedHook({
+    currentConfig,
+    targetConfig,
+  }: {
+    currentConfig: RateLimitedHookConfig;
+    targetConfig: RateLimitedHookConfig;
+  }): Promise<AnnotatedEV5Transaction[]> {
+    const updateTxs: AnnotatedEV5Transaction[] = [];
+
+    // Duration changes are handled upstream in `update()` by redeploying a
+    // fresh hook (duration is immutable), so it never differs here.
+    if (currentConfig.maxCapacity !== targetConfig.maxCapacity) {
+      updateTxs.push({
+        annotation: `Setting refill rate on RateLimitedHook on chain "${this.chain}" and address "${this.args.addresses.deployedHook}"`,
+        chainId: this.chainId,
+        to: this.args.addresses.deployedHook,
+        data: RateLimitedHook__factory.createInterface().encodeFunctionData(
+          'setRefillRate',
+          [targetConfig.maxCapacity],
+        ),
+      });
+    }
+
+    return updateTxs;
+  }
+
   protected async updateIgpHook({
     currentConfig,
     targetConfig,
@@ -389,7 +509,44 @@ export class EvmHookModule extends HyperlaneModule<
     targetConfig: IgpHookConfig;
   }): Promise<AnnotatedEV5Transaction[]> {
     const updateTxs: AnnotatedEV5Transaction[] = [];
+    const igpAddress = this.args.addresses.deployedHook;
     const igpInterface = InterchainGasPaymaster__factory.createInterface();
+    const provider = this.multiProvider.getProvider(this.domainId);
+    const currentVersion = await fetchPackageVersion(
+      provider,
+      igpAddress,
+      this.logger,
+    );
+
+    // Upgrade IGP proxy implementation only if contractVersion is specified in config
+    if (targetConfig.contractVersion && (await isProxy(provider, igpAddress))) {
+      assert(
+        contractVersionMatchesDependency(targetConfig.contractVersion),
+        VERSION_ERROR_MESSAGE,
+      );
+
+      if (compareVersions(targetConfig.contractVersion, currentVersion) > 0) {
+        this.logger.info(
+          `Upgrading IGP implementation from ${currentVersion} to ${targetConfig.contractVersion}`,
+        );
+        const newImpl = await this.deployer.deployContractFromFactory(
+          this.chain,
+          new InterchainGasPaymaster__factory(),
+          HookType.INTERCHAIN_GAS_PAYMASTER,
+          [],
+        );
+        const igpProxyAdmin = await proxyAdmin(provider, igpAddress);
+        updateTxs.push({
+          annotation: `Upgrade IGP proxy implementation to ${targetConfig.contractVersion}`,
+          chainId: this.chainId,
+          to: igpProxyAdmin,
+          data: ProxyAdmin__factory.createInterface().encodeFunctionData(
+            'upgrade',
+            [igpAddress, newImpl.address],
+          ),
+        });
+      }
+    }
 
     // Update beneficiary if changed
     if (!eqAddress(currentConfig.beneficiary, targetConfig.beneficiary)) {
@@ -428,6 +585,11 @@ export class EvmHookModule extends HyperlaneModule<
         })),
       );
     } else {
+      assert(
+        targetConfig.igpVersion !== IgpVersion.Legacy,
+        'Legacy IGP updates require an existing gas oracle configuration',
+      );
+
       const newGasOracle = await this.deployStorageGasOracle({
         config: targetConfig,
       });
@@ -445,7 +607,214 @@ export class EvmHookModule extends HyperlaneModule<
       })),
     );
 
+    // update quote signers only if explicitly specified in target config
+    // and IGP supports them (detected from on-chain read or version upgrade)
+    const offchainFeeQuotingVersion =
+      targetConfig.contractVersion ?? currentVersion;
+    const supportsOffchainFeeQuoting = igpSupportsOffchainFeeQuoting({
+      igpVersion: targetConfig.igpVersion,
+      contractVersion: offchainFeeQuotingVersion,
+      quoteSigners: currentConfig.quoteSigners,
+    });
+    if (targetConfig.quoteSigners !== undefined) {
+      assert(
+        supportsOffchainFeeQuoting,
+        `IGP quoteSigners require contract version >= ${OFFCHAIN_QUOTED_IGP_VERSION}`,
+      );
+      updateTxs.push(
+        ...this.updateIgpQuoteSigners({
+          currentSigners: currentConfig.quoteSigners ?? [],
+          targetSigners: targetConfig.quoteSigners ?? [],
+        }),
+      );
+    }
+
+    // update token gas oracles only if explicitly specified in target config.
+    // Gated behind the same support check as quoteSigners: the tokenGasOracles
+    // mapping and setTokenGasOracles only exist on the new (non-legacy) IGP.
+    const targetTokenOracleConfig = targetConfig.tokenOracleConfig;
+    if (
+      targetTokenOracleConfig &&
+      Object.keys(targetTokenOracleConfig).length > 0
+    ) {
+      assert(
+        supportsOffchainFeeQuoting,
+        `IGP tokenOracleConfig requires contract version >= ${OFFCHAIN_QUOTED_IGP_VERSION}`,
+      );
+      updateTxs.push(
+        ...(await this.updateIgpTokenGasOracles({
+          interchainGasPaymaster: this.args.addresses.deployedHook,
+          targetTokenOracleConfig,
+          config: targetConfig,
+        })),
+      );
+    }
+
     return updateTxs;
+  }
+
+  /**
+   * Diffs and applies per-fee-token gas oracles on the IGP. Target-driven: the
+   * configured fee tokens are the only enumeration source (the on-chain
+   * tokenGasOracles mapping is not enumerable), so removals are intentionally
+   * unsupported and old fee-token mappings remain live until cleared by a
+   * dedicated teardown flow. Each configured token's current oracle is read back
+   * from chain, so no off-chain address bookkeeping is needed for additions and
+   * updates.
+   *
+   * For each fee token: resolve the oracle already wired on chain (reused across
+   * that token's destinations), or deploy a fresh StorageGasOracle if none is
+   * set yet; reconcile the oracle's remote gas data; then point any unmapped
+   * destinations at it via setTokenGasOracles.
+   */
+  protected async updateIgpTokenGasOracles({
+    interchainGasPaymaster,
+    targetTokenOracleConfig,
+    config,
+  }: {
+    interchainGasPaymaster: Address;
+    targetTokenOracleConfig: NonNullable<IgpConfig['tokenOracleConfig']>;
+    config: IgpConfig;
+  }): Promise<AnnotatedEV5Transaction[]> {
+    const updateTxs: AnnotatedEV5Transaction[] = [];
+    const igpInterface = InterchainGasPaymaster__factory.createInterface();
+    const igp = InterchainGasPaymaster__factory.connect(
+      interchainGasPaymaster,
+      this.multiProvider.getProvider(this.domainId),
+    );
+    assertTokenOracleConfigHasNativeRemotes(this.chain, config);
+
+    for (const [feeToken, oracleConfig] of Object.entries(
+      targetTokenOracleConfig,
+    )) {
+      // Resolve the in-MultiProvider remote domains for this fee token.
+      const remotes = Object.keys(oracleConfig)
+        .map((remote) => ({
+          remote,
+          domainId: this.multiProvider.tryGetDomainId(remote),
+        }))
+        .filter(
+          (r): r is { remote: string; domainId: number } => r.domainId !== null,
+        );
+
+      if (remotes.length === 0) {
+        this.logger.warn(
+          `Skipping token gas oracle for ${feeToken} on ${this.chain}: no configured remotes in MultiProvider`,
+        );
+        continue;
+      }
+
+      // Find an oracle already wired for this fee token on any configured
+      // destination; reuse it across destinations.
+      let gasOracle: Address | undefined;
+      for (const { domainId } of remotes) {
+        const existing = await igp.tokenGasOracles(feeToken, domainId);
+        if (!eqAddress(existing, ethers.constants.AddressZero)) {
+          gasOracle = existing;
+          break;
+        }
+      }
+
+      // No oracle wired yet -> deploy a dedicated one for this fee token,
+      // seeded with its oracle config.
+      if (!gasOracle) {
+        const newOracle = await this.deployStorageGasOracle({
+          config,
+          oracleConfig,
+        });
+        gasOracle = newOracle.address;
+      } else {
+        // Reconcile remote gas data on the existing oracle. updateStorageGasOracle
+        // diffs against a supplied current config, so read it back from chain
+        // first (tokenDecimals isn't stored on-chain, so carry it from target to
+        // avoid a spurious diff).
+        const oracleContract = StorageGasOracle__factory.connect(
+          gasOracle,
+          this.multiProvider.getProvider(this.domainId),
+        );
+        const currentOracleConfig: IgpConfig['oracleConfig'] = {};
+        for (const { remote, domainId } of remotes) {
+          const data = await oracleContract.remoteGasData(domainId);
+          currentOracleConfig[remote] = {
+            tokenExchangeRate: data.tokenExchangeRate.toString(),
+            gasPrice: data.gasPrice.toString(),
+            tokenDecimals: oracleConfig[remote]?.tokenDecimals,
+          };
+        }
+
+        updateTxs.push(
+          ...(await this.updateStorageGasOracle({
+            gasOracle,
+            currentOracleConfig,
+            targetOracleConfig: oracleConfig,
+            targetOverhead: config.overhead,
+          })),
+        );
+      }
+
+      // Point any destinations not yet mapped to this oracle at it.
+      const tokenOracleParams: InterchainGasPaymaster.TokenGasOracleConfigStruct[] =
+        [];
+      for (const { domainId } of remotes) {
+        const current = await igp.tokenGasOracles(feeToken, domainId);
+        if (!eqAddress(current, gasOracle)) {
+          tokenOracleParams.push({
+            feeToken,
+            remoteDomain: domainId,
+            gasOracle,
+          });
+        }
+      }
+
+      if (tokenOracleParams.length > 0) {
+        updateTxs.push({
+          annotation: `Setting token gas oracles for ${feeToken} on ${this.chain} (domains ${tokenOracleParams
+            .map((p) => p.remoteDomain)
+            .join(', ')})`,
+          chainId: this.chainId,
+          to: interchainGasPaymaster,
+          data: igpInterface.encodeFunctionData('setTokenGasOracles', [
+            tokenOracleParams,
+          ]),
+        });
+      }
+    }
+
+    return updateTxs;
+  }
+
+  protected updateIgpQuoteSigners({
+    currentSigners,
+    targetSigners,
+  }: {
+    currentSigners: string[];
+    targetSigners: string[];
+  }): AnnotatedEV5Transaction[] {
+    const txs: AnnotatedEV5Transaction[] = [];
+    const igpInterface = InterchainGasPaymaster__factory.createInterface();
+
+    const currentSet = new Set(currentSigners.map((s) => s.toLowerCase()));
+    const targetSet = new Set(targetSigners.map((s) => s.toLowerCase()));
+
+    for (const signer of difference(targetSet, currentSet)) {
+      txs.push({
+        annotation: `Add IGP quote signer ${signer}`,
+        chainId: this.chainId,
+        to: this.args.addresses.deployedHook,
+        data: igpInterface.encodeFunctionData('addQuoteSigner', [signer]),
+      });
+    }
+
+    for (const signer of difference(currentSet, targetSet)) {
+      txs.push({
+        annotation: `Remove IGP quote signer ${signer}`,
+        chainId: this.chainId,
+        to: this.args.addresses.deployedHook,
+        data: igpInterface.encodeFunctionData('removeQuoteSigner', [signer]),
+      });
+    }
+
+    return txs;
   }
 
   protected async updateIgpRemoteGasParams({
@@ -534,7 +903,12 @@ export class EvmHookModule extends HyperlaneModule<
       }
 
       // only update if the oracle config has changed
-      if (!current || !deepEquals(current, target)) {
+      const comparableTarget = {
+        gasPrice: target.gasPrice,
+        tokenExchangeRate: target.tokenExchangeRate,
+        tokenDecimals: target.tokenDecimals,
+      };
+      if (!current || !deepEquals(current, comparableTarget)) {
         configsToSet.push({ remoteDomain, ...target });
 
         // Log an example remote gas cost
@@ -630,7 +1004,7 @@ export class EvmHookModule extends HyperlaneModule<
     // Deploy a new fallback hook if the fallback config has changed
     if (
       targetConfig.type === HookType.FALLBACK_ROUTING &&
-      !deepEquals(
+      !hookConfigsEqual(
         targetConfig.fallback,
         (currentConfig as FallbackRoutingHookConfig).fallback,
       )
@@ -709,6 +1083,22 @@ export class EvmHookModule extends HyperlaneModule<
         return this.deployAmountRoutingHook({ config });
       case HookType.CCIP:
         return this.deployCCIPHook({ config });
+      case HookType.CCTP:
+        // TODO: https://github.com/hyperlane-xyz/hyperlane-monorepo/issues/3773
+        // we can remove the ts-ignore once we have a proper type for address Hooks
+        // @ts-ignore
+        return IPostDispatchHook__factory.connect(
+          config.address,
+          this.multiProvider.getSignerOrProvider(this.args.chain),
+        );
+      case HookType.RATE_LIMITED:
+        return this.deployRateLimitedHook({ config });
+      case HookType.NET_FLOW_RATE_LIMITED:
+      case HookType.DELAYED_FLOW_ROUTER:
+        throw new Error(
+          `${config.type} is a hook/ISM hybrid deployed via its ISM config ` +
+            `(HyperlaneIsmFactory); reference the deployed instance by address as the hook`,
+        );
       default:
         throw new Error(`Unsupported hook config: ${config}`);
     }
@@ -742,11 +1132,48 @@ export class EvmHookModule extends HyperlaneModule<
       [],
     );
 
+    if (config.paused) {
+      await this.multiProvider.handleTx(
+        this.chain,
+        hook.pause(this.txOverrides),
+      );
+    }
+
     // transfer ownership
     await this.multiProvider.handleTx(
       this.chain,
       hook.transferOwnership(config.owner, this.txOverrides),
     );
+
+    return hook;
+  }
+
+  protected async deployRateLimitedHook({
+    config,
+  }: {
+    config: RateLimitedHookConfig;
+  }): Promise<RateLimitedHook> {
+    this.logger.debug('Deploying RateLimitedHook...');
+    const deployer = new HookDeployer(this.multiProvider, hookFactories);
+    const sender = this.args.addresses.rateLimitedSender;
+    assert(sender, 'rateLimitedSender is required to deploy RateLimitedHook');
+    const hook = await deployer.deployContract(
+      this.chain,
+      HookType.RATE_LIMITED,
+      [
+        this.args.addresses.mailbox,
+        config.maxCapacity,
+        config.duration,
+        sender,
+      ],
+    );
+
+    if (config.owner) {
+      await this.multiProvider.handleTx(
+        this.chain,
+        hook.transferOwnership(config.owner, this.txOverrides),
+      );
+    }
 
     return hook;
   }
@@ -1049,6 +1476,11 @@ export class EvmHookModule extends HyperlaneModule<
   }: {
     config: IgpHookConfig;
   }): Promise<InterchainGasPaymaster> {
+    assert(
+      config.igpVersion !== IgpVersion.Legacy,
+      'Legacy IGP configs require an existing deployment and cannot deploy a new IGP',
+    );
+
     this.logger.debug('Deploying IGP as hook...');
 
     // Deploy the StorageGasOracle
@@ -1056,7 +1488,8 @@ export class EvmHookModule extends HyperlaneModule<
       config,
     });
 
-    // Deploy the InterchainGasPaymaster
+    // Deploy the InterchainGasPaymaster (handles token gas oracle wiring
+    // via updateIgpTokenGasOracles before transferring ownership)
     const interchainGasPaymaster = await this.deployInterchainGasPaymaster({
       storageGasOracle,
       config,
@@ -1099,6 +1532,31 @@ export class EvmHookModule extends HyperlaneModule<
       await this.multiProvider.sendTransaction(this.chain, tx);
     }
 
+    // Add quote signers if configured
+    if (config.quoteSigners?.length) {
+      for (const signer of config.quoteSigners) {
+        await this.multiProvider.handleTx(
+          this.chain,
+          igp.addQuoteSigner(signer, this.txOverrides),
+        );
+      }
+    }
+
+    // Wire per-fee-token gas oracles if configured. Must run while the deployer
+    // still owns the IGP (setTokenGasOracles is onlyOwner) and after the native
+    // gas params above, since the IGP requires a destination's native oracle to
+    // exist before a non-native token oracle can be set for it.
+    if (config.tokenOracleConfig !== undefined) {
+      const tokenOracleTxs = await this.updateIgpTokenGasOracles({
+        interchainGasPaymaster: igp.address,
+        targetTokenOracleConfig: config.tokenOracleConfig,
+        config,
+      });
+      for (const tx of tokenOracleTxs) {
+        await this.multiProvider.sendTransaction(this.chain, tx);
+      }
+    }
+
     // Transfer igp to the configured owner
     await this.multiProvider.handleTx(
       this.chain,
@@ -1133,8 +1591,12 @@ export class EvmHookModule extends HyperlaneModule<
 
   protected async deployStorageGasOracle({
     config,
+    oracleConfig = config.oracleConfig,
   }: {
     config: IgpConfig;
+    // Oracle data to seed the deployed oracle with. Defaults to the native
+    // oracleConfig; token gas oracles pass their per-fee-token config instead.
+    oracleConfig?: IgpConfig['oracleConfig'];
   }): Promise<StorageGasOracle> {
     // Deploy the StorageGasOracle, by default msg.sender is the owner
     const gasOracle = await this.deployer.deployContractFromFactory(
@@ -1147,7 +1609,7 @@ export class EvmHookModule extends HyperlaneModule<
     // Obtain the transactions to set the gas params for each remote
     const configureTxs = await this.updateStorageGasOracle({
       gasOracle: gasOracle.address,
-      targetOracleConfig: config.oracleConfig,
+      targetOracleConfig: oracleConfig,
       targetOverhead: config.overhead,
     });
 

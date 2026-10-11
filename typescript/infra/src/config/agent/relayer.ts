@@ -6,19 +6,21 @@ import {
   AgentConfig,
   ChainMap,
   GasPaymentEnforcement,
-  HyperlaneAddresses,
   HyperlaneAddressesMap,
   HyperlaneFactories,
   IsmCacheConfig,
   MatchingList,
   RelayerConfig as RelayerAgentConfig,
+  type WarpCoreConfig,
 } from '@hyperlane-xyz/sdk';
 import {
   Address,
-  ProtocolType,
   addressToBytes32,
+  assert,
+  isEVMLike,
   isValidAddressEvm,
   objMap,
+  retryAsync,
   rootLogger,
 } from '@hyperlane-xyz/utils';
 
@@ -61,6 +63,53 @@ export interface RelayerBatchConfig {
   maxSubmitQueueLength?: ChainMap<number>;
 }
 
+export type AddressLookupTableOverride = { matchingList: MatchingList } & (
+  | { addressLookupTable: string; addressLookupTables?: never }
+  | {
+      addressLookupTable?: never;
+      addressLookupTables: [string, ...string[]];
+    }
+);
+
+/**
+ * Builds destination-process ALT overrides from registered warp routes.
+ * Routes without SVM ALT metadata are ignored. Each generated override matches
+ * the destination warp program and supplies the complete ordered ALT bundle.
+ */
+export function buildWarpRouteProcessAltOverrides(
+  warpRoutes: readonly WarpCoreConfig[],
+): ChainMap<AddressLookupTableOverride[]> {
+  const overrides: ChainMap<AddressLookupTableOverride[]> = {};
+
+  for (const route of warpRoutes) {
+    const altAddresses = route.options?.sealevel?.altAddresses;
+    if (!altAddresses) continue;
+
+    for (const [chainName, alts] of Object.entries(altAddresses)) {
+      const destinationToken = route.tokens.find(
+        (token) => token.chainName === chainName,
+      );
+      assert(
+        destinationToken?.addressOrDenom,
+        `Warp ALT metadata references missing token on ${chainName}`,
+      );
+
+      const chainOverrides = overrides[chainName] ?? [];
+      chainOverrides.push({
+        matchingList: [
+          {
+            recipientAddress: addressToBytes32(destinationToken.addressOrDenom),
+          },
+        ],
+        addressLookupTables: [alts.core, ...alts.warpSpecific],
+      });
+      overrides[chainName] = chainOverrides;
+    }
+  }
+
+  return overrides;
+}
+
 // Incomplete basic relayer agent config
 export interface BaseRelayerConfig {
   gasPaymentEnforcement: GasPaymentEnforcement[];
@@ -71,6 +120,7 @@ export interface BaseRelayerConfig {
   skipTransactionGasLimitFor?: string[];
   metricAppContextsGetter?: () => MetricAppContext[];
   ismCacheConfigs?: Array<IsmCacheConfig>;
+  processAltOverrides?: ChainMap<AddressLookupTableOverride[]>;
   dbBootstrap?: boolean;
   mixing?: RelayerMixingConfig;
   environmentVariableEndpointEnabled?: boolean;
@@ -78,6 +128,19 @@ export interface BaseRelayerConfig {
   batch?: RelayerBatchConfig;
   txIdIndexingEnabled?: boolean;
   igpIndexingEnabled?: boolean;
+  websocketUrl?: string;
+  websocketAuthorityEnabled?: boolean;
+  reorgPeriodOverrides?: ChainMap<number>;
+  interval?: number;
+  relayApi?: RelayApiConfig;
+}
+
+export interface RelayApiConfig {
+  enabled: boolean;
+  port?: number;
+  rateLimitMaxRequests?: number;
+  rateLimitWindowSecs?: number;
+  corsOrigins?: string;
 }
 
 // Full relayer-specific agent config for a single chain
@@ -113,6 +176,8 @@ export interface HelmRelayerValues extends HelmStatefulSetValues {
   environmentVariableEndpointEnabled?: boolean;
   // Config for the cache
   cacheDefaultExpirationSeconds?: number;
+  // Config for the relay API
+  relayApi?: RelayApiConfig;
 }
 
 export interface RelayerDbBootstrapConfig {
@@ -177,6 +242,30 @@ export class RelayerConfigHelper extends AgentConfigHelper<RelayerConfig> {
     relayerConfig.allowContractCallCaching = baseConfig.cache?.enabled ?? false;
     relayerConfig.txIdIndexingEnabled = baseConfig.txIdIndexingEnabled ?? true;
     relayerConfig.igpIndexingEnabled = baseConfig.igpIndexingEnabled ?? true;
+    if (baseConfig.websocketUrl !== undefined) {
+      relayerConfig.websocketUrl = baseConfig.websocketUrl;
+    }
+    if (baseConfig.websocketAuthorityEnabled !== undefined) {
+      relayerConfig.websocketAuthorityEnabled =
+        baseConfig.websocketAuthorityEnabled;
+    }
+    if (baseConfig.relayApi !== undefined) {
+      relayerConfig.relayApiEnabled = baseConfig.relayApi.enabled;
+      if (baseConfig.relayApi.port !== undefined) {
+        relayerConfig.relayApiPort = baseConfig.relayApi.port;
+      }
+      if (baseConfig.relayApi.rateLimitMaxRequests !== undefined) {
+        relayerConfig.relayApiRateLimitMaxRequests =
+          baseConfig.relayApi.rateLimitMaxRequests;
+      }
+      if (baseConfig.relayApi.rateLimitWindowSecs !== undefined) {
+        relayerConfig.relayApiRateLimitWindowSecs =
+          baseConfig.relayApi.rateLimitWindowSecs;
+      }
+      if (baseConfig.relayApi.corsOrigins !== undefined) {
+        relayerConfig.relayApiCorsOrigins = baseConfig.relayApi.corsOrigins;
+      }
+    }
 
     return relayerConfig;
   }
@@ -195,9 +284,9 @@ export class RelayerConfigHelper extends AgentConfigHelper<RelayerConfig> {
       await awsUser.createIfNotExists();
       const awsKey = (await awsUser.createKeyIfNotExists(this)).keyConfig;
 
-      // AWS keys only work for Ethereum chains
+      // AWS keys only work for EVM-like chains
       for (const chainName of this.relayChains) {
-        if (getChain(chainName).protocol === ProtocolType.Ethereum) {
+        if (isEVMLike(getChain(chainName).protocol)) {
           chainSigners[chainName] = awsKey;
         }
       }
@@ -230,13 +319,19 @@ export class RelayerConfigHelper extends AgentConfigHelper<RelayerConfig> {
           },
           'Fetching sanctioned addresses',
         );
-        const json = await fetch(rawUrl);
-        const sanctionedAddresses = schema.parse(await json.json());
+        const sanctionedAddresses = await retryAsync(
+          async () => {
+            const json = await fetch(rawUrl);
+            return schema.parse(await json.json());
+          },
+          3, // attempts
+          1000, // 1s base delay
+        );
         return sanctionedAddresses;
       }),
     );
 
-    const sanctionedEthereumAdresses = allSanctionedAddresses
+    const sanctionedEthereumAddresses = allSanctionedAddresses
       .flat()
       .filter((address) => {
         if (!isValidAddressEvm(address)) {
@@ -263,7 +358,7 @@ export class RelayerConfigHelper extends AgentConfigHelper<RelayerConfig> {
 
     const uniqueAddresses = new Set(
       [
-        ...sanctionedEthereumAdresses,
+        ...sanctionedEthereumAddresses,
         ...radiantExploiter,
         ...flowAddresses,
       ].map((address) => address.toLowerCase()),
@@ -341,43 +436,47 @@ export function consistentSenderRecipientMatchingList(
 export function chainMapMatchingList(
   chainMap: ChainMap<Address>,
 ): MatchingList {
-  // Convert to a router matching list
-  const routers = objMap(chainMap, (chain, address) => ({
-    router: address,
-  }));
-  return routerMatchingList(routers);
+  return multiAddressChainMapMatchingList(
+    objMap(chainMap, (_chain, address) => [address]),
+  );
+}
+
+// Create a matching list for chains that have multiple addresses (e.g. mixed token types in one warp route).
+// Generates entries for all (source, destination) pairs where sender/recipient arrays include all addresses for that chain.
+export function multiAddressChainMapMatchingList(
+  chainAddresses: ChainMap<Address[]>,
+): MatchingList {
+  const chains = Object.keys(chainAddresses);
+  const list: MatchingList = [];
+
+  for (const source of chains) {
+    for (const destination of chains) {
+      if (source === destination) continue;
+      list.push({
+        originDomain: getDomainId(source),
+        senderAddress: Array.from(new Set(chainAddresses[source])).map((addr) =>
+          addressToBytes32(addr),
+        ),
+        destinationDomain: getDomainId(destination),
+        recipientAddress: Array.from(new Set(chainAddresses[destination])).map(
+          (addr) => addressToBytes32(addr),
+        ),
+      });
+    }
+  }
+
+  return list;
 }
 
 // Create a matching list for the given contract addresses
 export function matchingList<F extends HyperlaneFactories>(
   addressesMap: HyperlaneAddressesMap<F>,
 ): MatchingList {
-  const chains = Object.keys(addressesMap);
-
-  // matching list must have at least one element so bypass and check before returning
-  const matchingList: MatchingList = [];
-
-  for (const source of chains) {
-    for (const destination of chains) {
-      if (source === destination) {
-        continue;
-      }
-
-      const uniqueAddresses = (addresses: HyperlaneAddresses<F>) =>
-        Array.from(new Set(Object.values(addresses)).values()).map((s) =>
-          addressToBytes32(s),
-        );
-
-      matchingList.push({
-        originDomain: getDomainId(source),
-        senderAddress: uniqueAddresses(addressesMap[source]),
-        destinationDomain: getDomainId(destination),
-        recipientAddress: uniqueAddresses(addressesMap[destination]),
-      });
-    }
-  }
-
-  return matchingList;
+  return multiAddressChainMapMatchingList(
+    objMap(addressesMap, (_chain, addresses) =>
+      Array.from(new Set<string>(Object.values(addresses))),
+    ),
+  );
 }
 
 /**

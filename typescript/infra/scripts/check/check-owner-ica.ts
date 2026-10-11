@@ -3,9 +3,11 @@ import {
   Address,
   LogFormat,
   LogLevel,
+  bytes32ToAddress,
   configureRootLogger,
   eqAddress,
   isZeroishAddress,
+  mapAllSettled,
   rootLogger,
 } from '@hyperlane-xyz/utils';
 
@@ -13,11 +15,7 @@ import {
   getGovernanceIcas,
   getGovernanceSafes,
 } from '../../config/environments/mainnet3/governance/utils.js';
-import {
-  chainsToSkip,
-  legacyEthIcaRouter,
-  legacyIcaChains,
-} from '../../src/config/chain.js';
+import { chainsToSkip, minimalIcaChains } from '../../src/config/chain.js';
 import { withGovernanceType } from '../../src/governance.js';
 import { isEthereumProtocolChain } from '../../src/utils/utils.js';
 import { getArgs as getEnvArgs, withChains } from '../agent-utils.js';
@@ -77,23 +75,36 @@ async function main() {
     string,
     { Expected: Address; Actual: Address }
   > = {};
-  const settledResults = await Promise.allSettled(
-    checkOwnerIcaChains.map(async (chain) => {
+  const { fulfilled, rejected } = await mapAllSettled(
+    checkOwnerIcaChains,
+    async (chain) => {
       const expectedAddress = icas[chain];
       if (!expectedAddress) {
         rootLogger.error(`No expected address found for ${chain}`);
-        return { chain, error: 'No expected address found' };
+        return { chain, error: 'No expected address found' as const };
       }
 
-      const icaRouter = legacyIcaChains.includes(chain)
-        ? legacyEthIcaRouter
-        : ownerChainInterchainAccountRouter;
-
       try {
-        const actualAccount = await interchainAccountApp.getAccount(chain, {
-          ...ownerConfig,
-          localRouter: icaRouter,
-        });
+        const destinationRouter =
+          interchainAccountApp.contractsMap[chain].interchainAccountRouter;
+        const originDomain = multiProvider.getDomainId(ownerConfig.origin);
+        const destinationIsm = bytes32ToAddress(
+          await destinationRouter.isms(originDomain),
+        );
+        const actualAccount = minimalIcaChains.includes(chain)
+          ? await destinationRouter[
+              'getLocalInterchainAccount(uint32,address,address,address)'
+            ](
+              originDomain,
+              ownerConfig.owner,
+              ownerChainInterchainAccountRouter,
+              destinationIsm,
+            )
+          : await interchainAccountApp.getAccount(chain, {
+              ...ownerConfig,
+              localRouter: ownerChainInterchainAccountRouter,
+            });
+
         if (!eqAddress(expectedAddress, actualAccount)) {
           return {
             chain,
@@ -105,33 +116,40 @@ async function main() {
         }
         return { chain, result: null };
       } catch (error) {
-        rootLogger.error(`Error processing chain ${chain}:`, error);
         return { chain, error };
       }
-    }),
+    },
+    (chain) => chain,
   );
 
-  settledResults.forEach((settledResult) => {
-    if (settledResult.status === 'fulfilled') {
-      const { chain, result, error } = settledResult.value;
-      if (error) {
-        rootLogger.error(`Failed to process ${chain}:`, error);
-      } else if (result) {
-        mismatchedResults[chain] = result;
-      }
-    } else {
-      rootLogger.error(`Promise rejected:`, settledResult.reason);
+  const failedChains: string[] = [];
+  for (const [chain, value] of fulfilled) {
+    if ('error' in value && value.error) {
+      failedChains.push(chain);
+      rootLogger.error(`Failed to process ${chain}:`, value.error);
+    } else if (value.result) {
+      mismatchedResults[chain] = value.result;
     }
-  });
+  }
+
+  for (const [chain, error] of rejected) {
+    failedChains.push(chain);
+    rootLogger.error(`Promise rejected for ${chain}:`, error);
+  }
 
   if (Object.keys(mismatchedResults).length > 0) {
     rootLogger.error('\nMismatched ICAs found:');
     // eslint-disable-next-line no-console
     console.table(mismatchedResults);
     process.exit(1);
-  } else {
-    rootLogger.info('✅ All ICAs match the expected addresses.');
   }
+
+  if (failedChains.length > 0) {
+    rootLogger.error(`Failed to process chains: ${failedChains.join(', ')}`);
+    process.exit(1);
+  }
+
+  rootLogger.info('✅ All ICAs match the expected addresses.');
   process.exit(0);
 }
 

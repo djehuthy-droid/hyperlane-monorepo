@@ -1,0 +1,625 @@
+# @hyperlane-xyz/tron-sdk
+
+## 26.0.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@45.0.1
+- @hyperlane-xyz/core@12.2.0
+- @hyperlane-xyz/provider-sdk@11.0.1
+
+## 26.0.0
+
+### Major Changes
+
+- 47d25a1: The Tron SDK was migrated to the stricter shared TypeScript configuration.
+
+### Patch Changes
+
+- Updated dependencies [ee50f43]
+- Updated dependencies [12678bc]
+- Updated dependencies [0aeb76a]
+- Updated dependencies [9a59116]
+- Updated dependencies [ebf3922]
+- Updated dependencies [28eda66]
+- Updated dependencies [43f89c6]
+- Updated dependencies [4e2ab65]
+- Updated dependencies [4ad4577]
+- Updated dependencies [f64f992]
+  - @hyperlane-xyz/provider-sdk@11.0.0
+  - @hyperlane-xyz/core@12.2.0
+  - @hyperlane-xyz/utils@45.0.0
+
+## 25.0.2
+
+### Patch Changes
+
+- 16df6ee: Bumped the @hyperlane-xyz/registry catalog pin to 26.1.0 and released the exact-pin cascade through tron-sdk, deploy-sdk, sdk, and widgets.
+  - @hyperlane-xyz/utils@44.0.2
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@10.0.2
+
+## 25.0.1
+
+### Patch Changes
+
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/utils@44.0.1
+  - @hyperlane-xyz/core@12.1.0
+
+## 25.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+### Patch Changes
+
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+  - @hyperlane-xyz/core@12.1.0
+
+## 24.2.1
+
+### Patch Changes
+
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/utils@43.0.0
+  - @hyperlane-xyz/core@12.1.0
+
+## 24.2.0
+
+### Minor Changes
+
+- f0f8a56: Tron externally-owned accounts are no longer reported as inactive owners. `TronJsonRpcProvider` gained `isAccountActive`, which reads on-chain activation from the native `wallet/getaccount` endpoint instead of leaving liveness to be inferred from `getTransactionCount` (Tron has no nonces, so that method is hardcoded to 0 and made every Tron EOA look dead). `isAddressActive` now consults that method when the provider offers it and otherwise keeps its existing code-or-nonce behaviour, so `warp check` stops emitting a permanent `ownerStatus` violation for live Tron EOA owners. A failure reaching the Tron node is thrown rather than reported as inactive.
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@42.0.0
+- @hyperlane-xyz/core@12.1.0
+- @hyperlane-xyz/provider-sdk@8.1.3
+
+## 24.1.5
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.1
+- @hyperlane-xyz/core@12.1.0
+- @hyperlane-xyz/provider-sdk@8.1.2
+
+## 24.1.4
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.0
+- @hyperlane-xyz/core@12.1.0
+- @hyperlane-xyz/provider-sdk@8.1.1
+
+## 24.1.3
+
+### Patch Changes
+
+- Updated dependencies [bd4e5f0]
+- Updated dependencies [5899416]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/utils@41.2.0
+
+## 24.1.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.1.0
+- @hyperlane-xyz/core@12.0.0
+- @hyperlane-xyz/provider-sdk@8.0.4
+
+## 24.1.1
+
+### Patch Changes
+
+- Updated dependencies [fa19409]
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+
+## 24.1.0
+
+### Minor Changes
+
+- 4acd9a6: Extended `WarpCore` rate-limit validation to cover Tron xERC20 warp-route standards (`TronHypVSXERC20`, `TronHypVSXERC20Lockbox` and `TronHypCollateralFiat`) by matching against the shared `XERC20_STANDARDS` set instead of enumerating EVM standards inline. The destination mint-limit check now compares capacity in message space using each router's `scale` (mirroring `isDestinationCollateralSufficient`) rather than converting decimals only, and the origin burn-limit check now accounts for the origin-token-denominated fees included in the on-chain burn debit.
+
+  Hardened the Tron SDK ethers adapters. Native contract reads and the ethers-to-Tron transaction conversion now share a single `buildTronTriggerRequest` helper for request construction, fixing calldata serialization so `BytesLike` inputs are hex-encoded rather than stringified. Contract reads are now `eth_call`-first (keeping JSON-RPC-only endpoints working and surfacing reverts as `CALL_EXCEPTION` for missing-selector detection), falling back to the raw `wallet/triggerconstantcontract` full-node endpoint only when `eth_call` is unanswered; that raw path returns data only for a successful execution, and for an executed revert throws a `CALL_EXCEPTION` carrying the revert data (`0x` for a reasonless revert) so missing-selector detection still recognizes empty reverts while reverts with data propagate as genuine reverts, mirroring `eth_call`. Provider reads that omit `from` now execute with the Tron zero address as caller instead of the contract itself. Receipt confirmation now follows ethers semantics: `wait(0)` performs a single non-blocking probe (returning the receipt if the tx is already mined, otherwise `null` for a still-pending tx) so `MultiProvider.handleTx` can gate on inclusion, and `wait(n)` polls until the requested confirmation depth is reached before finalizing success or failure, so a reorgable on-chain failure is not rejected prematurely at a single confirmation. The confirmation poll is unbounded by default, leaving preemption to the caller, with an optional injectable timeout retained for bounding. The synthesized ethers `TransactionReceipt` now carries the deployed contract address (for deployments) and the real block hash fetched from the mined block.
+
+### Patch Changes
+
+- 745fb77: The Tron test runtime was pinned to TRE 2.0.0 and now uses its HTTP health check with an explicit Tron HD path.
+- Updated dependencies [745fb77]
+- Updated dependencies [745fb77]
+- Updated dependencies [469da6d]
+- Updated dependencies [74f3760]
+- Updated dependencies [abeeb52]
+- Updated dependencies [8944dd2]
+- Updated dependencies [eb9c37c]
+- Updated dependencies [3a74600]
+- Updated dependencies [57b1e14]
+- Updated dependencies [f3a6a4e]
+- Updated dependencies [d6e923f]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [5830b8e]
+- Updated dependencies [d3bbedf]
+- Updated dependencies [e5908e9]
+- Updated dependencies [8944dd2]
+- Updated dependencies [89e6a8e]
+- Updated dependencies [c2301b2]
+- Updated dependencies [de37b68]
+- Updated dependencies [c0ca851]
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/utils@40.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.2
+
+## 24.0.1
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/provider-sdk@8.0.1
+
+## 24.0.0
+
+### Major Changes
+
+- 4ef1fde: - `getMinGasForWarpDeploy` now lives on `IProvider` (per-chain) instead of the stateless `ProtocolProvider`. It is `async` and returns a FINAL native-denom amount rather than a mix of gas units and native amounts. It composes the base router deploy cost with additive deltas for detected features (cross-collateral extras, fee program deploy, custom ISM / hook / IGP deploy) driven by the warp config shape, and for gas-metered protocols multiplies gas units by the chain gas price.
+  - `ChainMetadataForAltVM` gained an optional `gasPrice` field.
+  - `ProviderBuilderFn` now takes a full `ChainMetadata` instead of `(rpcUrls, network)`.
+  - The AltVM `IProvider.connect` and `ISigner.connectWithSigner` static factories now take `ChainMetadataForAltVM` as their first argument, replacing the previous `(rpcUrls, chainId, extraParams)` shape and the metadata-through-`extraParams` indirection.
+  - The CLI warp-deploy preflight now sizes AltVM native-balance requirements from the composed per-chain deploy cost, so feature-heavy deploys are no longer silently under-funded, and chains without a gas price are no longer skipped for the warp-deploy path.
+  - The AltVM warp-deploy base gas costs were calibrated from measured deploys (Sealevel from mainnet; Starknet, Aleo, and Radix from devnet base-router floors with safety margin), replacing the previous catastrophically-low placeholder constants that let preflight pass under-funded accounts.
+  - The Starknet test fixture native token was corrected from ETH to STRK to match the production registry and the token the devnet actually charges fees in.
+
+### Patch Changes
+
+- 6f61265: The Tron test runtime was pinned to TRE 2.0.0 and now uses its HTTP health check with an explicit Tron HD path.
+- 1a31d04: Fixed a bug where a Tron transaction that broadcast successfully but reverted on-chain was silently treated as a success by the ethers-compatible `TronWallet`. The `wait` returned by `getTransactionResponse` delegated to ethers' stock `waitForTransaction`, which resolves the receipt without the status-0 revert throw ethers only injects for EVM. It now fetches the transaction's execution info from the full node via `getUnconfirmedTransactionInfo` (available immediately after mining, unlike `getTransactionInfo`, which queries the lagging solidity node and returns `{}` until the block solidifies) and throws a descriptive `Tron Transaction Failed` error on a reverted or failed transaction, matching EVM's `CALL_EXCEPTION` behavior; when the info is not yet populated it falls back to the JSON-RPC receipt status. The revert-detection logic was extracted into a shared `assertTronReceiptSuccess` helper reused by both `TronWallet` and the AltVM `TronProvider.waitForTransaction` path, and now flags both the top-level `result` (`FAILED`) and any non-`SUCCESS` nested `receipt.result` contractResult value (`REVERT`, `OUT_OF_ENERGY`, ...) as failures, while treating the absent nested result of a plain transfer as success.
+- Updated dependencies [4ef1fde]
+- Updated dependencies [735793b]
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/utils@39.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 23.1.4
+
+### Patch Changes
+
+- Updated dependencies [961a89d]
+  - @hyperlane-xyz/provider-sdk@7.2.0
+  - @hyperlane-xyz/utils@38.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 23.1.3
+
+### Patch Changes
+
+- Updated dependencies [df34a68]
+- Updated dependencies [cc4bdb6]
+- Updated dependencies [31f8b51]
+- Updated dependencies [97e8ca1]
+  - @hyperlane-xyz/provider-sdk@7.1.0
+  - @hyperlane-xyz/utils@37.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 23.1.2
+
+### Patch Changes
+
+- aa41ce4: SVM fee program management was added to the SVM SDK with full create, read, and update support for all 6 fee types (linear, regressive, progressive, offchainQuotedLinear, routing, crossCollateralRouting). The provider-sdk fee types were refactored with a FeeParams discriminated union (bps vs raw), PascalCase FeeType/FeeStrategyType values, expanded DerivedFeeConfig with resolved bigint fields, and a required FeeReadContext parameter on createFeeArtifactManager. Shared BPS fee utilities (computeBps, bpsToRawFeeParams, constants) were consolidated into provider-sdk as the single source of truth — sdk and svm-sdk now import from provider-sdk. The EVM SDK TokenFeeType was converted from enum to const object for structural compatibility. Legacy pre-fee program bytes were preserved for upgrade testing. The repeated account-decoding boilerplate in the fee and token decoders was consolidated into a shared decodeDiscriminatedAccount helper.
+- 823eca3: TronWallet now uses the provided RPC URL's host for building, signing and broadcasting transactions instead of silently redirecting non-TronGrid/localhost hosts to the public https://api.trongrid.io endpoint. This fixes private/custom Tron RPCs being ignored for broadcasting (which caused rate-limiting/429s and leaked transactions to a third party). API keys via `custom_rpc_header` continue to work. As an intended behavior change, an RPC that serves eth JSON-RPC but not the Tron HTTP API (`/wallet/*`) will now fail loudly instead of silently succeeding by routing broadcasts through public TronGrid; such setups should point the RPC at a full Tron HTTP API host (or TronGrid with an API key via `custom_rpc_header`).
+- Updated dependencies [9cd7606]
+- Updated dependencies [aa41ce4]
+- Updated dependencies [2f9d783]
+- Updated dependencies [9bdab1d]
+  - @hyperlane-xyz/utils@36.0.0
+  - @hyperlane-xyz/provider-sdk@7.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 23.1.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@35.2.0
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@6.1.1
+
+## 23.1.0
+
+### Minor Changes
+
+- d1b6f0a: Added new hook deploy command
+
+### Patch Changes
+
+- Updated dependencies [d1b6f0a]
+  - @hyperlane-xyz/provider-sdk@6.1.0
+  - @hyperlane-xyz/utils@35.1.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 23.0.9
+
+### Patch Changes
+
+- Updated dependencies [da1cfb1]
+  - @hyperlane-xyz/utils@35.0.1
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/provider-sdk@6.0.4
+
+## 23.0.8
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@35.0.0
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@6.0.3
+
+## 23.0.7
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@34.0.0
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@6.0.2
+
+## 23.0.6
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@33.1.1
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@6.0.1
+
+## 23.0.5
+
+### Patch Changes
+
+- Updated dependencies [bfe4d2e]
+  - @hyperlane-xyz/provider-sdk@6.0.0
+  - @hyperlane-xyz/utils@33.1.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 23.0.4
+
+### Patch Changes
+
+- b864cca: Multi-VM fee type support was added to provider-sdk and deploy-sdk. Fee types (linear, regressive, progressive, offchainQuotedLinear, routing, crossCollateralRouting) were defined with Config API and Artifact API variants. FeeReader and FeeWriter with required FeeReadContext were added to deploy-sdk. Fee was integrated into warp types and the warp writer update flow. All protocol providers received createFeeArtifactManager stubs.
+- Updated dependencies [b864cca]
+- Updated dependencies [1f918d0]
+  - @hyperlane-xyz/provider-sdk@5.1.0
+  - @hyperlane-xyz/utils@33.0.2
+  - @hyperlane-xyz/core@11.3.1
+
+## 23.0.3
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@33.0.1
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@5.0.3
+
+## 23.0.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@33.0.0
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@5.0.2
+
+## 23.0.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@32.0.1
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@5.0.1
+
+## 23.0.0
+
+### Major Changes
+
+- 3dc6367: Core query methods (getIsmType, getRoutingIsm, getHookType, etc.) were removed from the IProvider interface and extracted into standalone query functions in each SDK. isMessageDelivered was kept on the interface to enforce all providers implement it.
+
+  Starknet get\*Transaction methods were extracted into standalone tx builder functions (mailbox-tx.ts, ism-tx.ts, hook-tx.ts, warp-tx.ts) with their own parameter types, removing the dependency on provider-sdk Req/Res types.
+
+  Tron and Aleo providers and signers had all get\*Transaction and action methods removed. Old e2e tests replaced with artifact API equivalents.
+
+  76 Req/Res types were removed from provider-sdk altvm.ts, reducing it from 587 to 243 lines.
+
+- fa08f2a: IProvider and ISigner interfaces were slimmed to their minimal surface. IProvider was reduced from 53 to 22 query-only methods by removing all get\*Transaction methods. ISigner was reduced from 36 to 5 infrastructure methods by removing all action methods (createMailbox, setDefaultIsm, enrollRemoteRouter, etc.). Transaction building is now handled exclusively by artifact managers using concrete class methods or standalone helper functions.
+
+  Throwing stubs were removed from SVM, Cosmos, Radix, and Starknet provider/signer implementations. Old action-method-based e2e tests were replaced with artifact API equivalents. Cosmos routing ISM writer was fixed to handle domain route updates correctly via remove + re-add.
+
+### Patch Changes
+
+- Updated dependencies [3dc6367]
+- Updated dependencies [fa08f2a]
+  - @hyperlane-xyz/provider-sdk@5.0.0
+  - @hyperlane-xyz/utils@32.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 22.1.14
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@31.2.1
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@4.3.4
+
+## 22.1.13
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@31.2.0
+- @hyperlane-xyz/core@11.3.1
+- @hyperlane-xyz/provider-sdk@4.3.3
+
+## 22.1.12
+
+### Patch Changes
+
+- 8a082af: Added runtime entrypoints for non-EVM SDKs and avoided bundling heavy deploy-time modules in UI wallet integrations.
+  - @hyperlane-xyz/utils@31.1.0
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/provider-sdk@4.3.2
+
+## 22.1.11
+
+### Patch Changes
+
+- Updated dependencies [d5168fc]
+  - @hyperlane-xyz/utils@31.0.1
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/provider-sdk@4.3.1
+
+## 22.1.10
+
+### Patch Changes
+
+- 1dac3b0: TronJsonRpcProvider and TronTransactionBuilder were updated to parse custom_rpc_header query params into HTTP headers, fixing auth with third-party RPC providers like Tatum.
+- Updated dependencies [44626fb]
+- Updated dependencies [7ad1f9e]
+  - @hyperlane-xyz/provider-sdk@4.3.0
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/utils@31.0.0
+
+## 22.1.9
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@30.1.1
+- @hyperlane-xyz/core@11.3.0
+- @hyperlane-xyz/provider-sdk@4.2.5
+
+## 22.1.8
+
+### Patch Changes
+
+- Updated dependencies [9ac480a]
+- Updated dependencies [9eefa2d]
+- Updated dependencies [4c4462f]
+- Updated dependencies [696da11]
+- Updated dependencies [46dda6c]
+- Updated dependencies [ac1acbb]
+- Updated dependencies [d38fad1]
+- Updated dependencies [cfed1d2]
+- Updated dependencies [9061916]
+- Updated dependencies [d41d088]
+- Updated dependencies [b691b87]
+- Updated dependencies [7018cc6]
+- Updated dependencies [ef4399b]
+- Updated dependencies [3fef31c]
+- Updated dependencies [d98726f]
+- Updated dependencies [40356c6]
+- Updated dependencies [6f8c503]
+- Updated dependencies [f2749a6]
+- Updated dependencies [6bd4fd1]
+- Updated dependencies [57e46b1]
+- Updated dependencies [993de2b]
+- Updated dependencies [b5f897c]
+- Updated dependencies [9515191]
+  - @hyperlane-xyz/core@11.3.0
+  - @hyperlane-xyz/utils@30.1.0
+  - @hyperlane-xyz/provider-sdk@4.2.4
+
+## 22.1.7
+
+### Patch Changes
+
+- Updated dependencies [ac297da]
+- Updated dependencies [77db719]
+- Updated dependencies [37255ba]
+- Updated dependencies [7646819]
+  - @hyperlane-xyz/core@11.2.0
+  - @hyperlane-xyz/provider-sdk@4.2.3
+  - @hyperlane-xyz/utils@30.0.0
+
+## 22.1.6
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@29.1.0
+- @hyperlane-xyz/core@11.1.0
+- @hyperlane-xyz/provider-sdk@4.2.2
+
+## 22.1.5
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@29.0.1
+- @hyperlane-xyz/core@11.1.0
+- @hyperlane-xyz/provider-sdk@4.2.1
+
+## 22.1.4
+
+### Patch Changes
+
+- 3c6b1ad: Fixed Tron gas estimation and transaction building for wallet integration.
+- 084c6b6: The TypeScript packages were updated to support TypeScript 6.0 and to make ambient type loading explicit so the future TypeScript 7.0 upgrade is smoother.
+- Updated dependencies [3c6b1ad]
+- Updated dependencies [084c6b6]
+  - @hyperlane-xyz/utils@29.0.0
+  - @hyperlane-xyz/provider-sdk@4.2.0
+  - @hyperlane-xyz/core@11.1.0
+
+## 22.1.3
+
+### Patch Changes
+
+- 2e622e8: TronJsonRpcProvider was changed to extend `StaticJsonRpcProvider` with a `detectNetwork` fallback and default `estimateGas` override for Tron's unreliable RPC methods. Automatic `/jsonrpc` suffix appending was removed — callers now pass the correct URL directly. TronWallet now parses `custom_rpc_header` query params from RPC URLs and forwards them as headers to TronWeb HTTP API calls (needed for TronGrid API key auth). `alterTransaction` was switched to `txLocal: true` to avoid unnecessary network roundtrips.
+- Updated dependencies [5caac66]
+- Updated dependencies [6c715a7]
+  - @hyperlane-xyz/provider-sdk@4.1.0
+  - @hyperlane-xyz/core@11.1.0
+  - @hyperlane-xyz/utils@28.1.0
+
+## 22.1.2
+
+### Patch Changes
+
+- Updated dependencies [83767b9]
+- Updated dependencies [a6b7bf3]
+- Updated dependencies [a4a74d8]
+  - @hyperlane-xyz/provider-sdk@4.0.0
+  - @hyperlane-xyz/core@11.0.3
+  - @hyperlane-xyz/utils@28.0.0
+
+## 22.1.1
+
+### Patch Changes
+
+- Updated dependencies [b892e61]
+- Updated dependencies [b892e61]
+- Updated dependencies [b892e61]
+  - @hyperlane-xyz/provider-sdk@3.1.0
+  - @hyperlane-xyz/utils@27.1.0
+  - @hyperlane-xyz/core@11.0.2
+
+## 22.1.0
+
+### Minor Changes
+
+- 4a816e3: Add retry logic to TronJsonProvider
+
+### Patch Changes
+
+- Updated dependencies [f7ebf6c]
+  - @hyperlane-xyz/core@11.0.2
+  - @hyperlane-xyz/utils@27.0.0
+  - @hyperlane-xyz/provider-sdk@3.0.1
+
+## 22.0.0
+
+### Major Changes
+
+- 1d116d8: Added Tron ProtocolType & deprecated Tron TechnicalStack. Add support for TronLink wallet in the widgets.
+
+### Patch Changes
+
+- Updated dependencies [06aacac]
+- Updated dependencies [1d116d8]
+  - @hyperlane-xyz/utils@26.0.0
+  - @hyperlane-xyz/provider-sdk@3.0.0
+  - @hyperlane-xyz/core@11.0.1
+
+## 21.1.5
+
+### Patch Changes
+
+- Updated dependencies [e197331]
+- Updated dependencies [840fb33]
+  - @hyperlane-xyz/provider-sdk@2.0.0
+  - @hyperlane-xyz/utils@25.5.0
+  - @hyperlane-xyz/core@11.0.1
+
+## 21.1.4
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@25.4.1
+- @hyperlane-xyz/provider-sdk@1.4.1
+- @hyperlane-xyz/core@11.0.1
+
+## 21.1.3
+
+### Patch Changes
+
+- Updated dependencies [1f021bf]
+- Updated dependencies [027eeac]
+- Updated dependencies [1f021bf]
+  - @hyperlane-xyz/utils@25.4.0
+  - @hyperlane-xyz/core@11.0.1
+  - @hyperlane-xyz/provider-sdk@1.4.0
+
+## 21.1.2
+
+### Patch Changes
+
+- Updated dependencies [521d42b]
+  - @hyperlane-xyz/core@10.2.0
+  - @hyperlane-xyz/utils@25.3.2
+  - @hyperlane-xyz/provider-sdk@1.3.6
+
+## 21.1.1
+
+### Patch Changes
+
+- 7636bb4: fix: assert import
+  - @hyperlane-xyz/utils@25.3.1
+  - @hyperlane-xyz/provider-sdk@1.3.5
+  - @hyperlane-xyz/core@10.1.5
+
+## 21.1.0
+
+### Minor Changes
+
+- aea767c: Tron Virtual Machine (TVM) support added to the Hyperlane SDK. The new `@hyperlane-xyz/tron-sdk` package provides `TronJsonRpcProvider`, `TronWallet`, and `TronContractFactory` for interacting with Tron chains. The SDK deployers now automatically use Tron-compiled factories for Create2-affected contracts (ISM/hook factories, ICA router) when deploying to Tron chains.
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@25.3.0
+- @hyperlane-xyz/provider-sdk@1.3.4
+
+## 21.0.2
+
+### Patch Changes
+
+- Updated dependencies [360db52]
+- Updated dependencies [ccd638d]
+  - @hyperlane-xyz/utils@25.2.0
+  - @hyperlane-xyz/provider-sdk@1.3.3
+  - @hyperlane-xyz/eslint-config@25.2.0
+
+## 21.0.1
+
+### Patch Changes
+
+- Updated dependencies [b930534]
+  - @hyperlane-xyz/utils@25.1.0
+  - @hyperlane-xyz/provider-sdk@1.3.2
+  - @hyperlane-xyz/eslint-config@25.1.0
+
+## 21.0.0
+
+### Major Changes
+
+- 1eb26db: feat: add tron-sdk base package
+
+### Patch Changes
+
+- Updated dependencies [52ce778]
+  - @hyperlane-xyz/utils@25.0.0
+  - @hyperlane-xyz/provider-sdk@1.3.1
+  - @hyperlane-xyz/eslint-config@25.0.0

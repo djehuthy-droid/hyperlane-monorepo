@@ -1,5 +1,133 @@
 # @hyperlane-xyz/starknet-core
 
+## 45.0.1
+
+## 45.0.0
+
+### Patch Changes
+
+- 0aeb76a: Reduced contract build times by compiling Tron without shared source mutations, retaining its incremental compiler cache, and parallelizing Starknet artifact generation. Generated contract artifacts were preserved.
+
+## 44.0.2
+
+## 44.0.1
+
+## 44.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+## 43.0.0
+
+## 42.0.0
+
+## 41.3.1
+
+## 41.3.0
+
+## 41.2.0
+
+## 41.1.0
+
+## 41.0.0
+
+## 40.0.0
+
+## 39.1.0
+
+### Minor Changes
+
+- 086ec59: Kept Starknet deployment artifacts out of browser runtime paths by publishing ABI and class-hash data through dedicated runtime exports.
+
+## 39.0.0
+
+## 38.0.0
+
+## 37.0.0
+
+## 36.0.0
+
+## 35.2.0
+
+## 35.1.0
+
+## 35.0.1
+
+## 35.0.0
+
+## 34.0.0
+
+## 33.1.1
+
+## 33.1.0
+
+## 33.0.2
+
+## 33.0.1
+
+## 33.0.0
+
+## 32.0.1
+
+## 32.0.0
+
+## 31.2.1
+
+## 31.2.0
+
+## 31.1.0
+
+## 31.0.1
+
+## 31.0.0
+
+## 30.1.1
+
+## 30.1.0
+
+## 30.0.0
+
+## 29.1.0
+
+## 29.0.1
+
+## 29.0.0
+
+## 28.1.0
+
+## 28.0.0
+
+## 27.1.0
+
+## 27.0.0
+
+## 26.0.0
+
+## 25.5.0
+
+## 25.4.1
+
+## 25.4.0
+
+## 25.3.2
+
+## 25.3.1
+
+## 25.3.0
+
+## 25.2.0
+
+## 25.1.0
+
+## 25.0.0
+
+## 24.0.0
+
+## 23.0.0
+
+## 22.0.0
+
 ## 21.1.0
 
 ## 21.0.0
@@ -9,7 +137,6 @@
 ### Patch Changes
 
 - 11fa887: Upgrade TypeScript from 5.3.3 to 5.8.3 and compilation target to ES2023
-
   - Upgraded TypeScript from 5.3.3 to 5.8.3 across all packages
   - Updated compilation target from ES2022 to ES2023 (Node 16+ fully supported)
   - Converted internal const enums to 'as const' pattern for better compatibility

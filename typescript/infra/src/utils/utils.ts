@@ -2,13 +2,14 @@
 import asn1 from 'asn1.js';
 import { exec } from 'child_process';
 import { ethers } from 'ethers';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 import { ChainMap, ChainName, NativeToken } from '@hyperlane-xyz/sdk';
 import {
   Address,
   ProtocolType,
+  isEVMLike,
   objFilter,
   stringifyObject,
 } from '@hyperlane-xyz/utils';
@@ -74,9 +75,11 @@ export function execCmd(
         }
         if (err) {
           if (rejectWithOutput) {
-            reject([err, stdout.toString(), stderr.toString()]);
+            reject(
+              new Error([err, stdout.toString(), stderr.toString()].join('\n')),
+            );
           } else {
-            reject(err);
+            reject(new Error(err.message, { cause: err }));
           }
         } else {
           resolve([stdout.toString(), stderr.toString()]);
@@ -146,7 +149,7 @@ export function writeJsonAtPath(filepath: string, obj: any) {
 
 export async function writeAndFormatJsonAtPath(filepath: string, obj: any) {
   writeJsonAtPath(filepath, obj);
-  await formatFileWithPrettier(filepath);
+  await formatFile(filepath);
 }
 
 /**
@@ -176,21 +179,34 @@ export function getMonorepoRoot(): string {
 }
 
 /**
- * Formats a file using prettier
+ * Formats a file using oxfmt (JS/TS) or prettier (other file types)
  * @param filepath - The path to the file to format
  */
-export async function formatFileWithPrettier(filepath: string): Promise<void> {
+const OXFMT_EXTENSIONS = new Set([
+  '.js',
+  '.jsx',
+  '.ts',
+  '.tsx',
+  '.mjs',
+  '.cjs',
+]);
+
+export async function formatFile(filepath: string): Promise<void> {
+  const ext = filepath.slice(filepath.lastIndexOf('.'));
+  const absolutePath = resolve(filepath);
+  const formatter = OXFMT_EXTENSIONS.has(ext)
+    ? `npx oxfmt --write "${absolutePath}"`
+    : `npx prettier --write "${absolutePath}"`;
+
   try {
     const monorepoRoot = getMonorepoRoot();
-    await execCmd(`npx prettier --write "${filepath}"`, {
+    await execCmd(formatter, {
       cwd: monorepoRoot,
       stdio: 'pipe',
     });
   } catch (error) {
-    // Silently fail if prettier is not available or fails
-    // This ensures the deployment process continues even if formatting fails
     console.warn(
-      `Warning: Failed to format file with prettier: ${filepath}`,
+      `Warning: Failed to format file: ${filepath}`,
       error instanceof Error ? error.message : error,
     );
   }
@@ -208,8 +224,10 @@ export function assertFundableRole(roleStr: string): FundableRole {
   const role = roleStr as Role;
   if (
     role !== Role.Relayer &&
-    role !== Role.Kathy &&
-    role !== Role.Rebalancer
+    role !== Role.Rebalancer &&
+    role !== Role.InventoryRebalancer &&
+    role !== Role.QuoteSubmitter &&
+    role !== Role.StableswapInventoryRebalancer
   ) {
     throw Error(`Invalid fundable role ${role}`);
   }
@@ -287,7 +305,9 @@ export function chainIsProtocol(chainName: ChainName, protocol: ProtocolType) {
 }
 
 export function isEthereumProtocolChain(chainName: ChainName) {
-  return chainIsProtocol(chainName, ProtocolType.Ethereum);
+  const metadata = getChain(chainName);
+  if (!metadata) throw new Error(`Unknown chain ${chainName}`);
+  return isEVMLike(metadata.protocol);
 }
 
 export function getInfraPath() {

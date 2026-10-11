@@ -1,6 +1,7 @@
 import { constants } from 'ethers';
 
 import { Ownable, Ownable__factory } from '@hyperlane-xyz/core';
+import type { TronJsonRpcProvider } from '@hyperlane-xyz/tron-sdk/runtime';
 import {
   Address,
   EvmChainId,
@@ -10,13 +11,15 @@ import {
   assert,
   eqAddress,
   hexOrBase58ToHex,
+  isEVMLike,
+  isZeroishAddressEvm,
   objFilter,
   objMap,
   pick,
   rootLogger,
 } from '@hyperlane-xyz/utils';
 
-import { EthersLikeProvider } from '../deploy/proxy.js';
+import type { EthersLikeProvider } from '../deploy/proxy.js';
 import { ChainMetadataManager } from '../metadata/ChainMetadataManager.js';
 import { MultiProvider } from '../providers/MultiProvider.js';
 import { AnnotatedEV5Transaction } from '../providers/ProviderType.js';
@@ -46,9 +49,15 @@ export function serializeContractsMap<F extends HyperlaneFactories>(
 export function serializeContracts<F extends HyperlaneFactories>(
   contracts: HyperlaneContracts<F>,
 ): any {
-  return objMap(contracts, (_, contract) =>
-    contract.address ? contract.address : serializeContracts(contract),
-  );
+  return objMap(contracts, (key, contract) => {
+    // Deployers must omit optional contracts instead of setting undefined;
+    // every present leaf is expected to serialize to an address.
+    assert(
+      contract,
+      `Cannot serialize missing contract for key ${String(key)}`,
+    );
+    return contract.address ? contract.address : serializeContracts(contract);
+  });
 }
 
 function getFactory<F extends HyperlaneFactories>(
@@ -160,21 +169,19 @@ export function attachContractsMapAndGetForeignDeployments<
   foreignDeployments: ChainMap<Address>;
 } {
   const contractsMap = attachContractsMap(
-    filterChainMapToProtocol(
-      addressesMap,
-      ProtocolType.Ethereum,
-      metadataManager,
-    ),
+    objFilter(addressesMap, (c, _addrs): _addrs is HyperlaneAddresses<F> => {
+      const protocol = metadataManager.tryGetChainMetadata(c)?.protocol;
+      return !!protocol && isEVMLike(protocol);
+    }),
     factories,
   );
 
   // TODO: This function shouldn't need to be aware of application types like collateral / synthetic / native etc. Ideally this should work for any app, not just warp routes. is it safe to assume this is always an object containing 1 key/value pair, and that the value will always be an address?
   const foreignDeployments = objMap(
-    filterChainMapExcludeProtocol(
-      addressesMap,
-      ProtocolType.Ethereum,
-      metadataManager,
-    ),
+    objFilter(addressesMap, (c, _addrs): _addrs is any => {
+      const protocol = metadataManager.tryGetChainMetadata(c)?.protocol;
+      return !!protocol && !isEVMLike(protocol);
+    }),
     (chain, addresses) => {
       const router =
         addresses.router ||
@@ -192,13 +199,17 @@ export function attachContractsMapAndGetForeignDeployments<
       }
 
       switch (protocolType) {
+        case ProtocolType.Tron:
         case ProtocolType.Ethereum:
-          throw new Error('Ethereum chain should not have foreign deployments');
+          throw new Error('EVM-like chain should not have foreign deployments');
 
         case ProtocolType.Cosmos:
         case ProtocolType.CosmosNative:
         case ProtocolType.Starknet:
           return router;
+
+        case ProtocolType.Aleo:
+          return addressToByteHexString(router, ProtocolType.Aleo);
 
         case ProtocolType.Radix:
           return addressToByteHexString(router, ProtocolType.Radix);
@@ -269,11 +280,11 @@ export function appFromAddressesMapHelper<F extends HyperlaneFactories>(
   contractsMap: HyperlaneContractsMap<F>;
   multiProvider: MultiProvider;
 } {
-  // Filter out non-Ethereum chains from the addressesMap
+  // Filter out non-EVM-like chains from the addressesMap
   const ethereumAddressesMap = objFilter(
     addressesMap,
     (chain, _): _ is HyperlaneAddresses<F> =>
-      multiProvider.getProtocol(chain) === ProtocolType.Ethereum,
+      isEVMLike(multiProvider.getProtocol(chain)),
   );
 
   // Attaches contracts for each Ethereum chain for which we have a complete set of addresses
@@ -299,8 +310,26 @@ export function transferOwnershipTransactions(
   expected: OwnableConfig,
   label?: string,
 ): AnnotatedEV5Transaction[] {
-  if (eqAddress(actual.owner, expected.owner)) {
+  if (
+    eqAddress(actual.owner, expected.owner) ||
+    (isZeroishAddressEvm(actual.owner) && isZeroishAddressEvm(expected.owner))
+  ) {
     return [];
+  }
+
+  if (isZeroishAddressEvm(expected.owner)) {
+    return [
+      {
+        chainId,
+        annotation: `Renouncing ownership of ${label ?? contract} from ${
+          actual.owner
+        }`,
+        to: contract,
+        data: Ownable__factory.createInterface().encodeFunctionData(
+          'renounceOwnership',
+        ),
+      },
+    ];
   }
 
   return [
@@ -318,10 +347,43 @@ export function transferOwnershipTransactions(
   ];
 }
 
+/**
+ * Providers for chains whose account model has no nonce (Tron) answer liveness
+ * directly instead of leaving it to be inferred from `getTransactionCount`.
+ *
+ * The shape is derived from the Tron provider rather than declared
+ * independently so that renaming or removing `isAccountActive` in
+ * @hyperlane-xyz/tron-sdk breaks this build, instead of silently reverting the
+ * structural check below to the always-zero nonce path.
+ */
+type AccountActivationProvider = Pick<TronJsonRpcProvider, 'isAccountActive'>;
+
+function canCheckActivation(
+  provider: EthersLikeProvider,
+): provider is EthersLikeProvider & AccountActivationProvider {
+  return (
+    'isAccountActive' in provider &&
+    typeof provider.isAccountActive === 'function'
+  );
+}
+
 export async function isAddressActive(
   provider: EthersLikeProvider,
   address: Address,
 ): Promise<boolean> {
+  if (canCheckActivation(provider)) {
+    // Deliberately sequential: non-empty code is by itself conclusive, so a
+    // contract must not be put at the mercy of an activation endpoint it never
+    // needed. Issuing both in parallel would propagate an activation failure
+    // for an address we had already proven active.
+    const code = await provider.getCode(address);
+    if (code !== '0x') {
+      return true;
+    }
+
+    return provider.isAccountActive(address);
+  }
+
   const [code, txnCount] = await Promise.all([
     provider.getCode(address),
     provider.getTransactionCount(address),

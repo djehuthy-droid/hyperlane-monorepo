@@ -1,3 +1,17 @@
+## [2.3.0] - 2026-07-20
+
+* feat(tron): migrate Tron agents from gRPC to HTTP API (#8370)
+* feat: faster polling for validator signatures (#8843)
+* feat: static interval override for idle indexing and validator checkpoint polling (#8989)
+* fix(validator): remove rusoto-based AWS region validation (#8669)
+* fix(validator): reuse validator key as Tron origin chain signer (#8911)
+* perf(validator): remove final checkpoint pacing delay (#9033)
+
+## [2.1.0] - 2026-03-04
+
+* feat(tron): protocol type (#7827)
+* fix(validator): tighten timestamp tolerance in reorg test (#8020)
+
 ## [2.0.0] - 2026-01-06
 
 * feat(rust): feature-gate Aleo chain support to reduce CI build times (#7569)

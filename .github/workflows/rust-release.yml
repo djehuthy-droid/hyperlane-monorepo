@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'rust/main/**'
+      - '!rust/main/helm/**'
       - 'rust/scripts/ci/**'
       - '.github/workflows/rust-release.yml'
   workflow_dispatch:
@@ -32,14 +33,14 @@ env:
 jobs:
   check-release-status:
     name: Check Release Status
-    runs-on: depot-ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     outputs:
       has_changes: ${{ steps.check_changes.outputs.has_changes }}
       should_release: ${{ steps.check_version.outputs.should_release }}
       current_version: ${{ steps.check_version.outputs.current_version }}
       latest_version: ${{ steps.check_version.outputs.latest_version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Check if there are changes since last release
@@ -54,7 +55,7 @@ jobs:
             echo "has_changes=true" >> $GITHUB_OUTPUT
           else
             # Check if there are commits to rust/main since last release
-            COMMITS_SINCE=$(git log "$LATEST_TAG"..HEAD --oneline -- . | wc -l)
+            COMMITS_SINCE=$(git log "$LATEST_TAG"..HEAD --oneline -- . ':(exclude)helm/**' | wc -l)
             echo "Commits since $LATEST_TAG: $COMMITS_SINCE"
 
             if [ "$COMMITS_SINCE" -gt 0 ]; then
@@ -97,7 +98,7 @@ jobs:
 
   release-pr:
     name: Update Release PR
-    runs-on: depot-ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     needs: check-release-status
     if: |
       github.event_name == 'push' &&
@@ -112,7 +113,7 @@ jobs:
         with:
           app-id: ${{ secrets.HYPER_GONK_APP_ID }}
           private-key: ${{ secrets.HYPER_GONK_PRIVATE_KEY }}
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ steps.generate-token.outputs.token }}
@@ -191,7 +192,7 @@ jobs:
           git config user.name "${{ steps.generate-token.outputs.app-slug }}[bot]"
           git config user.email "${BOT_USER_ID}+${{ steps.generate-token.outputs.app-slug }}[bot]@users.noreply.github.com"
 
-          BRANCH_NAME="release-agents-v${NEW_VERSION}"
+          BRANCH_NAME="release-agents"
 
           # Create branch from current HEAD (which is main)
           git checkout -B "$BRANCH_NAME"
@@ -260,7 +261,7 @@ jobs:
 
   publish:
     name: Publish Release
-    runs-on: depot-ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     needs: check-release-status
     if: |
       github.event_name == 'workflow_dispatch' ||
@@ -268,7 +269,7 @@ jobs:
         github.event_name == 'push' &&
         needs.check-release-status.outputs.should_release == 'true')
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Determine version and create release

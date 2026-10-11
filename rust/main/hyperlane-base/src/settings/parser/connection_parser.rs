@@ -1,9 +1,12 @@
-use std::ops::Add;
+use std::{ops::Add, str::FromStr, time::Duration};
 
 use eyre::eyre;
 use hyperlane_sealevel::{
-    HeliusPriorityFeeLevel, HeliusPriorityFeeOracleConfig, PriorityFeeOracleConfig,
+    HeliusPriorityFeeLevel, HeliusPriorityFeeOracleConfig, NonEmptyAltAddresses,
+    PriorityFeeOracleConfig, ProcessAltOverride, SealevelTransactionFormat,
+    UniversalRouterRevealConfig,
 };
+use solana_sdk::pubkey::Pubkey;
 use url::Url;
 
 use h_eth::TransactionOverrides;
@@ -19,7 +22,10 @@ use hyperlane_kaspa as h_kaspa;
 use crate::settings::envs::*;
 use crate::settings::ChainConnectionConf;
 
-use super::{parse_base_and_override_urls, parse_cosmos_gas_price, ValueParser};
+use super::{
+    parse_base_and_override_urls, parse_cosmos_gas_price, parse_json_array, parse_matching_list,
+    ValueParser,
+};
 
 #[allow(clippy::question_mark)] // TODO: `rustc` 1.80.1 clippy issue
 pub fn build_ethereum_connection_conf(
@@ -127,11 +133,58 @@ pub fn build_ethereum_connection_conf(
         .parse_bool()
         .unwrap_or(false);
 
+    let fallback_hedge_delay_millis = chain
+        .chain(err)
+        .get_opt_key("fallbackHedgeDelayMillis")
+        .parse_u64()
+        .end();
+    let fallback_hedge_timeout_millis = chain
+        .chain(err)
+        .get_opt_key("fallbackHedgeTimeoutMillis")
+        .parse_u64()
+        .end();
+    if fallback_hedge_delay_millis == Some(0) {
+        err.push(
+            (&chain.cwp).add("fallback_hedge_delay_millis"),
+            eyre!("fallback hedge delay must be greater than zero"),
+        );
+    }
+    if fallback_hedge_timeout_millis == Some(0) {
+        err.push(
+            (&chain.cwp).add("fallback_hedge_timeout_millis"),
+            eyre!("fallback hedge timeout must be greater than zero"),
+        );
+    }
+    if fallback_hedge_timeout_millis.is_some() && fallback_hedge_delay_millis.is_none() {
+        err.push(
+            (&chain.cwp).add("fallback_hedge_timeout_millis"),
+            eyre!("fallback hedge timeout requires fallbackHedgeDelayMillis"),
+        );
+    }
+    if fallback_hedge_delay_millis.is_some() && rpc_consensus_type != "fallback" {
+        err.push(
+            (&chain.cwp).add("fallback_hedge_delay_millis"),
+            eyre!("fallback RPC hedging requires rpcConsensusType fallback"),
+        );
+    }
+    let fallback_hedge =
+        fallback_hedge_delay_millis
+            .filter(|delay| *delay > 0)
+            .map(|delay_millis| h_eth::FallbackHedgeConfig {
+                delay: Duration::from_millis(delay_millis),
+                attempt_timeout: Duration::from_millis(
+                    fallback_hedge_timeout_millis
+                        .filter(|timeout| *timeout > 0)
+                        .unwrap_or(30_000),
+                ),
+            });
+
     Some(ChainConnectionConf::Ethereum(h_eth::ConnectionConf {
         rpc_connection: rpc_connection_conf?,
         transaction_overrides,
         op_submission_config: operation_batch,
         consider_null_transaction_receipt,
+        fallback_hedge,
     }))
 }
 
@@ -289,9 +342,30 @@ fn build_sealevel_connection_conf(
 ) -> Option<ChainConnectionConf> {
     let mut local_err = ConfigParsingError::default();
 
+    let max_supported_transaction_version = chain
+        .chain(&mut local_err)
+        .get_opt_key("maxSupportedTransactionVersion")
+        .parse_u64()
+        .end()
+        .unwrap_or(0);
+    let max_supported_transaction_version = match max_supported_transaction_version {
+        0 => 0,
+        1 => 1,
+        _ => {
+            local_err.push(
+                (&chain.cwp).add("maxsupportedtransactionversion"),
+                eyre!("maxSupportedTransactionVersion must be 0 or 1"),
+            );
+            0
+        }
+    };
+
     let native_token = parse_native_token(chain, err, 9);
     let priority_fee_oracle = parse_sealevel_priority_fee_oracle_config(chain, &mut local_err);
     let transaction_submitter = parse_transaction_submitter_config(chain, &mut local_err);
+    let mailbox_process_alts = parse_sealevel_mailbox_process_alts(chain, &mut local_err);
+    let process_alt_overrides = parse_sealevel_process_alt_overrides(chain, &mut local_err);
+    let ur_reveal = parse_sealevel_ur_reveal(chain, &mut local_err);
 
     if !local_err.is_ok() {
         err.merge(local_err);
@@ -306,7 +380,202 @@ fn build_sealevel_connection_conf(
         native_token,
         priority_fee_oracle,
         transaction_submitter,
+        max_supported_transaction_version,
+        mailbox_process_alts,
+        process_alt_overrides,
+        ur_reveal,
     }))
+}
+
+/// Parses a single ALT pubkey string, recording a config error on failure.
+fn parse_alt_pubkey(
+    parser: &ValueParser,
+    key: &str,
+    value: &str,
+    err: &mut ConfigParsingError,
+) -> Option<Pubkey> {
+    match Pubkey::from_str(value) {
+        Ok(pubkey) => Some(pubkey),
+        Err(e) => {
+            err.push(
+                (&parser.cwp).add(key.to_ascii_lowercase()),
+                eyre!("Invalid {key} pubkey: {e}"),
+            );
+            None
+        }
+    }
+}
+
+/// Parses a list of ALT pubkeys, accepting either the plural key (an array of
+/// strings) or the legacy singular key (one string).
+///
+/// The plural key wins when both are present. Empty plural lists are rejected at
+/// this config boundary, so downstream code receives proof of non-emptiness.
+fn parse_alt_pubkey_list(
+    parser: &ValueParser,
+    plural_key: &str,
+    singular_key: &str,
+    err: &mut ConfigParsingError,
+) -> Option<NonEmptyAltAddresses> {
+    if let Some(plural) = parser.chain(err).get_opt_key(plural_key).end() {
+        let Some((cwp, value)) = parse_json_array(plural) else {
+            err.push(
+                (&parser.cwp).add(plural_key.to_ascii_lowercase()),
+                eyre!("Expected {plural_key} to be an array or stringified JSON array"),
+            );
+            return None;
+        };
+        let iter = match ValueParser::new(cwp, &value).into_array_iter() {
+            Ok(iter) => iter,
+            Err(e) => {
+                err.merge(e);
+                return None;
+            }
+        };
+        let values: Vec<String> = iter
+            .filter_map(|entry| entry.chain(err).parse_string().end().map(str::to_owned))
+            .collect();
+        let addresses: Vec<Pubkey> = values
+            .iter()
+            .filter_map(|value| parse_alt_pubkey(parser, plural_key, value, err))
+            .collect();
+        return match NonEmptyAltAddresses::try_from(addresses) {
+            Ok(addresses) => Some(addresses),
+            Err(error) => {
+                err.push(
+                    (&parser.cwp).add(plural_key.to_ascii_lowercase()),
+                    eyre!("{error}"),
+                );
+                None
+            }
+        };
+    }
+
+    let singular = parser
+        .chain(err)
+        .get_opt_key(singular_key)
+        .parse_string()
+        .end()
+        .map(str::to_owned);
+
+    singular
+        .and_then(|value| parse_alt_pubkey(parser, singular_key, &value, err))
+        .map(Into::into)
+}
+
+fn parse_sealevel_mailbox_process_alts(
+    chain: &ValueParser,
+    err: &mut ConfigParsingError,
+) -> SealevelTransactionFormat {
+    parse_alt_pubkey_list(chain, "mailboxProcessAlts", "mailboxProcessAlt", err)
+        .map(|alt_addresses| SealevelTransactionFormat::V0 { alt_addresses })
+        .unwrap_or_default()
+}
+
+fn parse_sealevel_ur_reveal(
+    chain: &ValueParser,
+    err: &mut ConfigParsingError,
+) -> Option<UniversalRouterRevealConfig> {
+    let ccs_url = chain
+        .chain(err)
+        .get_opt_key("urReveal")
+        .get_opt_key("ccsUrl")
+        .parse_string()
+        .end()
+        .map(|s| s.to_owned());
+
+    let program_id = chain
+        .chain(err)
+        .get_opt_key("urReveal")
+        .get_opt_key("programId")
+        .parse_string()
+        .end()
+        .map(|s| s.to_owned());
+
+    match (ccs_url, program_id) {
+        (Some(ccs_url), Some(program_id)) => {
+            // Validate at startup so misconfiguration fails fast rather than at first reveal.
+            if Url::parse(&ccs_url).is_err() {
+                err.push(
+                    (&chain.cwp).add("urReveal").add("ccsUrl"),
+                    eyre!("urReveal.ccsUrl is not a valid URL: {ccs_url}"),
+                );
+                return None;
+            }
+            if Pubkey::from_str(&program_id).is_err() {
+                err.push(
+                    (&chain.cwp).add("urReveal").add("programId"),
+                    eyre!("urReveal.programId is not a valid Solana pubkey: {program_id}"),
+                );
+                return None;
+            }
+            Some(UniversalRouterRevealConfig {
+                ccs_url,
+                program_id,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            err.push(
+                (&chain.cwp).add("urReveal"),
+                eyre!("urReveal requires both ccsUrl and programId"),
+            );
+            None
+        }
+    }
+}
+
+fn parse_sealevel_process_alt_overrides(
+    chain: &ValueParser,
+    err: &mut ConfigParsingError,
+) -> Vec<ProcessAltOverride> {
+    let p = chain.chain(err).get_opt_key("processAltOverrides").end();
+
+    let Some(p) = p else {
+        return vec![];
+    };
+
+    let Some((cwp, val)) = parse_json_array(p) else {
+        return vec![];
+    };
+
+    let entries = match ValueParser::new(cwp, &val).into_array_iter() {
+        Ok(iter) => iter,
+        Err(e) => {
+            err.merge(e);
+            return vec![];
+        }
+    };
+
+    entries
+        .filter_map(|entry| {
+            // If matchingList is absent, defaults to MatchingList(None) which will
+            // never match any message (msg_matches is called with default: false).
+            let matching_list = entry
+                .chain(err)
+                .get_opt_key("matchingList")
+                .and_then(parse_matching_list)
+                .unwrap_or_default();
+
+            let Some(alt_addresses) =
+                parse_alt_pubkey_list(&entry, "addressLookupTables", "addressLookupTable", err)
+            else {
+                err.push(
+                    (&entry.cwp).add("addresslookuptables"),
+                    eyre!(
+                        "processAltOverrides entry must specify at least one ALT via \
+                         `addressLookupTables` (array) or `addressLookupTable` (string)"
+                    ),
+                );
+                return None;
+            };
+
+            Some(ProcessAltOverride {
+                matching_list,
+                alt_addresses,
+            })
+        })
+        .collect()
 }
 
 fn parse_native_token(
@@ -321,6 +590,14 @@ fn parse_native_token(
         .parse_u32()
         .unwrap_or(default_decimals);
 
+    let native_token_symbol = chain
+        .chain(err)
+        .get_opt_key("nativeToken")
+        .get_opt_key("symbol")
+        .parse_string()
+        .unwrap_or("")
+        .to_owned();
+
     let native_token_denom = chain
         .chain(err)
         .get_opt_key("nativeToken")
@@ -330,6 +607,7 @@ fn parse_native_token(
 
     NativeToken {
         decimals: native_token_decimals,
+        symbol: native_token_symbol,
         denom: native_token_denom.to_owned(),
     }
 }
@@ -473,6 +751,51 @@ fn parse_transaction_submitter_config(
         // If not specified at all, use default
         Some(h_sealevel::config::TransactionSubmitterConfig::default())
     }
+}
+
+pub fn build_tron_connection_conf(
+    rpcs: &[Url],
+    chain: &ValueParser,
+    err: &mut ConfigParsingError,
+    _operation_batch: OpSubmissionConfig,
+) -> Option<ChainConnectionConf> {
+    let mut local_err = ConfigParsingError::default();
+    let wallet_urls = parse_base_and_override_urls(
+        chain,
+        "walletUrls",
+        "customWalletUrls",
+        "http",
+        &mut local_err,
+        false,
+    );
+    let wallet_solidity_urls = parse_base_and_override_urls(
+        chain,
+        "walletSolidityUrls",
+        "customWalletSolidityUrls",
+        "http",
+        &mut local_err,
+        false,
+    );
+
+    let fee_multiplier = chain
+        .chain(err)
+        .get_opt_key("feeMultiplier")
+        .parse_f64()
+        .end();
+
+    if !local_err.is_ok() {
+        err.merge(local_err);
+        return None;
+    }
+
+    Some(ChainConnectionConf::Tron(
+        hyperlane_tron::ConnectionConf::new(
+            rpcs.to_vec(),
+            wallet_urls,
+            wallet_solidity_urls,
+            fee_multiplier,
+        ),
+    ))
 }
 
 pub fn build_radix_connection_conf(
@@ -652,10 +975,6 @@ pub fn build_connection_conf(
             default_rpc_consensus_type,
             operation_batch,
         ),
-        HyperlaneDomainProtocol::Fuel => rpcs
-            .iter()
-            .next()
-            .map(|url| ChainConnectionConf::Fuel(h_fuel::ConnectionConf { url: url.clone() })),
         HyperlaneDomainProtocol::Sealevel => {
             let urls = rpcs.to_vec();
             build_sealevel_connection_conf(&urls, chain, err, operation_batch)
@@ -668,6 +987,9 @@ pub fn build_connection_conf(
         }
         HyperlaneDomainProtocol::Radix => {
             build_radix_connection_conf(rpcs, chain, err, operation_batch)
+        }
+        HyperlaneDomainProtocol::Tron => {
+            build_tron_connection_conf(rpcs, chain, err, operation_batch)
         }
         #[cfg(feature = "aleo")]
         HyperlaneDomainProtocol::Aleo => {
@@ -692,9 +1014,9 @@ pub fn build_kaspa_connection_conf(
     let mut local_err = ConfigParsingError::default();
 
     // Get the RPC URL (igra-service URL)
-    let Some(rpc_url) = rpcs.iter().next().cloned() else {
+    let Some(rpc_url) = rpcs.first().cloned() else {
         local_err.push(
-            (&chain.cwp).add("rpcUrls"),
+            (&chain.cwp).add("rpcurls"),
             eyre!("Missing RPC URL for Kaspa chain"),
         );
         err.merge(local_err);
@@ -777,10 +1099,238 @@ pub fn build_kaspa_connection_conf(
 pub fn is_protocol_supported(protocol: HyperlaneDomainProtocol) -> bool {
     use HyperlaneDomainProtocol::*;
     match protocol {
-        Ethereum | Fuel | Sealevel | Cosmos | CosmosNative | Starknet | Radix => true,
+        Ethereum | Sealevel | Cosmos | CosmosNative | Starknet | Radix | Tron => true,
         // Aleo is feature-gated - only supported when the "aleo" feature is enabled
         Aleo => cfg!(feature = "aleo"),
         // Kaspa is feature-gated - only supported when the "kaspa" feature is enabled
         Kaspa => cfg!(feature = "kaspa"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperlane_core::config::ConfigPath;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn kaspa_and_tron_protocol_support_survives_upstream_merge() {
+        assert!(is_protocol_supported(HyperlaneDomainProtocol::Tron));
+        assert_eq!(
+            is_protocol_supported(HyperlaneDomainProtocol::Kaspa),
+            cfg!(feature = "kaspa")
+        );
+    }
+
+    #[cfg(feature = "kaspa")]
+    #[test]
+    fn kaspa_connection_preserves_service_settings_and_requires_rpc() {
+        let value = json!({
+            "timeoutseconds": 120,
+            "networkprefix": "kaspadev",
+            "retry": { "maxretries": 5 }
+        });
+        let chain = ValueParser::new(ConfigPath::default(), &value);
+        let mut errors = ConfigParsingError::default();
+        let rpc = Url::parse("http://localhost:8088").unwrap();
+        let result = build_kaspa_connection_conf(
+            &[rpc.clone()],
+            &chain,
+            &mut errors,
+            OpSubmissionConfig::default(),
+        );
+        assert!(errors.is_ok());
+        let Some(ChainConnectionConf::Kaspa(conf)) = result else {
+            panic!("expected Kaspa connection");
+        };
+        assert_eq!(conf.rpc_url, rpc);
+        assert_eq!(conf.timeout_seconds, 120);
+        assert_eq!(conf.network_prefix, "kaspadev");
+        assert_eq!(conf.retry_config.max_retries, 5);
+        assert!(build_kaspa_connection_conf(
+            &[],
+            &chain,
+            &mut errors,
+            OpSubmissionConfig::default(),
+        )
+        .is_none());
+        assert!(!errors.is_ok());
+    }
+
+    #[test]
+    fn sealevel_read_version_is_opt_in_and_validated() {
+        for (value, expected) in [
+            (json!({}), Some(0)),
+            (json!({"maxsupportedtransactionversion": 0}), Some(0)),
+            (json!({"maxsupportedtransactionversion": 1}), Some(1)),
+            (json!({"maxsupportedtransactionversion": 2}), None),
+            (json!({"maxsupportedtransactionversion": "bad"}), None),
+        ] {
+            let chain = ValueParser::new(ConfigPath::default(), &value);
+            let mut errors = ConfigParsingError::default();
+            let result = build_sealevel_connection_conf(
+                &[Url::parse("http://localhost:8899").unwrap()],
+                &chain,
+                &mut errors,
+                OpSubmissionConfig::default(),
+            );
+            let version = result.map(|conf| {
+                let ChainConnectionConf::Sealevel(conf) = conf else {
+                    panic!("expected sealevel")
+                };
+                conf.max_supported_transaction_version
+            });
+            assert_eq!(version, expected);
+            assert_eq!(errors.is_ok(), expected.is_some());
+        }
+    }
+
+    fn parse_ethereum_hedge(value: serde_json::Value) -> (ChainConnectionConf, ConfigParsingError) {
+        let chain = ValueParser::new(ConfigPath::default(), &value);
+        let mut errors = ConfigParsingError::default();
+        let connection = build_ethereum_connection_conf(
+            &[Url::parse("http://localhost:8545").unwrap()],
+            &chain,
+            &mut errors,
+            "fallback",
+            OpSubmissionConfig::default(),
+        )
+        .unwrap();
+        (connection, errors)
+    }
+
+    #[test]
+    fn ethereum_fallback_hedging_is_default_off() {
+        let (connection, errors) = parse_ethereum_hedge(json!({}));
+        assert!(errors.is_ok());
+        let ChainConnectionConf::Ethereum(connection) = connection else {
+            panic!("expected ethereum connection");
+        };
+        assert_eq!(connection.fallback_hedge, None);
+    }
+
+    #[test]
+    fn parses_ethereum_fallback_hedge_settings() {
+        let (connection, errors) = parse_ethereum_hedge(json!({
+            "fallbackhedgedelaymillis": 250,
+            "fallbackhedgetimeoutmillis": 2_000,
+        }));
+        assert!(errors.is_ok());
+        let ChainConnectionConf::Ethereum(connection) = connection else {
+            panic!("expected ethereum connection");
+        };
+        assert_eq!(
+            connection.fallback_hedge,
+            Some(h_eth::FallbackHedgeConfig {
+                delay: Duration::from_millis(250),
+                attempt_timeout: Duration::from_secs(2),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ethereum_fallback_hedge_settings() {
+        let (_, zero_delay_errors) = parse_ethereum_hedge(json!({
+            "fallbackhedgedelaymillis": 0,
+        }));
+        assert!(!zero_delay_errors.is_ok());
+
+        let (_, timeout_only_errors) = parse_ethereum_hedge(json!({
+            "fallbackhedgetimeoutmillis": 2_000,
+        }));
+        assert!(!timeout_only_errors.is_ok());
+
+        let (_, non_fallback_errors) = parse_ethereum_hedge(json!({
+            "rpcconsensustype": "single",
+            "fallbackhedgedelaymillis": 250,
+        }));
+        assert!(!non_fallback_errors.is_ok());
+    }
+
+    #[test]
+    fn parses_legacy_and_plural_mailbox_process_alts() {
+        let legacy_alt = Pubkey::new_unique();
+        let plural_alts = [Pubkey::new_unique(), Pubkey::new_unique()];
+
+        let legacy = json!({ "mailboxprocessalt": legacy_alt.to_string() });
+        let mut legacy_err = ConfigParsingError::default();
+        let legacy_parser = ValueParser::new(Default::default(), &legacy);
+        assert_eq!(
+            parse_sealevel_mailbox_process_alts(&legacy_parser, &mut legacy_err),
+            SealevelTransactionFormat::V0 {
+                alt_addresses: legacy_alt.into()
+            }
+        );
+        assert!(legacy_err.is_ok());
+
+        let plural = json!({
+            "mailboxprocessalts": plural_alts.map(|alt| alt.to_string()),
+            "mailboxprocessalt": legacy_alt.to_string(),
+        });
+        let mut plural_err = ConfigParsingError::default();
+        let plural_parser = ValueParser::new(Default::default(), &plural);
+        assert_eq!(
+            parse_sealevel_mailbox_process_alts(&plural_parser, &mut plural_err),
+            SealevelTransactionFormat::V0 {
+                alt_addresses: NonEmptyAltAddresses::try_from(plural_alts.to_vec()).unwrap()
+            }
+        );
+        assert!(plural_err.is_ok());
+
+        let stringified = json!({
+            "mailboxprocessalts": serde_json::to_string(
+                &plural_alts.map(|alt| alt.to_string())
+            )
+            .unwrap(),
+        });
+        let mut stringified_err = ConfigParsingError::default();
+        let stringified_parser = ValueParser::new(Default::default(), &stringified);
+        assert_eq!(
+            parse_sealevel_mailbox_process_alts(&stringified_parser, &mut stringified_err),
+            SealevelTransactionFormat::V0 {
+                alt_addresses: NonEmptyAltAddresses::try_from(plural_alts.to_vec()).unwrap()
+            }
+        );
+        assert!(stringified_err.is_ok());
+    }
+
+    #[test]
+    fn parses_legacy_and_plural_process_alt_overrides() {
+        let legacy_alt = Pubkey::new_unique();
+        let plural_alts = [Pubkey::new_unique(), Pubkey::new_unique()];
+        let value = json!({
+            "processaltoverrides": [
+                {
+                    "matchinglist": [{}],
+                    "addresslookuptable": legacy_alt.to_string(),
+                },
+                {
+                    "matchinglist": [{}],
+                    "addresslookuptables": plural_alts.map(|alt| alt.to_string()),
+                },
+            ],
+        });
+        let parser = ValueParser::new(Default::default(), &value);
+        let mut err = ConfigParsingError::default();
+
+        let overrides = parse_sealevel_process_alt_overrides(&parser, &mut err);
+
+        assert!(err.is_ok());
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides[0].alt_addresses.as_slice(), &[legacy_alt]);
+        assert_eq!(overrides[1].alt_addresses.as_slice(), &plural_alts);
+    }
+
+    #[test]
+    fn rejects_empty_alt_lists_at_the_config_boundary() {
+        let value = json!({ "mailboxprocessalts": [] });
+        let parser = ValueParser::new(Default::default(), &value);
+        let mut err = ConfigParsingError::default();
+
+        let result = parse_sealevel_mailbox_process_alts(&parser, &mut err);
+
+        assert_eq!(result, SealevelTransactionFormat::Legacy);
+        assert!(!err.is_ok());
     }
 }

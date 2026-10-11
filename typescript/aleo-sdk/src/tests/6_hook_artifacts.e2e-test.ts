@@ -1,0 +1,440 @@
+import { expect } from 'chai';
+import { step } from 'mocha-steps';
+
+import { AltVM } from '@hyperlane-xyz/provider-sdk';
+import { HookType, type ISigner } from '@hyperlane-xyz/provider-sdk/altvm';
+import {
+  type ArtifactDeployed,
+  ArtifactState,
+} from '@hyperlane-xyz/provider-sdk/artifact';
+import {
+  type DeployedHookAddress,
+  type IgpHookConfig,
+} from '@hyperlane-xyz/provider-sdk/hook';
+import {
+  type AnnotatedTx,
+  type TxReceipt,
+} from '@hyperlane-xyz/provider-sdk/module';
+import { assert, normalizeConfig } from '@hyperlane-xyz/utils';
+
+import { AleoSigner } from '../clients/signer.js';
+import { AleoHookArtifactManager } from '../hook/hook-artifact-manager.js';
+import { AleoIsmArtifactManager } from '../ism/ism-artifact-manager.js';
+import { AleoMailboxArtifactManager } from '../mailbox/mailbox-artifact-manager.js';
+import { TEST_ALEO_CHAIN_METADATA } from '../testing/constants.js';
+import { ALEO_NULL_ADDRESS } from '../utils/helper.js';
+import { AleoNetworkId } from '../utils/types.js';
+
+describe('6. aleo sdk Hook artifacts e2e tests', async function () {
+  this.timeout(100_000);
+
+  let signer: ISigner<AnnotatedTx, TxReceipt>;
+  let aleoSigner: AleoSigner;
+  let artifactManager: AleoHookArtifactManager;
+  let mailboxAddress: string;
+
+  before(async () => {
+    // test private key with funds
+    const privateKey =
+      'APrivateKey1zkp8CZNn3yeCseEtxuVPbDCwSyhGW6yZKUYKfgXmcpoGPWH';
+    const domainId = 1234;
+
+    aleoSigner = await AleoSigner.connectWithSigner(
+      TEST_ALEO_CHAIN_METADATA,
+      privateKey,
+    );
+    signer = aleoSigner;
+
+    const aleoClient = aleoSigner.getAleoClient();
+
+    // Create ISM for mailbox
+    const ismArtifactManager = new AleoIsmArtifactManager(aleoClient);
+    const ismWriter = ismArtifactManager.createWriter(
+      AltVM.IsmType.TEST_ISM,
+      aleoSigner,
+    );
+    const [ism] = await ismWriter.create({
+      config: { type: AltVM.IsmType.TEST_ISM },
+    });
+
+    // Create a mailbox for hook testing using artifact manager
+    const mailboxArtifactManager = new AleoMailboxArtifactManager(
+      { domainId, aleoNetworkId: AleoNetworkId.TESTNET },
+      aleoClient,
+    );
+    const mailboxWriter = mailboxArtifactManager.createWriter(
+      'mailbox',
+      aleoSigner,
+    );
+    const [deployedMailbox] = await mailboxWriter.create({
+      config: {
+        owner: aleoSigner.getSignerAddress(),
+        defaultIsm: {
+          artifactState: ArtifactState.UNDERIVED,
+          deployed: { address: ism.deployed.address },
+        },
+        defaultHook: {
+          artifactState: ArtifactState.UNDERIVED,
+          deployed: { address: ALEO_NULL_ADDRESS },
+        },
+        requiredHook: {
+          artifactState: ArtifactState.UNDERIVED,
+          deployed: { address: ALEO_NULL_ADDRESS },
+        },
+      },
+    });
+    mailboxAddress = deployedMailbox.deployed.address;
+
+    artifactManager = new AleoHookArtifactManager(aleoClient, mailboxAddress);
+  });
+
+  describe('MerkleTree Hook', () => {
+    let merkleTreeHookAddress: string;
+
+    step('should create and read a MerkleTree Hook', async () => {
+      // Create MerkleTree Hook using artifact writer
+      const writer = artifactManager.createWriter(
+        AltVM.HookType.MERKLE_TREE,
+        aleoSigner,
+      );
+
+      const [deployedArtifact] = await writer.create({
+        artifactState: ArtifactState.NEW,
+        config: {
+          type: AltVM.HookType.MERKLE_TREE,
+        },
+      });
+
+      merkleTreeHookAddress = deployedArtifact.deployed.address;
+
+      expect(merkleTreeHookAddress).to.be.a('string').and.not.be.empty;
+
+      // Read using artifact manager's specific reader
+      const reader = artifactManager.createReader(AltVM.HookType.MERKLE_TREE);
+      const readHook = await reader.read(merkleTreeHookAddress);
+
+      expect(readHook.artifactState).to.equal(ArtifactState.DEPLOYED);
+      expect(readHook.deployed.address).to.equal(merkleTreeHookAddress);
+      expect(readHook.config.type).to.equal(AltVM.HookType.MERKLE_TREE);
+    });
+  });
+
+  describe('IGP Hook', () => {
+    let igpHookAddress: string;
+
+    const DOMAIN_1 = 42;
+    const DOMAIN_2 = 96;
+
+    step('should create and read an IGP Hook', async () => {
+      // Create IGP Hook using artifact writer
+      const writer = artifactManager.createWriter(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+        aleoSigner,
+      );
+
+      const [deployedArtifact] = await writer.create({
+        artifactState: ArtifactState.NEW,
+        config: {
+          type: AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+          owner: aleoSigner.getSignerAddress(),
+          beneficiary: aleoSigner.getSignerAddress(),
+          oracleKey: aleoSigner.getSignerAddress(),
+          overhead: {
+            [DOMAIN_1]: 50000,
+            [DOMAIN_2]: 75000,
+          },
+          oracleConfig: {
+            [DOMAIN_1]: {
+              tokenExchangeRate: '1000000000000000000',
+              gasPrice: '1000000000',
+            },
+            [DOMAIN_2]: {
+              tokenExchangeRate: '2000000000000000000',
+              gasPrice: '2000000000',
+            },
+          },
+        },
+      });
+
+      igpHookAddress = deployedArtifact.deployed.address;
+
+      expect(igpHookAddress).to.be.a('string').and.not.be.empty;
+
+      // Read using artifact manager's specific reader
+      const reader = artifactManager.createReader(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+      );
+      const readHook = await reader.read(igpHookAddress);
+
+      expect(readHook.artifactState).to.equal(ArtifactState.DEPLOYED);
+      expect(readHook.deployed.address).to.equal(igpHookAddress);
+      expect(readHook.config.type).to.equal(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+      );
+      expect(readHook.config.owner).to.equal(aleoSigner.getSignerAddress());
+
+      // Verify gas configs
+      const expectedConfig = {
+        type: AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+        owner: aleoSigner.getSignerAddress(),
+        beneficiary: aleoSigner.getSignerAddress(),
+        oracleKey: aleoSigner.getSignerAddress(),
+        overhead: {
+          [DOMAIN_1]: 50000,
+          [DOMAIN_2]: 75000,
+        },
+        oracleConfig: {
+          [DOMAIN_1]: {
+            tokenExchangeRate: '1000000000000000000',
+            gasPrice: '1000000000',
+          },
+          [DOMAIN_2]: {
+            tokenExchangeRate: '2000000000000000000',
+            gasPrice: '2000000000',
+          },
+        },
+      };
+
+      expect(normalizeConfig(readHook.config)).to.deep.equal(
+        normalizeConfig(expectedConfig),
+      );
+    });
+
+    step('should verify IGP Hook gas config updates', async () => {
+      // Update one of the gas configs using artifact writer
+      const writer = artifactManager.createWriter(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+        aleoSigner,
+      );
+
+      // Read current config
+      const reader = artifactManager.createReader(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+      );
+      const currentHook = await reader.read(igpHookAddress);
+
+      // Update DOMAIN_1 config
+      const updatedArtifact: ArtifactDeployed<
+        IgpHookConfig,
+        DeployedHookAddress
+      > = {
+        artifactState: ArtifactState.DEPLOYED,
+        config: {
+          ...currentHook.config,
+          overhead: {
+            ...currentHook.config.overhead,
+            [DOMAIN_1]: 60000, // increased overhead
+          },
+          oracleConfig: {
+            ...currentHook.config.oracleConfig,
+            [DOMAIN_1]: {
+              tokenExchangeRate: '1500000000000000000', // updated exchange rate
+              gasPrice: '1500000000', // updated gas price
+            },
+          },
+        },
+        deployed: currentHook.deployed,
+      };
+
+      // Execute update transactions
+      const transactions = await writer.update(updatedArtifact);
+      for (const tx of transactions) {
+        await signer.sendAndConfirmTransaction(tx);
+      }
+
+      // Read and verify update
+      const readHook = await reader.read(igpHookAddress);
+      const domain1Oracle = readHook.config.oracleConfig[DOMAIN_1];
+      const domain2Oracle = readHook.config.oracleConfig[DOMAIN_2];
+      assert(domain1Oracle, `Missing oracle config for ${DOMAIN_1}`);
+      assert(domain2Oracle, `Missing oracle config for ${DOMAIN_2}`);
+
+      expect(readHook.config.overhead[DOMAIN_1]).to.equal(60000);
+      expect(domain1Oracle.tokenExchangeRate).to.equal('1500000000000000000');
+      expect(domain1Oracle.gasPrice).to.equal('1500000000');
+
+      // Verify DOMAIN_2 config unchanged
+      expect(readHook.config.overhead[DOMAIN_2]).to.equal(75000);
+      expect(domain2Oracle.tokenExchangeRate).to.equal('2000000000000000000');
+    });
+
+    step('should verify IGP Hook gas config removal', async () => {
+      // Remove DOMAIN_2 config using artifact writer
+      const writer = artifactManager.createWriter(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+        aleoSigner,
+      );
+
+      // Read current config
+      const reader = artifactManager.createReader(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+      );
+      const currentHook = await reader.read(igpHookAddress);
+      const domain1Overhead = currentHook.config.overhead[DOMAIN_1];
+      const domain1Oracle = currentHook.config.oracleConfig[DOMAIN_1];
+      assert(domain1Overhead !== undefined, `Missing overhead for ${DOMAIN_1}`);
+      assert(domain1Oracle, `Missing oracle config for ${DOMAIN_1}`);
+
+      // Create updated artifact without DOMAIN_2
+      const updatedArtifact: ArtifactDeployed<
+        IgpHookConfig,
+        DeployedHookAddress
+      > = {
+        artifactState: ArtifactState.DEPLOYED,
+        config: {
+          ...currentHook.config,
+          overhead: {
+            [DOMAIN_1]: domain1Overhead,
+            // DOMAIN_2 omitted to remove it
+          },
+          oracleConfig: {
+            [DOMAIN_1]: domain1Oracle,
+            // DOMAIN_2 omitted to remove it
+          },
+        },
+        deployed: currentHook.deployed,
+      };
+
+      // Execute update transactions
+      const transactions = await writer.update(updatedArtifact);
+      for (const tx of transactions) {
+        await signer.sendAndConfirmTransaction(tx);
+      }
+
+      // Read and verify removal
+      const readHook = await reader.read(igpHookAddress);
+
+      // DOMAIN_1 should still exist
+      expect(readHook.config.overhead[DOMAIN_1]).to.not.be.undefined;
+      expect(readHook.config.oracleConfig[DOMAIN_1]).to.not.be.undefined;
+
+      // DOMAIN_2 should be removed
+      expect(readHook.config.overhead[DOMAIN_2]).to.be.undefined;
+      expect(readHook.config.oracleConfig[DOMAIN_2]).to.be.undefined;
+    });
+
+    step(
+      'should transfer ownership when owner differs from deployer',
+      async () => {
+        // Use a different address for the new owner (not the deployer's address)
+        // This is a valid Aleo address but different from the test account
+        const newOwnerAddress =
+          'aleo1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3ljyzc';
+
+        // Create IGP hook using the artifact writer with a different owner
+        const writer = artifactManager.createWriter(
+          AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+          aleoSigner,
+        );
+
+        const [deployedArtifact] = await writer.create({
+          artifactState: ArtifactState.NEW,
+          config: {
+            type: AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+            owner: newOwnerAddress,
+            beneficiary: newOwnerAddress,
+            oracleKey: newOwnerAddress,
+            overhead: {},
+            oracleConfig: {},
+          },
+        });
+
+        expect(deployedArtifact.deployed.address).to.be.a('string').and.not.be
+          .empty;
+
+        // Read and verify owner was transferred
+        const reader = artifactManager.createReader(
+          AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+        );
+        const readHook = await reader.read(deployedArtifact.deployed.address);
+
+        expect(readHook.config.owner).to.equal(newOwnerAddress);
+        expect(readHook.config.owner).to.not.equal(
+          aleoSigner.getSignerAddress(),
+        );
+      },
+    );
+  });
+
+  describe('Generic hook reading via readHook', () => {
+    const DOMAIN_1 = 42;
+
+    step('should detect and read MerkleTree hook', async () => {
+      // Create MerkleTree Hook
+      const writer = artifactManager.createWriter(
+        AltVM.HookType.MERKLE_TREE,
+        aleoSigner,
+      );
+
+      const [deployedHook] = await writer.create({
+        artifactState: ArtifactState.NEW,
+        config: {
+          type: AltVM.HookType.MERKLE_TREE,
+        },
+      });
+
+      // Read via generic readHook (without knowing the type)
+      const readHook = await artifactManager.readHook(
+        deployedHook.deployed.address,
+      );
+
+      expect(readHook.artifactState).to.equal(ArtifactState.DEPLOYED);
+      expect(readHook.config.type).to.equal(AltVM.HookType.MERKLE_TREE);
+      expect(readHook.deployed.address).to.equal(deployedHook.deployed.address);
+    });
+
+    step('should detect and read IGP hook', async () => {
+      // Create IGP Hook
+      const writer = artifactManager.createWriter(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+        aleoSigner,
+      );
+
+      const [deployedHook] = await writer.create({
+        artifactState: ArtifactState.NEW,
+        config: {
+          type: AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+          owner: aleoSigner.getSignerAddress(),
+          beneficiary: aleoSigner.getSignerAddress(),
+          oracleKey: aleoSigner.getSignerAddress(),
+          overhead: {
+            [DOMAIN_1]: 50000,
+          },
+          oracleConfig: {
+            [DOMAIN_1]: {
+              tokenExchangeRate: '1000000000000000000',
+              gasPrice: '1000000000',
+            },
+          },
+        },
+      });
+
+      // Read via generic readHook (without knowing the type)
+      const readHook = await artifactManager.readHook(
+        deployedHook.deployed.address,
+      );
+
+      expect(readHook.artifactState).to.equal(ArtifactState.DEPLOYED);
+      expect(readHook.config.type).to.equal(
+        AltVM.HookType.INTERCHAIN_GAS_PAYMASTER,
+      );
+      expect(readHook.deployed.address).to.equal(deployedHook.deployed.address);
+
+      // Verify IGP-specific config details
+      // After checking the type, we can safely cast to IgpHookConfig
+      const igpConfig = readHook.config;
+      assert(
+        igpConfig.type === HookType.INTERCHAIN_GAS_PAYMASTER,
+        `Expected config to be of type ${HookType.INTERCHAIN_GAS_PAYMASTER}`,
+      );
+      expect(igpConfig.owner).to.equal(aleoSigner.getSignerAddress());
+      expect(igpConfig.beneficiary).to.equal(aleoSigner.getSignerAddress());
+      expect(igpConfig.oracleKey).to.equal(aleoSigner.getSignerAddress());
+      expect(igpConfig.overhead[DOMAIN_1]).to.equal(50000);
+      const oracleConfig = igpConfig.oracleConfig[DOMAIN_1];
+      assert(oracleConfig, `Missing oracle config for ${DOMAIN_1}`);
+      expect(oracleConfig.gasPrice).to.equal('1000000000');
+      expect(oracleConfig.tokenExchangeRate).to.equal('1000000000000000000');
+    });
+  });
+});

@@ -1,46 +1,39 @@
+import { providers, Signer } from 'ethers';
 import { Registry } from 'prom-client';
 
-import { HelloWorldChecker } from '@hyperlane-xyz/helloworld';
 import {
   CheckerViolation,
-  HypERC20App,
-  HypERC20Checker,
+  defaultEthersV5ProviderBuilder,
   HyperlaneCoreChecker,
   HyperlaneIgp,
   HyperlaneIgpChecker,
   HyperlaneIsmFactory,
+  IcaRouterType,
   InterchainAccount,
   InterchainAccountConfig,
   InterchainQuery,
   InterchainQueryChecker,
   IsmType,
   MultiProvider,
-  attachContractsMapAndGetForeignDeployments,
-  hypERC20factories,
-  proxiedFactories,
 } from '@hyperlane-xyz/sdk';
-import { eqAddress, objFilter } from '@hyperlane-xyz/utils';
+import { objFilter, rootLogger } from '@hyperlane-xyz/utils';
 
 import { Contexts } from '../../config/contexts.js';
 import { DEPLOYER } from '../../config/environments/mainnet3/owners.js';
 import { DEFAULT_OFFCHAIN_LOOKUP_ISM_URLS } from '../../config/environments/utils.js';
-import { getWarpAddressesFrom } from '../../config/registry.js';
-import { getWarpConfig } from '../../config/warp.js';
-import { chainsToSkip } from '../../src/config/chain.js';
-import { DeployEnvironment } from '../../src/config/environment.js';
+import { chainsToSkip, minimalIcaChains } from '../../src/config/chain.js';
+import { DeployEnvironment } from '../../src/config/deploy-environment.js';
 import { HyperlaneAppGovernor } from '../../src/govern/HyperlaneAppGovernor.js';
 import { HyperlaneCoreGovernor } from '../../src/govern/HyperlaneCoreGovernor.js';
 import { HyperlaneHaasGovernor } from '../../src/govern/HyperlaneHaasGovernor.js';
 import { HyperlaneICAChecker } from '../../src/govern/HyperlaneICAChecker.js';
 import { HyperlaneIgpGovernor } from '../../src/govern/HyperlaneIgpGovernor.js';
 import { ProxiedRouterGovernor } from '../../src/govern/ProxiedRouterGovernor.js';
-import { Role } from '../../src/roles.js';
 import { impersonateAccount, useLocalProvider } from '../../src/utils/fork.js';
 import { logViolationDetails } from '../../src/utils/violation.js';
 import {
   Modules,
   getArgs as getRootArgs,
-  getWarpRouteIdInteractive,
   withAsDeployer,
   withChains,
   withContext,
@@ -48,11 +41,9 @@ import {
   withGovern,
   withModule,
   withPushMetrics,
-  withWarpRouteId,
 } from '../agent-utils.js';
 import { getEnvironmentConfig, getHyperlaneCore } from '../core-utils.js';
 import { withRegistryUris } from '../github-utils.js';
-import { getHelloWorldApp } from '../helloworld/utils.js';
 
 export function getCheckBaseArgs() {
   return withAsDeployer(
@@ -65,38 +56,100 @@ export function getCheckWarpDeployArgs() {
 }
 
 export function getCheckDeployArgs() {
-  return withRegistryUris(withWarpRouteId(withModule(getCheckBaseArgs())))
-    .describe(
-      'forceRegistryConfig',
-      'Force using registry YAML config instead of config getter',
-    )
-    .boolean('forceRegistryConfig')
-    .default('forceRegistryConfig', false);
+  return withRegistryUris(withModule(getCheckBaseArgs()));
 }
 
-const ICA_ENABLED_MODULES = [
-  Modules.INTERCHAIN_ACCOUNTS,
-  Modules.HAAS,
-  Modules.WARP,
-];
+const ICA_ENABLED_MODULES = [Modules.INTERCHAIN_ACCOUNTS, Modules.HAAS];
+
+const HAAS_SMART_PROVIDER_OPTIONS = {
+  maxRetries: 4,
+  baseRetryDelayMs: 100,
+  fallbackStaggerMs: 2_000,
+};
+
+const logger = rootLogger.child({ module: 'check-utils' });
+
+function reconnectSigner(
+  signer: Signer,
+  provider: providers.Provider,
+  chain: string,
+): Signer {
+  try {
+    return signer.connect(provider);
+  } catch (error: unknown) {
+    const code =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as Record<string, unknown>).code)
+        : undefined;
+    if (code === 'UNSUPPORTED_OPERATION') {
+      logger.warn(
+        { chain },
+        'Signer could not be reconnected to HAAS provider; smart-provider options not active',
+      );
+      return signer;
+    }
+    throw error;
+  }
+}
+
+function getHaasMultiProvider(baseMultiProvider: MultiProvider): MultiProvider {
+  const haasMultiProvider = new MultiProvider(baseMultiProvider.metadata, {
+    ...baseMultiProvider.options,
+    providerBuilder: (metadata) =>
+      defaultEthersV5ProviderBuilder(metadata, HAAS_SMART_PROVIDER_OPTIONS)
+        .provider,
+  });
+
+  if (baseMultiProvider.useSharedSigner) {
+    const sharedSigner = Object.values(baseMultiProvider.signers)[0];
+    if (sharedSigner) {
+      haasMultiProvider.setSharedSigner(sharedSigner);
+      // Rebind each chain's signer to its HAAS provider so signer-backed
+      // calls (estimateGas, sendTransaction) benefit from the smart-provider
+      // options. We mutate the map directly because MultiProvider.setSigner()
+      // is blocked once useSharedSigner is true.
+      for (const chain of Object.keys(haasMultiProvider.signers)) {
+        const provider = haasMultiProvider.tryGetProvider(chain);
+        if (!provider) continue;
+        haasMultiProvider.signers[chain] = reconnectSigner(
+          sharedSigner,
+          provider,
+          chain,
+        );
+      }
+    }
+    return haasMultiProvider;
+  }
+
+  for (const [chain, signer] of Object.entries(baseMultiProvider.signers)) {
+    const provider = haasMultiProvider.tryGetProvider(chain);
+    haasMultiProvider.setSigner(
+      chain,
+      provider ? reconnectSigner(signer, provider, chain) : signer,
+    );
+  }
+
+  return haasMultiProvider;
+}
 
 export async function getGovernor(
   module: Modules,
   context: Contexts,
   environment: DeployEnvironment,
   asDeployer: boolean,
-  warpRouteId?: string,
   chains?: string[],
   fork?: string,
   govern?: boolean,
   multiProvider: MultiProvider | undefined = undefined,
-  registryUris?: string[],
-  forceRegistryConfig?: boolean,
 ) {
   const envConfig = getEnvironmentConfig(environment);
   // If the multiProvider is not passed in, get it from the environment
   if (!multiProvider) {
     multiProvider = await envConfig.getMultiProvider();
+  }
+
+  if (module === Modules.HAAS) {
+    multiProvider = getHaasMultiProvider(multiProvider);
   }
 
   // must rotate to forked provider before building core contracts
@@ -162,14 +215,19 @@ export async function getGovernor(
       Record<string, InterchainAccountConfig>
     >((acc, [chain, conf]) => {
       if (icaChainAddresses[chain]) {
+        const isMinimal = minimalIcaChains.includes(chain);
         acc[chain] = {
           ...conf,
-          commitmentIsm: {
-            type: IsmType.OFFCHAIN_LOOKUP,
-            owner: conf.owner,
-            ownerOverrides: conf.ownerOverrides,
-            urls: DEFAULT_OFFCHAIN_LOOKUP_ISM_URLS,
-          },
+          ...(isMinimal
+            ? { routerType: IcaRouterType.MINIMAL }
+            : {
+                commitmentIsm: {
+                  type: IsmType.OFFCHAIN_LOOKUP,
+                  owner: conf.owner,
+                  ownerOverrides: conf.ownerOverrides,
+                  urls: DEFAULT_OFFCHAIN_LOOKUP_ISM_URLS,
+                },
+              }),
         };
       }
       return acc;
@@ -188,14 +246,19 @@ export async function getGovernor(
       Record<string, InterchainAccountConfig>
     >((acc, [chain, conf]) => {
       if (icaChainAddresses[chain]) {
+        const isMinimal = minimalIcaChains.includes(chain);
         acc[chain] = {
           ...conf,
-          commitmentIsm: {
-            type: IsmType.OFFCHAIN_LOOKUP,
-            owner: conf.owner,
-            ownerOverrides: conf.ownerOverrides,
-            urls: DEFAULT_OFFCHAIN_LOOKUP_ISM_URLS,
-          },
+          ...(isMinimal
+            ? { routerType: IcaRouterType.MINIMAL }
+            : {
+                commitmentIsm: {
+                  type: IsmType.OFFCHAIN_LOOKUP,
+                  owner: conf.owner,
+                  ownerOverrides: conf.ownerOverrides,
+                  urls: DEFAULT_OFFCHAIN_LOOKUP_ISM_URLS,
+                },
+              }),
         };
       }
       return acc;
@@ -226,115 +289,6 @@ export async function getGovernor(
       routerConfig,
     );
     governor = new ProxiedRouterGovernor(checker);
-  } else if (module === Modules.HELLO_WORLD) {
-    const app = await getHelloWorldApp(
-      envConfig,
-      context,
-      Role.Deployer,
-      Contexts.Hyperlane, // Owner should always be from the hyperlane context
-    );
-    const ismFactory = HyperlaneIsmFactory.fromAddressesMap(
-      chainAddresses,
-      multiProvider,
-    );
-    const checker = new HelloWorldChecker(
-      multiProvider,
-      app,
-      routerConfig,
-      ismFactory,
-    );
-    governor = new ProxiedRouterGovernor(checker);
-  } else if (module === Modules.WARP) {
-    if (!warpRouteId) {
-      warpRouteId = await getWarpRouteIdInteractive(environment);
-    }
-
-    const config = await getWarpConfig(
-      multiProvider,
-      envConfig,
-      warpRouteId,
-      registryUris,
-      forceRegistryConfig,
-    ).catch((error) => {
-      console.log(
-        `Fetching warp route deploy config failed for ${warpRouteId}. Exiting with error: ${error}`,
-      );
-      process.exit(0);
-    });
-
-    const warpAddresses = await getWarpAddressesFrom(warpRouteId, registryUris);
-
-    const filteredAddresses = Object.keys(warpAddresses) // filter out changes not in config
-      .filter((key) => key in config)
-      .reduce(
-        (obj, key) => {
-          obj[key] = {
-            ...warpAddresses[key],
-          };
-
-          // Use the specified proxyAdmin if it is set in the config
-          let proxyAdmin = config[key].proxyAdmin?.address;
-          // If the owner in the config is an AW account and there is no proxyAdmin in the config,
-          // set the proxyAdmin to the AW singleton proxyAdmin.
-          // This will ensure that the checker will check that any proxies are owned by the singleton proxyAdmin.
-          if (
-            !proxyAdmin &&
-            eqAddress(config[key].owner, envConfig.owners[key]?.owner)
-          ) {
-            proxyAdmin = chainAddresses[key]?.proxyAdmin;
-          }
-
-          if (proxyAdmin) {
-            obj[key].proxyAdmin = proxyAdmin;
-          }
-
-          return obj;
-        },
-        {} as typeof warpAddresses,
-      );
-
-    const { contractsMap, foreignDeployments } =
-      attachContractsMapAndGetForeignDeployments(
-        filteredAddresses,
-        { ...hypERC20factories, ...proxiedFactories },
-        multiProvider,
-      );
-
-    // log error and return if requesting check on foreign deployment
-    const nonEvmChains = chains
-      ? chains.filter((c) => foreignDeployments[c])
-      : fork && foreignDeployments[fork]
-        ? [fork]
-        : [];
-
-    if (nonEvmChains.length > 0) {
-      const chainList = nonEvmChains.join(', ');
-      console.log(
-        `${chainList} ${
-          nonEvmChains.length > 1 ? 'are' : 'is'
-        } non-EVM and not compatible with warp checker tooling`,
-      );
-      throw Error(
-        `${chainList} ${
-          nonEvmChains.length > 1 ? 'are' : 'is'
-        } non-EVM and not compatible with warp checker tooling`,
-      );
-    }
-
-    const app = new HypERC20App(
-      contractsMap,
-      multiProvider,
-      undefined,
-      foreignDeployments,
-    );
-
-    const checker = new HypERC20Checker(
-      multiProvider,
-      app,
-      config as any,
-      ismFactory,
-    );
-    governor = new ProxiedRouterGovernor(checker, ica);
   } else {
     throw Error(
       `Checker or governor not implemented not implemented for ${module}`,
@@ -374,4 +328,95 @@ export function getCheckerViolationsGaugeObj(metricsRegister: Registry) {
       'expected',
     ],
   };
+}
+
+// Every warp violation is pushed to PushGateway under its own group, keyed by
+// (warp_route_id, chain, contract_name, type). This makes each alert an
+// independently addressable series that can be cleared on its own (push 0 /
+// DELETE) without touching any other violation. The grouping value must be a
+// single URL-path-safe segment: warp_route_id contains "/" and contract_name
+// can be empty, both of which break PushGateway's path grouping, so we encode
+// the composite as base64url and expose it as a single `alert_key` label. A NUL
+// separator is used so values containing spaces (e.g. some violation types)
+// cannot collide across different composites.
+export function warpViolationAlertKey(
+  warpRouteId: string,
+  chain: string,
+  contractName: string,
+  type: string,
+): string {
+  const composite = [warpRouteId, chain, contractName, type].join('\u0000');
+  return Buffer.from(composite, 'utf8').toString('base64url');
+}
+
+export function warpViolationGroupings(
+  warpRouteId: string,
+  chain: string,
+  contractName: string,
+  type: string,
+): Record<string, string> {
+  return {
+    alert_key: warpViolationAlertKey(warpRouteId, chain, contractName, type),
+  };
+}
+
+export function getCheckRouteErrorGaugeObj(metricsRegister: Registry) {
+  return {
+    name: 'hyperlane_check_route_error',
+    help: 'Warp route could not be checked this run (1) or was checked (0)',
+    registers: [metricsRegister],
+    labelNames: ['module', 'warp_route_id'],
+  };
+}
+
+// warp_route_id contains "/", so the grouping uses a base64url `route_key`
+// (distinct from the per-violation `alert_key`) to stay a single path segment.
+export function warpRouteErrorGroupings(
+  warpRouteId: string,
+): Record<string, string> {
+  return {
+    route_key: Buffer.from(warpRouteId, 'utf8').toString('base64url'),
+  };
+}
+
+export function buildWarpRouteErrorMetricEntries({
+  attemptedRouteIds,
+  failedRouteIds,
+}: {
+  attemptedRouteIds: string[];
+  failedRouteIds: string[];
+}): { warpRouteId: string; value: 0 | 1 }[] {
+  const failed = new Set(failedRouteIds);
+  return [...new Set(attemptedRouteIds)].map((warpRouteId) => ({
+    warpRouteId,
+    value: failed.has(warpRouteId) ? 1 : 0,
+  }));
+}
+
+export function allAttemptedRoutesFailed({
+  attemptedRoutes,
+  failedRoutes,
+}: {
+  attemptedRoutes: number;
+  failedRoutes: number;
+}): boolean {
+  return attemptedRoutes > 0 && failedRoutes >= attemptedRoutes;
+}
+
+// Per-route execution errors (timeouts, RPC failures, config load failures) do
+// not fail the job; config problems are alerted per route via violation
+// metrics. The job only fails when no attempted route could be checked at all,
+// which indicates an outage rather than a route-specific problem. Failing to
+// publish route-error metrics is a monitoring failure and always fails the job.
+export function getCheckWarpDeployExitCode({
+  attemptedRoutes,
+  failedRoutes,
+  failedMetricPublications,
+}: {
+  attemptedRoutes: number;
+  failedRoutes: number;
+  failedMetricPublications: number;
+}): 0 | 1 {
+  if (failedMetricPublications > 0) return 1;
+  return allAttemptedRoutesFailed({ attemptedRoutes, failedRoutes }) ? 1 : 0;
 }

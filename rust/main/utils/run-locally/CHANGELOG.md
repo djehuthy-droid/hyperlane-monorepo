@@ -1,3 +1,15 @@
+## [2.3.0] - 2026-07-20
+
+* fix(test): retry cosmos native e2e transactions to prevent flaky failures (#8354)
+* test(tron): agent e2e tests (#8427)
+
+## [2.1.0] - 2026-03-04
+
+* feat(agents): add chain configuration metrics (#8185)
+* feat: Store Raw Message Dispatches (#7714)
+* fix(starknet-e2e): replace hardcoded sleep with RPC readiness check (#8190)
+* perf(ci): speed up non-EVM Rust E2E tests (#8211)
+
 ## [2.0.0] - 2026-01-06
 
 * feat!: pnpm migration (#7410)

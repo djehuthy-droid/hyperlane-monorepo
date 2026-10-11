@@ -22,7 +22,7 @@ import {
 } from '@hyperlane-xyz/sdk';
 import { assert, objFilter, rootLogger } from '@hyperlane-xyz/utils';
 
-import type { DeployEnvironment } from '../src/config/environment.js';
+import type { DeployEnvironment } from '../src/config/deploy-environment.js';
 
 import { supportedChainNames as mainnet3Chains } from './environments/mainnet3/supportedChainNames.js';
 import {
@@ -39,10 +39,19 @@ export const DEFAULT_REGISTRY_URI = join(
 
 // A global Registry singleton
 // All uses of chain metadata or chain address artifacts should go through this registry.
-let registry: FileSystemRegistry;
+let registry: FileSystemRegistry | undefined;
 
 export function setRegistry(reg: FileSystemRegistry) {
   registry = reg;
+}
+
+/**
+ * Resets the registry singleton, forcing it to be recreated on the next
+ * getRegistry() call. Used by the HTTP registry server to pick up new files
+ * when file watching detects changes.
+ */
+export function resetRegistry() {
+  registry = undefined;
 }
 
 /**
@@ -102,6 +111,10 @@ export function getChainMetadata(): ChainMap<ChainMetadata> {
 
 export function getChainAddresses(): ChainMap<ChainAddresses> {
   return getRegistry().getAddresses();
+}
+
+export function warpRouteExistsInRegistry(warpRouteId: string): boolean {
+  return !!getRegistry().getWarpRoute(warpRouteId);
 }
 
 export function getWarpCoreConfig(warpRouteId: string): WarpCoreConfig {

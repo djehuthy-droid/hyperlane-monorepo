@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hyperlane_core::{
-    ChainResult, HyperlaneMessage, Indexed, Indexer, LogMeta, SequenceAwareIndexer,
-    H256, H512,
+    ChainResult, HyperlaneMessage, Indexed, Indexer, LogMeta, SequenceAwareIndexer, H256, H512,
 };
 use tracing::{debug, instrument};
 
@@ -70,8 +69,11 @@ impl Indexer<HyperlaneMessage> for KaspaMessageIndexer {
                 .map_err(|e| hyperlane_core::ChainCommunicationError::from_other_str(&e))?;
 
             // Decode body
-            let body = hex::decode(&record.body)
-                .map_err(|e| hyperlane_core::ChainCommunicationError::from_other_str(&format!("invalid body hex: {}", e)))?;
+            let body = hex::decode(&record.body).map_err(|e| {
+                hyperlane_core::ChainCommunicationError::from_other_str(&format!(
+                    "invalid body hex: {e}"
+                ))
+            })?;
 
             // Construct message
             let message = HyperlaneMessage {

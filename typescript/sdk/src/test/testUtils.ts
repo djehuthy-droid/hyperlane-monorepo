@@ -3,7 +3,7 @@ import { Keypair } from '@solana/web3.js';
 import { BigNumber, ethers } from 'ethers';
 import { bytesToHex } from 'viem';
 
-import { Address, exclude, objMap } from '@hyperlane-xyz/utils';
+import { Address, exclude, objMap, randomElement } from '@hyperlane-xyz/utils';
 
 import { testChains } from '../consts/testChains.js';
 import { HyperlaneContractsMap } from '../contracts/types.js';
@@ -14,12 +14,15 @@ import { IgpConfig } from '../gas/types.js';
 import { HookConfig, HookType } from '../hook/types.js';
 import {
   AggregationIsmConfig,
+  BlacklistIsmConfig,
   IsmConfig,
   IsmType,
   ModuleType,
   MultisigIsmConfig,
+  RateLimitedIsmConfig,
   RoutingIsmConfig,
   TrustedRelayerIsmConfig,
+  WeightedMultisigIsmConfig,
   ismTypeToModuleType,
 } from '../ism/types.js';
 import { RouterConfig } from '../router/types.js';
@@ -132,7 +135,14 @@ export const hookTypesToFilter: HookType[] = [
   HookType.OP_STACK,
   HookType.ARB_L2_TO_L1,
   HookType.CUSTOM,
+  HookType.PREDICATE,
   HookType.CCIP,
+  HookType.CCTP,
+  HookType.UNKNOWN,
+  // hook/ISM hybrids are deployed via their ISM config and need a live paired
+  // TokenRouter, so they cannot be randomly generated
+  HookType.NET_FLOW_RATE_LIMITED,
+  HookType.DELAYED_FLOW_ROUTER,
 ];
 export const DEFAULT_TOKEN_DECIMALS = 18;
 
@@ -235,6 +245,9 @@ export function randomHookConfig(
         arbSys: randomAddress(),
         bridge: randomAddress(),
         destinationChain: 'testChain',
+        childHook: {
+          type: HookType.MERKLE_TREE,
+        },
       };
 
     case HookType.ROUTING:
@@ -271,6 +284,14 @@ export function randomHookConfig(
         upperHook: randomHookConfig(depth + 1, maxDepth),
       };
 
+    case HookType.RATE_LIMITED:
+      return {
+        owner: randomAddress(),
+        type: hookType,
+        maxCapacity: ((1 + Math.floor(Math.random() * 100)) * 86400).toString(),
+        duration: 86400n,
+      };
+
     default:
       throw new Error(`Unsupported Hook type: ${hookType}`);
   }
@@ -279,13 +300,44 @@ export function randomHookConfig(
 export const randomMultisigIsmConfig = (
   m: number,
   n: number,
+  addresses?: string[],
 ): MultisigIsmConfig => {
-  const emptyArray = new Array<number>(n).fill(0);
-  const validators = emptyArray.map(() => randomAddress());
+  const validators = Array.from({ length: n }, () =>
+    addresses ? randomElement(addresses) : randomAddress(),
+  ).sort();
   return {
     type: IsmType.MERKLE_ROOT_MULTISIG,
     validators,
     threshold: m,
+  };
+};
+
+export const randomWeightedMultisigIsmConfig = (
+  n: number,
+  addresses?: string[],
+): WeightedMultisigIsmConfig => {
+  const totalWeight = 1e10;
+  const validators = Array.from({ length: n }, () => ({
+    signingAddress: addresses ? randomElement(addresses) : randomAddress(),
+    weight: 0,
+  }));
+  let remainingWeight = totalWeight;
+
+  for (let i = 0; i < n; i++) {
+    if (i === n - 1) {
+      validators[i].weight = remainingWeight;
+    } else {
+      const weight = Math.floor(Math.random() * (remainingWeight + 1));
+      validators[i].weight = weight;
+      remainingWeight -= weight;
+    }
+  }
+
+  const thresholdWeight = Math.floor(Math.random() * totalWeight);
+  return {
+    type: IsmType.WEIGHTED_MESSAGE_ID_MULTISIG,
+    validators,
+    thresholdWeight,
   };
 };
 
@@ -311,6 +363,12 @@ export const randomIsmConfig = (
   maxDepth = 2,
   providedIsmType?: IsmType,
 ): Exclude<IsmConfig, string> => {
+  // MAILBOX_DEFAULT maps to the ROUTING module type but has no domains table,
+  // so it cannot share the generic routing branch below
+  if (providedIsmType === IsmType.MAILBOX_DEFAULT) {
+    return { type: IsmType.MAILBOX_DEFAULT };
+  }
+
   // Use input IsmType, otherwise randomize a config based on depth
   const moduleType = providedIsmType
     ? ismTypeToModuleType(providedIsmType)
@@ -336,7 +394,7 @@ export const randomIsmConfig = (
     case ModuleType.AGGREGATION: {
       const n = randomInt(2, 1);
       const moduleTypes = new Set();
-      const modules = new Array<number>(n).fill(0).map(() => {
+      const modules = Array.from({ length: n }, () => {
         let moduleConfig: Exclude<IsmConfig, string>;
         let moduleType: IsmType;
 
@@ -357,6 +415,39 @@ export const randomIsmConfig = (
       return config;
     }
     case ModuleType.NULL: {
+      // The hybrid hook/ISMs share the NULL module type but are not
+      // interchangeable with the fallback below: they only make sense paired
+      // with a warp router, so returning a trusted relayer config for them
+      // would silently test something else.
+      if (
+        providedIsmType === IsmType.NET_FLOW_RATE_LIMITED ||
+        providedIsmType === IsmType.DELAYED_FLOW_ROUTER
+      ) {
+        throw new Error(
+          `randomIsmConfig cannot generate ${providedIsmType}: it is deployed against a specific warp router, so build the config explicitly`,
+        );
+      }
+      if (providedIsmType === IsmType.RATE_LIMITED) {
+        const config: RateLimitedIsmConfig = {
+          type: IsmType.RATE_LIMITED,
+          maxCapacity: '86400',
+          duration: 86400n,
+          recipient: randomAddress(),
+          owner: randomAddress(),
+        };
+        return config;
+      }
+      if (providedIsmType === IsmType.BLACKLIST) {
+        const config: BlacklistIsmConfig = {
+          type: IsmType.BLACKLIST,
+          owner: randomAddress(),
+          blacklistedIds: [
+            ethers.utils.hexlify(ethers.utils.randomBytes(32)),
+            ethers.utils.hexlify(ethers.utils.randomBytes(32)),
+          ],
+        };
+        return config;
+      }
       const config: TrustedRelayerIsmConfig = {
         type: IsmType.TRUSTED_RELAYER,
         relayer: randomAddress(),
@@ -365,5 +456,83 @@ export const randomIsmConfig = (
     }
     default:
       throw new Error(`Unsupported ISM type: ${moduleType}`);
+  }
+};
+
+/**
+ * Generate a random ISM config suitable for deployment with specific validators/relayer.
+ * Unlike randomIsmConfig, this version allows specifying validator addresses and relayer
+ * for use in hardhat tests where real signatures are needed.
+ */
+export const randomDeployableIsmConfig = (
+  maxDepth = 5,
+  validatorAddresses?: string[],
+  relayerAddress?: string,
+): Exclude<IsmConfig, Address> => {
+  const DeployableModuleTypes = [
+    ModuleType.AGGREGATION,
+    ModuleType.MESSAGE_ID_MULTISIG,
+    ModuleType.WEIGHTED_MESSAGE_ID_MULTISIG,
+    ModuleType.ROUTING,
+    ModuleType.NULL,
+  ];
+  const moduleType =
+    maxDepth === 0
+      ? ModuleType.MESSAGE_ID_MULTISIG
+      : DeployableModuleTypes[randomInt(DeployableModuleTypes.length)];
+
+  if (moduleType === ModuleType.MESSAGE_ID_MULTISIG) {
+    const n = randomInt(validatorAddresses?.length ?? 5, 1);
+    const m = randomInt(n, 1);
+    const validators = Array.from({ length: n }, () =>
+      validatorAddresses ? randomElement(validatorAddresses) : randomAddress(),
+    ).sort();
+    return {
+      type: IsmType.MESSAGE_ID_MULTISIG,
+      validators,
+      threshold: m,
+    };
+  } else if (moduleType === ModuleType.WEIGHTED_MESSAGE_ID_MULTISIG) {
+    const n = randomInt(validatorAddresses?.length ?? 5, 1);
+    return randomWeightedMultisigIsmConfig(n, validatorAddresses);
+  } else if (moduleType === ModuleType.ROUTING) {
+    const config: RoutingIsmConfig = {
+      type: IsmType.ROUTING,
+      owner: randomAddress(),
+      domains: Object.fromEntries(
+        testChains.map((c) => [
+          c,
+          randomDeployableIsmConfig(
+            maxDepth - 1,
+            validatorAddresses,
+            relayerAddress,
+          ),
+        ]),
+      ),
+    };
+    return config;
+  } else if (moduleType === ModuleType.AGGREGATION) {
+    const n = randomInt(5, 2);
+    const modules = Array.from({ length: n }, () =>
+      randomDeployableIsmConfig(
+        maxDepth - 1,
+        validatorAddresses,
+        relayerAddress,
+      ),
+    );
+    const config: AggregationIsmConfig = {
+      type: IsmType.AGGREGATION,
+      threshold: randomInt(n, 1),
+      modules,
+    };
+    return config;
+  } else if (moduleType === ModuleType.NULL) {
+    const config: TrustedRelayerIsmConfig = {
+      type: IsmType.TRUSTED_RELAYER,
+      relayer: relayerAddress ?? randomAddress(),
+    };
+    return config;
+  } else {
+    throw new Error(`Unsupported ISM type: ${moduleType}`);
   }
 };

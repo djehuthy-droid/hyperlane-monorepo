@@ -24,6 +24,7 @@ use super::{
     multisig::{MerkleRootMultisigMetadataBuilder, MessageIdMultisigMetadataBuilder},
     null_metadata::NullMetadataBuilder,
     routing::RoutingIsmMetadataBuilder,
+    sealevel_composite::SealevelCompositeIsmMetadataBuilder,
     MetadataBuilder,
 };
 
@@ -53,7 +54,7 @@ pub struct MessageMetadataBuilder {
 ///                 MessageMetadataBuilder
 #[async_trait]
 impl MetadataBuilder for MessageMetadataBuilder {
-    #[instrument(err, skip(self, message, params), fields(destination_domain=self.base_builder().destination_domain().name()))]
+    #[instrument(skip(self, message, params), fields(destination_domain=self.base_builder().destination_domain().name()))]
     async fn build(
         &self,
         ism_address: H256,
@@ -153,6 +154,43 @@ pub async fn build_message_metadata(
     message_builder: MessageMetadataBuilder,
     ism_address: H256,
     message: &HyperlaneMessage,
+    params: MessageMetadataBuildParams,
+    maybe_ism_and_module_type: Option<(Box<dyn InterchainSecurityModule>, ModuleType)>,
+) -> Result<IsmWithMetadataAndType, MetadataBuildError> {
+    let result = build_message_metadata_inner(
+        message_builder,
+        ism_address,
+        message,
+        params,
+        maybe_ism_and_module_type,
+    )
+    .await;
+    match &result {
+        Err(err @ MetadataBuildError::AwaitingValidatorSignatures) => {
+            tracing::debug!(
+                ?err,
+                ?ism_address,
+                message_id = ?message.id(),
+                "Metadata submodule is waiting for validator signatures"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                ?ism_address,
+                message_id = ?message.id(),
+                "Metadata submodule build failed"
+            );
+        }
+        Ok(_) => {}
+    }
+    result
+}
+
+async fn build_message_metadata_inner(
+    message_builder: MessageMetadataBuilder,
+    ism_address: H256,
+    message: &HyperlaneMessage,
     mut params: MessageMetadataBuildParams,
     maybe_ism_and_module_type: Option<(Box<dyn InterchainSecurityModule>, ModuleType)>,
 ) -> Result<IsmWithMetadataAndType, MetadataBuildError> {
@@ -200,7 +238,18 @@ pub async fn build_message_metadata(
         ModuleType::Routing => Box::new(RoutingIsmMetadataBuilder::new(message_builder)),
         ModuleType::Aggregation => Box::new(AggregationIsmMetadataBuilder::new(message_builder)),
         ModuleType::Null => Box::new(NullMetadataBuilder::new()),
-        ModuleType::CcipRead => Box::new(CcipReadIsmMetadataBuilder::new(message_builder)),
+        ModuleType::CcipRead => Box::new(CcipReadIsmMetadataBuilder::new(message_builder.clone())),
+        ModuleType::Composite => {
+            let composite_ism = message_builder
+                .base_builder()
+                .build_sealevel_composite_ism(ism_address)
+                .await
+                .map_err(|e| MetadataBuildError::FailedToBuild(e.to_string()))?;
+            Box::new(SealevelCompositeIsmMetadataBuilder::new(
+                message_builder,
+                composite_ism,
+            ))
+        }
         _ => return Err(MetadataBuildError::UnsupportedModuleType(module_type)),
     };
     let metadata = metadata_builder.build(ism_address, message, params).await?;

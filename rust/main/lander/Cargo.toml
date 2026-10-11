@@ -10,11 +10,13 @@ version.workspace = true
 [dependencies]
 hyperlane-base = { path = "../hyperlane-base", features = ["test-utils"] }
 hyperlane-core = { path = "../hyperlane-core" }
+hyperlane-metric = { path = "../hyperlane-metric" }
 
 hyperlane-aleo = { path = "../chains/hyperlane-aleo", optional = true }
 hyperlane-ethereum = { path = "../chains/hyperlane-ethereum" }
 hyperlane-radix = { path = "../chains/hyperlane-radix" }
 hyperlane-sealevel = { path = "../chains/hyperlane-sealevel" }
+hyperlane-tron = { path = "../chains/hyperlane-tron" }
 
 async-trait.workspace = true
 chrono.workspace = true
@@ -29,7 +31,10 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 solana-client.workspace = true
+solana-commitment-config.workspace = true
+solana-compute-budget-interface.workspace = true
 solana-sdk.workspace = true
+solana-system-interface.workspace = true
 solana-transaction-status.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "parking_lot"] }
@@ -49,6 +54,7 @@ sbor = { workspace = true, features = ["serde"] }
 scrypto = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 tracing-test.workspace = true
 mockall.workspace = true
@@ -57,6 +63,7 @@ tempfile.workspace = true
 [features]
 default = []
 aleo = ["dep:hyperlane-aleo", "hyperlane-base/aleo"]
+kaspa = ["hyperlane-base/kaspa"]
 # Feature flag for integration tests - enables test-specific factory functions
 # Integration tests should enable this feature, production builds should not
 integration_test = []

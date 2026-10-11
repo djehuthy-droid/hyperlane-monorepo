@@ -1,21 +1,23 @@
-import { BigNumber, PopulatedTransaction, utils } from 'ethers';
-import { z } from 'zod';
-
+import { BigNumber, PopulatedTransaction, ethers } from 'ethers';
 import {
   InterchainAccountRouter,
   InterchainAccountRouter__factory,
 } from '@hyperlane-xyz/core';
 import {
   Address,
-  CallData,
+  ProtocolType,
   addBufferToGasLimit,
   addressToBytes32,
   arrayToObject,
+  assert,
   bytes32ToAddress,
   eqAddress,
+  formatStandardHookMetadata,
+  isNullish,
   isZeroishAddress,
   objFilter,
   objMap,
+  parseStandardHookMetadata,
   promiseObjAll,
 } from '@hyperlane-xyz/utils';
 
@@ -26,14 +28,26 @@ import {
   HyperlaneContractsMap,
 } from '../../contracts/types.js';
 import { MultiProvider } from '../../providers/MultiProvider.js';
+import { CallData as SdkCallData } from '../../providers/transactions/types.js';
 import { RouterApp } from '../../router/RouterApps.js';
 import { ChainMap, ChainName } from '../../types.js';
+import { isMissingSelectorCallException } from '../../utils/contract.js';
+import {
+  estimateCallGas,
+  estimateHandleGasForRecipient,
+} from '../../utils/gas.js';
 
 import {
   InterchainAccountFactories,
   interchainAccountFactories,
 } from './contracts.js';
+import type { PostCallsType } from './icaCalls.js';
 import { AccountConfig, GetCallRemoteSettings } from './types.js';
+
+const IGP_DEFAULT_GAS = BigNumber.from(50_000);
+const ICA_OVERHEAD = BigNumber.from(50_000);
+const PER_CALL_OVERHEAD = BigNumber.from(5_000);
+const ICA_HANDLE_GAS_FALLBACK = BigNumber.from(200_000);
 
 export class InterchainAccount extends RouterApp<InterchainAccountFactories> {
   knownAccounts: Record<Address, AccountConfig | undefined>;
@@ -70,6 +84,8 @@ export class InterchainAccount extends RouterApp<InterchainAccountFactories> {
     return new InterchainAccount(helper.contractsMap, helper.multiProvider);
   }
 
+  static EMPTY_SALT = '0x' + '00'.repeat(32);
+
   async getAccount(
     destinationChain: ChainName,
     config: AccountConfig,
@@ -89,30 +105,68 @@ export class InterchainAccount extends RouterApp<InterchainAccountFactories> {
     destinationChain: ChainName,
     config: AccountConfig,
   ): Promise<Address> {
+    const userSalt = config.userSalt ?? InterchainAccount.EMPTY_SALT;
     const originDomain = this.multiProvider.tryGetDomainId(config.origin);
-    if (!originDomain) {
+    if (isNullish(originDomain)) {
       throw new Error(
         `Origin chain (${config.origin}) metadata needed for deploying ICAs ...`,
       );
     }
-    const destinationRouter = this.router(this.contractsMap[destinationChain]);
-    const originRouterAddress = config.localRouter
-      ? bytes32ToAddress(config.localRouter)
-      : bytes32ToAddress(await destinationRouter.routers(originDomain));
+    const destinationContracts = this.contractsMap[destinationChain];
+    assert(
+      destinationContracts?.interchainAccountRouter,
+      `No interchain account router configured for ${destinationChain}`,
+    );
+    const destinationRouter = this.router(destinationContracts);
+
+    // Tron uses 0x41 instead of the EVM 0xff prefix for CREATE2 address
+    // derivation, so ethers.getCreate2Address cannot reproduce its result.
+    const canDeriveLocally =
+      this.multiProvider.getProtocol(destinationChain) ===
+      ProtocolType.Ethereum;
+    const bytecodeHashPromise = canDeriveLocally
+      ? destinationRouter.bytecodeHash().catch((error: unknown) => {
+          if (isMissingSelectorCallException(error)) return null;
+          throw error;
+        })
+      : Promise.resolve(null);
+    const [rawOriginRouter, rawIsm, bytecodeHash] = await Promise.all([
+      config.localRouter ?? destinationRouter.routers(originDomain),
+      config.ismOverride ?? destinationRouter.isms(originDomain),
+      bytecodeHashPromise,
+    ]);
+    const originRouterAddress = bytes32ToAddress(rawOriginRouter);
     if (isZeroishAddress(originRouterAddress)) {
       throw new Error(
         `Origin router address is zero for ${config.origin} on ${destinationChain}`,
       );
     }
 
-    const destinationIsmAddress = bytes32ToAddress(
-      addressToBytes32(
-        config.ismOverride ?? (await destinationRouter.isms(originDomain)),
-      ),
-    );
-    const destinationAccount = await destinationRouter[
-      'getLocalInterchainAccount(uint32,address,address,address)'
-    ](originDomain, config.owner, originRouterAddress, destinationIsmAddress);
+    const destinationIsmAddress = bytes32ToAddress(addressToBytes32(rawIsm));
+    const owner = addressToBytes32(config.owner);
+    const originRouter = addressToBytes32(originRouterAddress);
+    let destinationAccount: Address;
+    if (isNullish(bytecodeHash)) {
+      destinationAccount = await destinationRouter[
+        'getLocalInterchainAccount(uint32,bytes32,bytes32,address,bytes32)'
+      ](originDomain, owner, originRouter, destinationIsmAddress, userSalt);
+    } else {
+      const deploySalt = ethers.utils.solidityKeccak256(
+        ['uint32', 'bytes32', 'bytes32', 'bytes32', 'bytes32'],
+        [
+          originDomain,
+          owner,
+          originRouter,
+          ethers.utils.hexZeroPad(destinationIsmAddress, 32),
+          userSalt,
+        ],
+      );
+      destinationAccount = ethers.utils.getCreate2Address(
+        destinationRouter.address,
+        deploySalt,
+        bytecodeHash,
+      );
+    }
 
     // If not deploying anything, return the account address.
     if (!deployIfNotExists) {
@@ -130,8 +184,8 @@ export class InterchainAccount extends RouterApp<InterchainAccountFactories> {
 
       // Estimate gas for deployment
       const gasEstimate = await destinationRouter.estimateGas[
-        'getDeployedInterchainAccount(uint32,address,address,address)'
-      ](originDomain, config.owner, originRouterAddress, destinationIsmAddress);
+        'getDeployedInterchainAccount(uint32,bytes32,bytes32,address,bytes32)'
+      ](originDomain, owner, originRouter, destinationIsmAddress, userSalt);
 
       // Add buffer to gas estimate
       const gasWithBuffer = addBufferToGasLimit(gasEstimate);
@@ -140,17 +194,11 @@ export class InterchainAccount extends RouterApp<InterchainAccountFactories> {
       await this.multiProvider.handleTx(
         destinationChain,
         destinationRouter[
-          'getDeployedInterchainAccount(uint32,address,address,address)'
-        ](
-          originDomain,
-          config.owner,
-          originRouterAddress,
-          destinationIsmAddress,
-          {
-            gasLimit: gasWithBuffer,
-            ...txOverrides,
-          },
-        ),
+          'getDeployedInterchainAccount(uint32,bytes32,bytes32,address,bytes32)'
+        ](originDomain, owner, originRouter, destinationIsmAddress, userSalt, {
+          gasLimit: gasWithBuffer,
+          ...txOverrides,
+        }),
       );
       this.logger.debug(`Interchain account deployed at ${destinationAccount}`);
     } else {
@@ -162,6 +210,144 @@ export class InterchainAccount extends RouterApp<InterchainAccountFactories> {
     this.knownAccounts[destinationAccount] = config;
 
     return destinationAccount;
+  }
+
+  /**
+   * Encode the ICA message body for handle() call estimation.
+   * Mirrors solidity/contracts/middleware/libs/InterchainAccountMessage.sol#encode
+   */
+  encodeIcaMessageBody(
+    owner: string,
+    ism: string,
+    calls: { to: string; value: BigNumber; data: string }[],
+    salt: string = ethers.constants.HashZero,
+  ): string {
+    const MESSAGE_TYPE_CALLS = 0;
+    const prefix = ethers.utils.solidityPack(
+      ['uint8', 'bytes32', 'bytes32', 'bytes32'],
+      [MESSAGE_TYPE_CALLS, owner, ism, salt],
+    );
+    const suffix = ethers.utils.defaultAbiCoder.encode(
+      ['tuple(bytes32 to, uint256 value, bytes data)[]'],
+      [calls],
+    );
+    return ethers.utils.hexConcat([prefix, suffix]);
+  }
+
+  /**
+   * Estimate gas for ICA handle() execution on destination chain.
+   */
+  async estimateIcaHandleGas({
+    origin,
+    destination,
+    innerCalls,
+    config,
+  }: {
+    origin: string;
+    destination: string;
+    innerCalls: SdkCallData[];
+    config: AccountConfig;
+  }): Promise<BigNumber> {
+    const originDomain = this.multiProvider.getDomainId(origin);
+    const destinationRouter = config.routerOverride
+      ? InterchainAccountRouter__factory.connect(
+          config.routerOverride,
+          this.multiProvider.getProvider(destination),
+        )
+      : this.router(this.contractsMap[destination]);
+
+    const localRouterAddress = config.localRouter
+      ? bytes32ToAddress(config.localRouter)
+      : this.routerAddress(origin);
+
+    const remoteIsm = addressToBytes32(
+      config.ismOverride ?? (await destinationRouter.isms(originDomain)),
+    );
+
+    const formattedCalls = innerCalls.map((call) => ({
+      to: addressToBytes32(call.to),
+      value: BigNumber.from(call.value ?? '0'),
+      data: call.data,
+    }));
+    let destinationAccount: Address;
+    try {
+      destinationAccount = await destinationRouter[
+        'getLocalInterchainAccount(uint32,bytes32,bytes32,address,bytes32)'
+      ](
+        originDomain,
+        addressToBytes32(config.owner),
+        addressToBytes32(localRouterAddress),
+        bytes32ToAddress(remoteIsm),
+        config.userSalt ?? InterchainAccount.EMPTY_SALT,
+      );
+    } catch (error) {
+      if (config.userSalt) throw error;
+      destinationAccount = await destinationRouter[
+        'getLocalInterchainAccount(uint32,address,address,address)'
+      ](
+        originDomain,
+        config.owner,
+        localRouterAddress,
+        bytes32ToAddress(remoteIsm),
+      );
+    }
+
+    const messageBody = this.encodeIcaMessageBody(
+      addressToBytes32(config.owner),
+      remoteIsm,
+      formattedCalls,
+    );
+
+    try {
+      const mailbox = await destinationRouter.mailbox();
+      const gasEstimate = await estimateHandleGasForRecipient({
+        recipient: destinationRouter,
+        origin: originDomain,
+        sender: addressToBytes32(localRouterAddress),
+        body: messageBody,
+        mailbox,
+      });
+
+      if (gasEstimate) {
+        return addBufferToGasLimit(gasEstimate);
+      }
+    } catch {
+      // Fall through to individual call estimation
+    }
+
+    this.logger.warn(
+      { destination },
+      'Failed to estimate ICA handle gas, trying individual call estimation',
+    );
+
+    try {
+      const provider = this.multiProvider.getProvider(destination);
+      const individualEstimates = await Promise.all(
+        formattedCalls.map((call) =>
+          estimateCallGas({
+            provider,
+            from: destinationAccount,
+            to: bytes32ToAddress(call.to),
+            data: call.data,
+            value: call.value,
+          }),
+        ),
+      );
+      const totalGas = individualEstimates.reduce(
+        (sum, gas) => sum.add(gas),
+        BigNumber.from(0),
+      );
+      const overhead = ICA_OVERHEAD.add(
+        PER_CALL_OVERHEAD.mul(formattedCalls.length),
+      );
+      return addBufferToGasLimit(totalGas.add(overhead));
+    } catch {
+      this.logger.warn(
+        { destination },
+        'Individual call estimation also failed, using static fallback',
+      );
+      return ICA_HANDLE_GAS_FALLBACK;
+    }
   }
 
   // meant for ICA governance to return the populatedTx
@@ -178,30 +364,105 @@ export class InterchainAccount extends RouterApp<InterchainAccountFactories> {
           this.multiProvider.getSigner(chain),
         )
       : this.router(this.contractsMap[chain]);
+    const originDomain = this.multiProvider.getDomainId(chain);
     const remoteDomain = this.multiProvider.getDomainId(destination);
-    const quote = await localRouter['quoteGasPayment(uint32)'](remoteDomain);
+
     const remoteRouter = addressToBytes32(
       config.routerOverride ?? this.routerAddress(destination),
     );
+    // ISMs are indexed by origin domain (where messages come FROM)
+    // For legacy routers, we need to use routerOverride to get the ISM
+    const destinationRouterForIsm = config.routerOverride
+      ? InterchainAccountRouter__factory.connect(
+          config.routerOverride,
+          this.multiProvider.getProvider(destination),
+        )
+      : this.router(this.contractsMap[destination]);
     const remoteIsm = addressToBytes32(
-      config.ismOverride ??
-        (await this.router(this.contractsMap[destination]).isms(remoteDomain)),
+      config.ismOverride ?? (await destinationRouterForIsm.isms(originDomain)),
     );
+
+    // Handle both string and object hookMetadata formats
+    const resolvedHookMetadata =
+      typeof hookMetadata === 'string'
+        ? hookMetadata
+        : hookMetadata
+          ? formatStandardHookMetadata({
+              msgValue: hookMetadata.msgValue
+                ? BigInt(hookMetadata.msgValue)
+                : undefined,
+              gasLimit: hookMetadata.gasLimit
+                ? BigInt(hookMetadata.gasLimit)
+                : undefined,
+              refundAddress: hookMetadata.refundAddress,
+            })
+          : '0x';
+
+    const gasLimitForQuote =
+      typeof hookMetadata === 'object' && hookMetadata?.gasLimit
+        ? BigNumber.from(hookMetadata.gasLimit)
+        : resolvedHookMetadata !== '0x'
+          ? (this.extractGasLimitFromMetadata(resolvedHookMetadata) ??
+            IGP_DEFAULT_GAS)
+          : IGP_DEFAULT_GAS;
+
+    const formattedCalls = innerCalls.map((call) => ({
+      to: addressToBytes32(call.to),
+      value: BigNumber.from(call.value ?? '0'),
+      data: call.data,
+    }));
+
+    let quote: BigNumber;
+    try {
+      quote = await localRouter['quoteGasPayment(uint32,uint256)'](
+        remoteDomain,
+        gasLimitForQuote,
+      );
+    } catch {
+      // Legacy ICA routers have broken quoteGasPayment that doesn't use hookMetadata.
+      // Query the mailbox directly to get accurate quote with our metadata.
+      const mailboxAddress = await localRouter.mailbox();
+      const mailbox = new ethers.Contract(
+        mailboxAddress,
+        [
+          'function quoteDispatch(uint32,bytes32,bytes,bytes,address) view returns (uint256)',
+          'function defaultHook() view returns (address)',
+        ],
+        this.multiProvider.getProvider(chain),
+      );
+      const defaultHook = await mailbox.defaultHook();
+      const messageBody = this.encodeIcaMessageBody(
+        addressToBytes32(config.owner),
+        remoteIsm,
+        formattedCalls,
+      );
+      quote = await mailbox[
+        'quoteDispatch(uint32,bytes32,bytes,bytes,address)'
+      ](
+        remoteDomain,
+        remoteRouter,
+        messageBody,
+        resolvedHookMetadata,
+        defaultHook,
+      );
+    }
+
     const callEncoded = await localRouter.populateTransaction[
       'callRemoteWithOverrides(uint32,bytes32,bytes32,(bytes32,uint256,bytes)[],bytes)'
     ](
       remoteDomain,
       remoteRouter,
       remoteIsm,
-      innerCalls.map((call) => ({
-        to: addressToBytes32(call.to),
-        value: call.value ?? BigNumber.from('0'),
-        data: call.data,
-      })),
-      hookMetadata ?? '0x',
+      formattedCalls,
+      resolvedHookMetadata,
       { value: quote },
     );
     return callEncoded;
+  }
+
+  private extractGasLimitFromMetadata(metadata: string): BigNumber | null {
+    const parsed = parseStandardHookMetadata(metadata);
+    return parsed ? BigNumber.from(parsed.gasLimit) : null;
   }
 
   // general helper for different overloaded callRemote functions
@@ -298,64 +559,6 @@ export async function deployInterchainAccount(
     );
   return interchainAccountApp.deployAccount(chain, config);
 }
-
-export function encodeIcaCalls(calls: CallData[], salt: string) {
-  return (
-    salt +
-    utils.defaultAbiCoder
-      .encode(
-        ['tuple(bytes32 to,uint256 value,bytes data)[]'],
-        [
-          calls.map((c) => ({
-            to: addressToBytes32(c.to),
-            value: c.value || 0,
-            data: c.data,
-          })),
-        ],
-      )
-      .slice(2)
-  );
-}
-
-// Convenience function to transform value strings to bignumber
-export type RawCallData = {
-  to: string;
-  value?: string | number;
-  data: string;
-};
-
-export function normalizeCalls(calls: RawCallData[]): CallData[] {
-  return calls.map((call) => ({
-    to: addressToBytes32(call.to),
-    value: BigNumber.from(call.value || 0),
-    data: call.data,
-  }));
-}
-
-export function commitmentFromIcaCalls(
-  calls: CallData[],
-  salt: string,
-): string {
-  return utils.keccak256(encodeIcaCalls(calls, salt));
-}
-
-export const PostCallsSchema = z.object({
-  calls: z
-    .array(
-      z.object({
-        to: z.string(),
-        data: z.string(),
-        value: z.string().optional(),
-      }),
-    )
-    .min(1),
-  relayers: z.array(z.string()),
-  salt: z.string(),
-  commitmentDispatchTx: z.string(),
-  originDomain: z.number(),
-});
-
-export type PostCallsType = z.infer<typeof PostCallsSchema>;
 
 export async function shareCallsWithPrivateRelayer(
   serverUrl: string,

@@ -1,6 +1,5 @@
 import { confirm } from '@inquirer/prompts';
 import {
-  ComputeBudgetProgram,
   PublicKey,
   Transaction,
   TransactionInstruction,
@@ -12,18 +11,26 @@ import {
   ChainName,
   IsmType,
   MultiProtocolProvider,
+  SealevelCoreAdapter,
   SvmMultiProtocolSignerAdapter,
 } from '@hyperlane-xyz/sdk';
-import { ProtocolType, rootLogger } from '@hyperlane-xyz/utils';
+import {
+  createRpc,
+  fetchMailboxInboxAccount,
+} from '@hyperlane-xyz/sealevel-sdk';
+import { ProtocolType, assert, rootLogger } from '@hyperlane-xyz/utils';
 import { readJson } from '@hyperlane-xyz/utils/fs';
+import { address } from '@solana/kit';
 
 import { Contexts } from '../../config/contexts.js';
 import { getChain } from '../../config/registry.js';
 import { chainsToSkip } from '../../src/config/chain.js';
-import { DeployEnvironment } from '../../src/config/environment.js';
+import { DeployEnvironment } from '../../src/config/deploy-environment.js';
 import { squadsConfigs } from '../../src/config/squads.js';
 import {
+  SQUADS_PROPOSAL_OVERHEAD,
   SvmMultisigConfigMap,
+  batchInstructionsBySize,
   buildMultisigIsmInstructions,
   diffMultisigIsmConfigs,
   fetchMultisigIsmState,
@@ -114,31 +121,31 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
   chain: ChainName,
   instructions: TransactionInstruction[],
   owner: PublicKey,
+  batchChainNames: string[],
   configsToUpdate: SvmMultisigConfigMap,
   mpp: MultiProtocolProvider,
   signerAdapter: SvmMultiProtocolSignerAdapter,
+  batchNum: number,
+  totalBatches: number,
 ): Promise<void> {
-  rootLogger.info(chalk.cyan('\n=== Batched Transaction ==='));
-  rootLogger.info(chalk.gray(`Total instructions: ${instructions.length}`));
+  const batchLabel =
+    totalBatches > 1 ? ` (Batch ${batchNum}/${totalBatches})` : '';
+  rootLogger.info(chalk.cyan(`\n=== Transaction${batchLabel} ===`));
+  rootLogger.info(chalk.gray(`Instructions: ${instructions.length}`));
   rootLogger.info(
     chalk.gray(
       `Transaction feePayer: ${owner.toBase58()} (Squads multisig vault)`,
     ),
   );
 
-  // Sort chain names alphabetically (same order as buildMultisigIsmInstructions)
-  const sortedChainNames = Object.keys(configsToUpdate).sort();
-
-  // Dynamically detect which instructions are compute budget vs MultisigIsm
-  // This handles different chains potentially having different setup instructions
+  // Log each instruction summary
   let multisigInstructionIndex = 0;
-
-  // Log each instruction summary with data hex for verification
   instructions.forEach((instruction, idx) => {
     const isComputeBudget = isComputeBudgetInstruction(instruction);
 
     if (isComputeBudget) {
-      // Decode compute budget instruction type
+      // Decode compute budget instruction type from first byte
+      // See: https://docs.solana.com/developing/runtime-facilities/compute-budget
       const dataView = new DataView(
         instruction.data.buffer,
         instruction.data.byteOffset,
@@ -146,6 +153,7 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
       );
       const instructionType = dataView.getUint8(0);
 
+      // ComputeBudget instruction types: 1 = RequestHeapFrame, 2 = SetComputeUnitLimit
       if (instructionType === 1) {
         rootLogger.info(
           chalk.gray(`Instruction ${idx}: Request heap frame (compute budget)`),
@@ -165,7 +173,7 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
       }
     } else {
       // MultisigIsm instruction
-      const remoteChain = sortedChainNames[multisigInstructionIndex];
+      const remoteChain = batchChainNames[multisigInstructionIndex];
       const config = configsToUpdate[remoteChain];
       rootLogger.info(
         chalk.gray(
@@ -173,7 +181,7 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
         ),
       );
 
-      // Debug log instruction data
+      // Debug log instruction data hex for verification
       const dataHex = instruction.data.toString('hex');
       rootLogger.debug(chalk.gray(`    Data: ${dataHex}`));
 
@@ -181,7 +189,6 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
     }
   });
 
-  // Create a transaction with ALL instructions
   try {
     const connection = mpp.getSolanaWeb3Provider(chain);
     const { blockhash } = await connection.getLatestBlockhash();
@@ -196,12 +203,10 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
 
     const isSolana = chain === 'solanamainnet';
 
-    // Serialize transaction to base58 (for Solana Squads)
     const txBase58 = bs58.encode(
       new Uint8Array(transaction.serialize({ requireAllSignatures: false })),
     );
 
-    // Serialize message to base58 (for alt SVM Squads UIs like Eclipse)
     const message = transaction.compileMessage();
     const messageBase58 = bs58.encode(new Uint8Array(message.serialize()));
 
@@ -218,14 +223,14 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
     }
 
     // Create descriptive memo for the proposal
-    const chainNames = sortedChainNames.join(', ');
-    const updateCount = sortedChainNames.length;
-    const memo = `Update MultisigIsm validators for ${updateCount} chain${updateCount > 1 ? 's' : ''}: ${chainNames}`;
+    const chainNamesStr = batchChainNames.join(', ');
+    const updateCount = batchChainNames.length;
+    const batchSuffix =
+      totalBatches > 1 ? ` [${batchNum}/${totalBatches}]` : '';
+    const memo = `Update MultisigIsm validators for ${updateCount} chain${updateCount > 1 ? 's' : ''}${batchSuffix}: ${chainNamesStr}`;
 
-    // Prompt for Squads submission
     const shouldSubmitToSquads = await confirm({
-      message:
-        'Do you want to submit this proposal to Squads multisig automatically?',
+      message: `Submit this proposal to Squads multisig?${batchLabel}`,
       default: true,
     });
 
@@ -238,7 +243,6 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
       return;
     }
 
-    // Submit to Squads
     await submitProposalToSquads(chain, instructions, mpp, signerAdapter, memo);
   } catch (error) {
     rootLogger.error(chalk.red(`Failed to log/submit transaction: ${error}`));
@@ -247,7 +251,11 @@ async function logAndSubmitMultisigIsmUpdateTransaction(
 }
 
 /**
- * Print update instructions as a single batched transaction for Squads multisig submission
+ * Print update instructions and submit as batched transactions for Squads multisig
+ *
+ * Automatically splits instructions into multiple transactions if they exceed
+ * Solana's 1232 byte transaction size limit. Each batch is submitted as a
+ * separate Squads proposal.
  */
 async function printAndSubmitMultisigIsmUpdates(
   chain: ChainName,
@@ -261,7 +269,8 @@ async function printAndSubmitMultisigIsmUpdates(
     return 0;
   }
 
-  const instructions = buildMultisigIsmInstructions(
+  // Build all instructions
+  const allInstructions = buildMultisigIsmInstructions(
     chain,
     multisigIsmProgramId,
     vaultPubkey,
@@ -269,29 +278,162 @@ async function printAndSubmitMultisigIsmUpdates(
     mpp,
   );
 
-  // Count instruction types dynamically
-  const computeBudgetCount = instructions.filter(
+  // Filter out compute budget instructions for batching purposes
+  // (they're only added for alt-SVM chains and don't count as "updates")
+  const multisigInstructions = allInstructions.filter(
+    (ix) => !isComputeBudgetInstruction(ix),
+  );
+  const computeBudgetInstructions = allInstructions.filter(
     isComputeBudgetInstruction,
-  ).length;
+  );
+
   const updateCount = Object.keys(configsToUpdate).length;
-
   const budgetNote =
-    computeBudgetCount === 0 ? ' (compute budget handled by Squads UI)' : '';
-  rootLogger.debug(
-    `[${chain}] Generating batched transaction with ${instructions.length} instructions (${computeBudgetCount} compute budget + ${updateCount} MultisigIsm updates)${budgetNote}`,
+    computeBudgetInstructions.length === 0
+      ? ' (compute budget handled by Squads UI)'
+      : '';
+
+  // Batch instructions by transaction size, accounting for Squads proposal overhead
+  // Note: We only batch the MultisigIsm instructions; compute budget would be per-batch
+  // but for Solana mainnet the Squads UI handles compute budget automatically
+  const instructionBatches = batchInstructionsBySize(
+    multisigInstructions,
+    vaultPubkey,
+    SQUADS_PROPOSAL_OVERHEAD,
+  );
+  const totalBatches = instructionBatches.length;
+
+  rootLogger.info(
+    chalk.gray(
+      `[${chain}] ${updateCount} MultisigIsm updates split into ${totalBatches} transaction${totalBatches > 1 ? 's' : ''}${budgetNote}`,
+    ),
   );
 
-  // Log the batched transaction and optionally submit to Squads
-  await logAndSubmitMultisigIsmUpdateTransaction(
-    chain,
-    instructions,
-    vaultPubkey,
-    configsToUpdate,
-    mpp,
-    signerAdapter,
-  );
+  // Sort chain names alphabetically (same order as buildMultisigIsmInstructions)
+  const sortedChainNames = Object.keys(configsToUpdate).sort();
+
+  // Submit each batch
+  let instructionOffset = 0;
+  for (let batchIdx = 0; batchIdx < instructionBatches.length; batchIdx++) {
+    const batchInstructions = instructionBatches[batchIdx];
+    const batchSize = batchInstructions.length;
+
+    // Get chain names for this batch (based on instruction order)
+    const batchChainNames = sortedChainNames.slice(
+      instructionOffset,
+      instructionOffset + batchSize,
+    );
+    instructionOffset += batchSize;
+
+    await logAndSubmitMultisigIsmUpdateTransaction(
+      chain,
+      batchInstructions,
+      vaultPubkey,
+      batchChainNames,
+      configsToUpdate,
+      mpp,
+      signerAdapter,
+      batchIdx + 1,
+      totalBatches,
+    );
+  }
 
   return updateCount;
+}
+
+/**
+ * Check if the on-chain default ISM matches the configured ISM program ID.
+ * If not, submit a set-default-ISM Squads proposal.
+ *
+ * Returns:
+ *   'match' — on-chain ISM equals configured, safe to do in-place validator updates
+ *   'proposed' — mismatch, set-default-ISM proposal submitted
+ *   'skipped' — mismatch, user declined proposal submission
+ *   'unreadable' — could not read mailbox inbox
+ */
+async function checkAndSubmitSetDefaultIsm(
+  chain: ChainName,
+  mailboxProgramId: string,
+  configuredIsmProgramId: string,
+  vaultPubkey: PublicKey,
+  mpp: MultiProtocolProvider,
+  adapter: SvmMultiProtocolSignerAdapter,
+): Promise<'match' | 'proposed' | 'skipped' | 'unreadable'> {
+  // Read on-chain default ISM from the mailbox inbox PDA
+  const chainMeta = getChain(chain);
+  let inbox;
+  try {
+    const rpcUrl = chainMeta.rpcUrls[0]?.http;
+    assert(rpcUrl, `No HTTP RPC configured for ${chain}`);
+    const rpc = createRpc(rpcUrl);
+    inbox = await fetchMailboxInboxAccount(rpc, address(mailboxProgramId));
+  } catch (error) {
+    rootLogger.warn(
+      chalk.yellow(
+        `[${chain}] Failed to read mailbox inbox — cannot verify default ISM, skipping validator updates: ${String(error)}`,
+      ),
+    );
+    return 'unreadable';
+  }
+  if (!inbox) {
+    // Can't verify — treat as mismatch to be safe (don't update wrong ISM)
+    rootLogger.warn(
+      chalk.yellow(
+        `[${chain}] Could not read mailbox inbox — cannot verify default ISM, skipping validator updates`,
+      ),
+    );
+    return 'unreadable';
+  }
+
+  const onChainIsm = inbox.defaultIsm;
+  if (onChainIsm === configuredIsmProgramId) {
+    rootLogger.info(
+      chalk.gray(
+        `[${chain}] Default ISM matches configured: ${configuredIsmProgramId}`,
+      ),
+    );
+    return 'match';
+  }
+
+  rootLogger.info(
+    chalk.yellow(
+      `[${chain}] Default ISM mismatch:\n` +
+        `  On-chain: ${onChainIsm}\n` +
+        `  Configured: ${configuredIsmProgramId}`,
+    ),
+  );
+
+  // Build set-default-ISM instruction (vault is the mailbox owner/signer)
+  const coreAdapter = new SealevelCoreAdapter(chain, mpp, {
+    mailbox: mailboxProgramId,
+  });
+  const setIsmIx = coreAdapter.createSetDefaultIsmInstruction(
+    new PublicKey(mailboxProgramId),
+    vaultPubkey,
+    new PublicKey(configuredIsmProgramId),
+  );
+
+  const shouldSubmit = await confirm({
+    message: `Submit set-default-ISM proposal for ${chain}? (${configuredIsmProgramId})`,
+    default: true,
+  });
+
+  if (shouldSubmit) {
+    await submitProposalToSquads(
+      chain,
+      [setIsmIx],
+      mpp,
+      adapter,
+      `Set default ISM to ${configuredIsmProgramId} on ${chain}`,
+    );
+    rootLogger.info(
+      chalk.green(`[${chain}] Set-default-ISM proposal submitted`),
+    );
+    return 'proposed';
+  }
+
+  rootLogger.info(chalk.yellow(`[${chain}] Skipped set-default-ISM proposal`));
+  return 'skipped';
 }
 
 /**
@@ -307,6 +449,7 @@ async function processChain(
   chain: string;
   updated: number;
   matched: number;
+  ismStatus: 'match' | 'proposed' | 'skipped' | 'unreadable';
 }> {
   rootLogger.debug(`Configuring MultisigIsm for ${chain} on ${environment}`);
 
@@ -329,6 +472,26 @@ async function processChain(
   rootLogger.debug(
     `Using Turnkey signer (proposal creator): ${await adapter.address()}`,
   );
+
+  // Check if on-chain default ISM matches configured ISM.
+  // If different, submit a set-default-ISM proposal and skip validator updates
+  // (the new ISM was already configured during deployment).
+  const ismCheckResult = await checkAndSubmitSetDefaultIsm(
+    chain,
+    coreProgramIds.mailbox,
+    coreProgramIds.multisig_ism_message_id,
+    vaultPubkey,
+    mpp,
+    adapter,
+  );
+  if (ismCheckResult !== 'match') {
+    return {
+      chain,
+      updated: 0,
+      matched: 0,
+      ismStatus: ismCheckResult,
+    };
+  }
 
   // Load configuration from file
   const configPath = multisigIsmConfigPath(environment, context, chain);
@@ -374,7 +537,7 @@ async function processChain(
     rootLogger.info(`No updates needed for ${chain} - all configs match`);
   }
 
-  return { chain, updated, matched };
+  return { chain, updated, matched, ismStatus: 'match' };
 }
 
 // CLI argument parsing
@@ -413,8 +576,12 @@ async function main() {
 
   // Process all chains sequentially (to avoid overwhelming the user with prompts)
   const mpp = await envConfig.getMultiProtocolProvider();
-  const results: Array<{ chain: string; updated: number; matched: number }> =
-    [];
+  const results: Array<{
+    chain: string;
+    updated: number;
+    matched: number;
+    ismStatus: string;
+  }> = [];
 
   for (const chain of chains) {
     const signerAdapter = new SvmMultiProtocolSignerAdapter(
@@ -434,7 +601,7 @@ async function main() {
       results.push(result);
     } catch (error) {
       rootLogger.error(`Failed to process ${chain}:`, error);
-      results.push({ chain, updated: 0, matched: 0 });
+      results.push({ chain, updated: 0, matched: 0, ismStatus: 'error' });
     }
   }
 

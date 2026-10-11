@@ -19,10 +19,9 @@ import type {
 import { ProtocolType } from '@hyperlane-xyz/utils';
 
 export const SignerKeyProtocolMapSchema = z
-  .record(z.nativeEnum(ProtocolType), z.string().nonempty(), {
-    errorMap: (_issue, _ctx) => ({
-      message: `Key inputs not valid, make sure to use --key.{protocol} or the legacy flag --key but not both at the same time or avoid defining multiple --key or --key.{protocol} flags for the same protocol.`,
-    }),
+  .partialRecord(z.enum(ProtocolType), z.string().nonempty(), {
+    error:
+      'Key inputs not valid, make sure to use --key.{protocol} or the legacy flag --key but not both at the same time or avoid defining multiple --key or --key.{protocol} flags for the same protocol.',
   })
   .or(z.string().nonempty())
   .transform((value) =>
@@ -42,10 +41,13 @@ export interface ContextSettings extends BaseContext {
   registryUris: string[];
   disableProxy?: boolean;
   authToken?: string;
+  skipLocalSigner?: boolean;
 }
 
-export interface CommandContext
-  extends Omit<BaseContext, 'key' | 'skipConfirmation'> {
+export interface CommandContext extends Omit<
+  BaseContext,
+  'key' | 'skipConfirmation'
+> {
   key?: SignerKeyProtocolMap;
   registry: IRegistry;
   chainMetadata: ChainMap<ChainMetadata>;
@@ -54,23 +56,26 @@ export interface CommandContext
   altVmProviders: ChainMap<AltVM.IProvider>;
   supportedProtocols: ProtocolType[];
   skipConfirmation: boolean;
-  // just for evm chains backward compatibility
-  signerAddress?: string;
+  warpCoreConfig?: WarpCoreConfig;
+  warpDeployConfig?: WarpRouteDeployConfigMailboxRequired;
+  resolvedWarpRouteId?: string;
+  altVmSigners: ChainMap<AltVM.ISigner<AnnotatedTx, TxReceipt>>;
 }
 
 export interface WriteCommandContext extends Omit<CommandContext, 'key'> {
   key: SignerKeyProtocolMap;
   signer: ethers.Signer;
-  altVmSigners: ChainMap<AltVM.ISigner<AnnotatedTx, TxReceipt>>;
   apiKeys?: ChainMap<string>;
 }
 
 export interface WarpDeployCommandContext extends WriteCommandContext {
   warpDeployConfig: WarpRouteDeployConfigMailboxRequired;
+  resolvedWarpRouteId?: string;
 }
 export interface WarpApplyCommandContext extends WriteCommandContext {
   warpDeployConfig: WarpRouteDeployConfigMailboxRequired;
   warpCoreConfig: WarpCoreConfig;
+  resolvedWarpRouteId?: string;
 }
 
 export type CommandModuleWithContext<Args> = CommandModule<

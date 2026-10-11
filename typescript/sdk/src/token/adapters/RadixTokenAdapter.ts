@@ -1,6 +1,9 @@
 import { BigNumber } from 'bignumber.js';
 
-import { RadixProvider, RadixSDKTransaction } from '@hyperlane-xyz/radix-sdk';
+import type {
+  RadixProvider,
+  RadixSDKTransaction,
+} from '@hyperlane-xyz/radix-sdk/runtime';
 import {
   Address,
   Domain,
@@ -11,7 +14,7 @@ import {
 } from '@hyperlane-xyz/utils';
 
 import { BaseRadixAdapter } from '../../app/MultiProtocolApp.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
 import { ChainName } from '../../types.js';
 import { TokenMetadata } from '../types.js';
 
@@ -37,7 +40,7 @@ export class RadixTokenAdapter
 
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { token: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -55,10 +58,9 @@ export class RadixTokenAdapter
   }
 
   async getMetadata(): Promise<TokenMetadata> {
-    // Work around to access the base radix provider getMetadata method
-    const { name, symbol, decimals } = await this.provider['base'].getMetadata({
-      resource: this.tokenAddress,
-    });
+    const { name, symbol, decimals } = await this.provider.getTokenMetadata(
+      this.tokenAddress,
+    );
 
     assert(
       name !== undefined,
@@ -151,7 +153,7 @@ export class RadixHypCollateralAdapter
 {
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { token: Address },
   ) {
     super(chainName, multiProvider, addresses);

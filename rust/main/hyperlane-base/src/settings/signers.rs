@@ -1,9 +1,13 @@
+use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use ethers::core::k256::sha2::{Digest, Sha256};
 use ethers::prelude::{AwsSigner, LocalWallet};
 use ethers::utils::hex::ToHex;
 use eyre::{bail, Context, Report};
+use moka::future::Cache;
 use rusoto_core::Region;
 use rusoto_kms::KmsClient;
 use tracing::instrument;
@@ -14,6 +18,79 @@ use super::aws_credentials::AwsChainCredentialsProvider;
 use crate::types::utils;
 
 const AWS_SIGNER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolve an AWS region string into a `rusoto_core::Region` without relying on
+/// rusoto's `FromStr` allowlist, which rejects regions added after rusoto was
+/// last updated (e.g. `eu-central-2`).
+fn resolve_kms_region(region: &str) -> Region {
+    Region::from_str(region).unwrap_or_else(|_| Region::Custom {
+        name: region.to_owned(),
+        endpoint: format!("https://kms.{region}.amazonaws.com"),
+    })
+}
+
+/// Cache of constructed AWS signers, keyed by (KMS key id, region), so independent call
+/// sites needing the same signer share one `GetPublicKey` call instead of repeating it.
+///
+/// Uses moka's `try_get_with`, not a `tokio::sync::OnceCell`: moka coalesces concurrent
+/// callers into one `init` attempt on both success and failure, so a KMS outage fails once
+/// for everyone waiting instead of serializing a fresh `AWS_SIGNER_TIMEOUT`-long attempt
+/// per waiter.
+type AwsSignerCache = Cache<(String, String), AwsSigner>;
+
+static AWS_SIGNER_CACHE: OnceLock<AwsSignerCache> = OnceLock::new();
+
+fn get_aws_signer_cache() -> &'static AwsSignerCache {
+    AWS_SIGNER_CACHE.get_or_init(|| Cache::builder().max_capacity(100).build())
+}
+
+/// Builds an `AwsSigner` for the given KMS key id and region, reusing an already-constructed
+/// signer for the same (id, region) pair if one exists rather than making a fresh KMS call.
+async fn build_aws_signer(id: &str, region: &str) -> Result<AwsSigner, Report> {
+    get_aws_signer_cache()
+        .try_get_with((id.to_owned(), region.to_owned()), async {
+            let http_client =
+                utils::http_client_with_timeout().map_err(|err| eyre::eyre!(err.to_string()))?;
+            let client = KmsClient::new_with_client(
+                rusoto_core::Client::new_with(AwsChainCredentialsProvider::new(), http_client),
+                resolve_kms_region(region),
+            );
+            AwsSigner::new(client, id, 0, Some(AWS_SIGNER_TIMEOUT))
+                .await
+                .map_err(Report::from)
+        })
+        .await
+        .map_err(|arc_err| eyre::eyre!("{arc_err}"))
+}
+
+/// Cache of constructed GCP signers, keyed by KMS crypto key version resource name, so
+/// independent call sites needing the same signer share one `GetPublicKey` call instead of
+/// repeating it. Same `try_get_with` coalescing rationale as `AWS_SIGNER_CACHE` above.
+type GcpSignerCache = Cache<String, hyperlane_ethereum::GcpSigner>;
+
+static GCP_SIGNER_CACHE: OnceLock<GcpSignerCache> = OnceLock::new();
+
+fn get_gcp_signer_cache() -> &'static GcpSignerCache {
+    GCP_SIGNER_CACHE.get_or_init(|| Cache::builder().max_capacity(100).build())
+}
+
+/// Builds a `GcpSigner` for the given KMS crypto key version, reusing an already-constructed
+/// signer for the same name rather than making a fresh KMS call. Credentials are ambient
+/// (Application Default Credentials) - nothing credential-related is read from config.
+async fn build_gcp_signer(key_version_name: &str) -> Result<hyperlane_ethereum::GcpSigner, Report> {
+    get_gcp_signer_cache()
+        .try_get_with(key_version_name.to_owned(), async {
+            let client = google_cloud_kms_v1::client::KeyManagementService::builder()
+                .build()
+                .await
+                .map_err(|err| eyre::eyre!(err.to_string()))?;
+            hyperlane_ethereum::GcpSigner::new(client, key_version_name.to_owned())
+                .await
+                .map_err(Report::from)
+        })
+        .await
+        .map_err(|arc_err| eyre::eyre!("{arc_err}"))
+}
 
 /// Signer types
 #[derive(Default, Debug, Clone)]
@@ -29,7 +106,14 @@ pub enum SignerConf {
         /// The UUID identifying the AWS KMS Key
         id: String,
         /// The AWS region
-        region: Region,
+        region: String,
+    },
+    /// A GCP Cloud KMS signer. Credentials are ambient (Application Default
+    /// Credentials) - nothing credential-related is read from this config.
+    Gcp {
+        /// Fully-qualified resource name of the crypto key version, e.g.
+        /// `projects/{p}/locations/{l}/keyRings/{k}/cryptoKeys/{ck}/cryptoKeyVersions/{v}`.
+        key_version_name: String,
     },
     /// Cosmos Specific key
     CosmosKey {
@@ -95,14 +179,10 @@ impl BuildableWithSignerConf for hyperlane_ethereum::Signers {
                 ),
             )),
             SignerConf::Aws { id, region } => {
-                let http_client = utils::http_client_with_timeout()
-                    .map_err(|err| eyre::eyre!(err.to_string()))?;
-                let client = KmsClient::new_with_client(
-                    rusoto_core::Client::new_with(AwsChainCredentialsProvider::new(), http_client),
-                    region.clone(),
-                );
-                let signer = AwsSigner::new(client, id, 0, Some(AWS_SIGNER_TIMEOUT)).await?;
-                hyperlane_ethereum::Signers::Aws(signer)
+                hyperlane_ethereum::Signers::Aws(build_aws_signer(id, region).await?)
+            }
+            SignerConf::Gcp { key_version_name } => {
+                hyperlane_ethereum::Signers::Gcp(build_gcp_signer(key_version_name).await?)
             }
             SignerConf::CosmosKey { .. } => {
                 bail!("cosmosKey signer is not supported by Ethereum")
@@ -128,26 +208,43 @@ impl ChainSigner for hyperlane_ethereum::Signers {
 }
 
 #[async_trait]
-impl BuildableWithSignerConf for fuels::prelude::WalletUnlocked {
+impl BuildableWithSignerConf for hyperlane_tron::TronSigner {
     async fn build(conf: &SignerConf) -> Result<Self, Report> {
-        if let SignerConf::HexKey { key } = conf {
-            let key = fuels::crypto::SecretKey::try_from(key.as_bytes())
-                .context("Invalid fuel signer key")?;
-            Ok(fuels::prelude::WalletUnlocked::new_from_private_key(
-                key, None,
-            ))
-        } else {
-            bail!(format!("{conf:?} key is not supported by fuel"));
+        match conf {
+            SignerConf::HexKey { key } => {
+                let key = ethers::core::k256::SecretKey::from_be_bytes(key.as_bytes())?;
+                let wallet = ethers::core::k256::ecdsa::SigningKey::from(key);
+                Ok(hyperlane_tron::TronSigner::from(wallet))
+            }
+            SignerConf::Aws { id, region } => Ok(hyperlane_tron::TronSigner::Aws(
+                build_aws_signer(id, region).await?,
+            )),
+            SignerConf::Gcp { key_version_name } => Ok(hyperlane_tron::TronSigner::Gcp(
+                build_gcp_signer(key_version_name).await?,
+            )),
+            _ => bail!(format!("{conf:?} key is not supported by tron")),
         }
     }
 }
 
-impl ChainSigner for fuels::prelude::WalletUnlocked {
+impl ChainSigner for hyperlane_tron::TronSigner {
     fn address_string(&self) -> String {
-        self.address().to_string()
+        let mut address_bytes = self.address_h256().to_fixed_bytes().to_vec();
+        address_bytes[11] = 0x41; // Tron address prefix
+
+        let hash1 = Sha256::digest(&address_bytes[11..]);
+        let hash2 = Sha256::digest(hash1);
+
+        let checksum = &hash2[0..4];
+
+        let mut final_bytes = Vec::with_capacity(25);
+        final_bytes.extend_from_slice(&address_bytes[11..]);
+        final_bytes.extend_from_slice(checksum);
+
+        bs58::encode(final_bytes).into_string()
     }
     fn address_h256(&self) -> H256 {
-        H256::from_slice(fuels::types::Address::from(self.address()).as_slice())
+        ethers::types::H256::from(self.address()).into()
     }
 }
 
@@ -275,10 +372,92 @@ impl ChainSigner for hyperlane_aleo::AleoSigner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use ethers::{signers::LocalWallet, utils::hex};
     use hyperlane_core::{AccountAddressType, Encode, H256};
+    use moka::future::Cache;
+    use rusoto_core::Region;
+    use tokio::sync::Barrier;
 
-    use crate::settings::ChainSigner;
+    use super::resolve_kms_region;
+    use crate::settings::{ChainSigner, SignerConf};
+
+    /// Exercises the exact coalescing mechanism `build_aws_signer` relies on
+    /// (`moka::future::Cache::try_get_with`) against a fake, always-failing initializer -
+    /// proving concurrent callers on the same key share one attempt and one failure, and
+    /// that a later call is not permanently blocked by a stale cached error.
+    #[tokio::test]
+    async fn concurrent_failing_lookups_are_coalesced_into_one_attempt() {
+        let cache: Cache<&'static str, u32> = Cache::builder().max_capacity(10).build();
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        const WAITERS: usize = 5;
+        let barrier = Arc::new(Barrier::new(WAITERS));
+        let tasks: Vec<_> = (0..WAITERS)
+            .map(|_| {
+                let cache = cache.clone();
+                let attempts = attempts.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    cache
+                        .try_get_with("key", async {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            Err::<u32, &'static str>("simulated KMS failure")
+                        })
+                        .await
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            let result = task.await.expect("spawned task must not panic");
+            assert!(
+                result.is_err(),
+                "the shared failure must propagate to every waiter"
+            );
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "concurrent callers on the same key must coalesce into a single init attempt, \
+             not one attempt per waiter"
+        );
+
+        // A later, non-concurrent call must retry rather than reuse the (uncached) failure.
+        let retry_result = cache
+            .try_get_with("key", async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok::<u32, &'static str>(42)
+            })
+            .await;
+        assert_eq!(retry_result, Ok(42));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "a later call must retry after a failure, not reuse a permanently cached error"
+        );
+    }
+
+    #[test]
+    fn resolve_kms_region_known_region_uses_enum_variant() {
+        assert_eq!(resolve_kms_region("us-east-1"), Region::UsEast1);
+    }
+
+    #[test]
+    fn resolve_kms_region_unknown_region_uses_custom() {
+        let region = resolve_kms_region("eu-central-2");
+        match region {
+            Region::Custom { name, endpoint } => {
+                assert_eq!(name, "eu-central-2");
+                assert_eq!(endpoint, "https://kms.eu-central-2.amazonaws.com");
+            }
+            other => panic!("expected Region::Custom, got {other:?}"),
+        }
+    }
 
     #[test]
     fn address_h256_ethereum() {
@@ -306,7 +485,7 @@ mod tests {
             "0d861aa9ee7b09fe0305a649ec9aa0dfede421817dbe995b48964e5a79fc89e50f8ac473c042cdd96a1fc81eac32221188807572521429fb871a856a668502a5";
         const ADDRESS: &str = "0f8ac473c042cdd96a1fc81eac32221188807572521429fb871a856a668502a5";
 
-        let chain_signer = hyperlane_sealevel::Keypair::from_bytes(
+        let chain_signer = hyperlane_sealevel::Keypair::try_from(
             hex::decode(PRIVATE_KEY)
                 .expect("Failed to decode private key")
                 .as_slice(),
@@ -315,29 +494,6 @@ mod tests {
 
         let address_h256 = H256::from_slice(
             hex::decode(ADDRESS)
-                .expect("Failed to decode public key")
-                .as_slice(),
-        );
-        assert_eq!(chain_signer.address_h256(), address_h256);
-    }
-
-    #[test]
-    fn address_h256_fuel() {
-        const PRIVATE_KEY: &str =
-            "0a83ee2a87f328704512567198ee25578c27c707b26fdf3be9ea8bf8588f3b65";
-        const PUBLIC_KEY: &str = "b43425b2256e7dcdd61752808b137b23f4f697cfaf21175ed81d0610ebab5a87";
-
-        let private_key = fuels::crypto::SecretKey::try_from(
-            hex::decode(PRIVATE_KEY)
-                .expect("Failed to decode private key")
-                .as_slice(),
-        )
-        .expect("Failed to create secret key");
-
-        let chain_signer = fuels::prelude::WalletUnlocked::new_from_private_key(private_key, None);
-
-        let address_h256 = H256::from_slice(
-            hex::decode(PUBLIC_KEY)
                 .expect("Failed to decode public key")
                 .as_slice(),
         );
@@ -368,5 +524,34 @@ mod tests {
                 .as_slice(),
         );
         assert_eq!(chain_signer.address_h256(), address_h256);
+    }
+
+    #[tokio::test]
+    async fn address_h256_tron() {
+        use crate::settings::signers::BuildableWithSignerConf;
+
+        const PRIVATE_KEY: &str =
+            "b2752a4539917a795c79caaa0e99d8111078574f381ca3f7598c6ff1ea6b6e3c";
+        let address =
+            hex::decode("000000000000000000000000e304de1cb42ac734b97bd6ae767942e00d751f8a")
+                .unwrap();
+
+        let signer_config = SignerConf::HexKey {
+            key: H256::from_slice(
+                hex::decode(PRIVATE_KEY)
+                    .expect("Failed to decode private key")
+                    .as_slice(),
+            ),
+        };
+
+        let tron_signer = hyperlane_tron::TronSigner::build(&signer_config)
+            .await
+            .expect("Failed to build tron signer");
+
+        assert_eq!(H256::from_slice(&address), tron_signer.address_h256());
+        assert_eq!(
+            "TWfaDp7My62uVWnxPiohWau4HyanfDG31N",
+            tron_signer.address_string()
+        );
     }
 }

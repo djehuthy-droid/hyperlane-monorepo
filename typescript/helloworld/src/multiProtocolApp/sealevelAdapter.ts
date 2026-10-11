@@ -10,7 +10,6 @@ import { deserializeUnchecked, serialize } from 'borsh';
 
 import {
   ChainName,
-  MultiProtocolProvider,
   ProviderType,
   SEALEVEL_SPL_NOOP_ADDRESS,
   SealevelAccountDataWrapper,
@@ -22,6 +21,7 @@ import {
   SolanaWeb3Transaction,
   getSealevelAccountDataSchema,
 } from '@hyperlane-xyz/sdk';
+import type { MultiProviderAdapter } from '@hyperlane-xyz/sdk/providers/MultiProviderAdapter';
 import { Address, Domain } from '@hyperlane-xyz/utils';
 
 import { IHelloWorldAdapter } from './types.js';
@@ -32,7 +32,7 @@ export class SealevelHelloWorldAdapter
 {
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { router: Address; mailbox: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -83,10 +83,8 @@ export class SealevelHelloWorldAdapter
     const connection = this.getProvider();
     const recentBlockhash = (await connection.getLatestBlockhash('finalized'))
       .blockhash;
-    // @ts-ignore Workaround for bug in the web3 lib, sometimes uses recentBlockhash and sometimes uses blockhash
     const transaction = new Transaction({
       feePayer: senderPubKey,
-      blockhash: recentBlockhash,
       recentBlockhash,
     }).add(txInstruction);
     transaction.partialSign(randomWallet);

@@ -1,50 +1,146 @@
 import chalk from 'chalk';
 import { Gauge, Registry } from 'prom-client';
+import { stringify as yamlStringify } from 'yaml';
 
+import { submitMetrics } from '@hyperlane-xyz/metrics';
 import { getRegistry } from '@hyperlane-xyz/registry/fs';
-import { ChainName } from '@hyperlane-xyz/sdk';
+import {
+  type ChainName,
+  InterchainAccount,
+  MultiProvider,
+  type WarpCoreConfig,
+  type WarpRouteCheckResult,
+  type WarpRouteDeployConfigMailboxRequired,
+  WarpRouteDeployConfigMailboxRequiredSchema,
+  checkWarpRouteDeployConfig,
+  resolveWarpDeployConfigRouterKeys,
+} from '@hyperlane-xyz/sdk';
+import { assert, objFilter } from '@hyperlane-xyz/utils';
 
 import { WarpRouteIds } from '../../config/environments/mainnet3/warp/warpIds.js';
 import { DEFAULT_REGISTRY_URI } from '../../config/registry.js';
-import { getWarpConfigMapFromMergedRegistry } from '../../config/warp.js';
-import { submitMetrics } from '../../src/utils/metrics.js';
-import { Modules } from '../agent-utils.js';
+import {
+  getWarpConfig,
+  getWarpConfigGetterInputs,
+  getWarpDeployConfigFromMergedRegistry,
+  getWarpConfigMapFromMergedRegistry,
+  warpConfigGetterMap,
+} from '../../config/warp.js';
+import { type EnvironmentConfig } from '../../src/config/environment.js';
 import { getEnvironmentConfig } from '../core-utils.js';
 
 import {
+  allAttemptedRoutesFailed,
   getCheckWarpDeployArgs,
+  getCheckWarpDeployExitCode,
+  buildWarpRouteErrorMetricEntries,
+  getCheckRouteErrorGaugeObj,
   getCheckerViolationsGaugeObj,
-  getGovernor,
-  logViolations,
+  warpRouteErrorGroupings,
+  warpViolationGroupings,
 } from './check-utils.js';
+import { isContractVerificationViolation } from './contract-verification-skip.js';
+import { resolveAcceptedInactiveOwners } from './governance-ica-owners.js';
+import { isSkippedOwnerStatusViolation } from './owner-status-skip.js';
+
+const ROUTES_TO_SKIP: string[] = [
+  'EDGEN/bsc-edgenchain-ethereum',
+  'INJ/inevm-injective',
+  'USDC/ethereum-inevm',
+  'USDT/ethereum-inevm',
+  'WBTC/ethereum-form',
+  'WSTETH/ethereum-form',
+  'USDT/ethereum-form',
+  'USDC/ethereum-form',
+  'AIXBT/base-form',
+  'FORM/ethereum-form',
+  'GAME/base-form',
+  // On-chain router set diverges from the registry config (misconfigured
+  // enrollment); excluded from checking until the route is reconciled.
+  'SMOL/arbitrum-abstract-ethereum-solanamainnet-base',
+  // Skip until Paradex executes hyperevm upgrade on their side
+  WarpRouteIds.ParadexUSDC,
+  // Staging route: not auto-skipped by isStagingOrTestRoute since the STAGE
+  // marker is in the symbol before the first `/`, not a chain segment.
+  WarpRouteIds.EclipseUSDCSTAGE,
+  // Standard xERC20 routes: registry config omits warpRouteLimits, so the
+  // post-#9329 reader flags a false ConfigMismatch on the real on-chain
+  // limits. Excluded until ENG-4414 lands (backfill limits or ignore missing).
+  WarpRouteIds.BaseEthereumREZ,
+  // Retired route on the old `nesa` chain (domain 41443). The `nesa` RPC now
+  // serves nesachain (chainId 41444), so the legacy router has no code there and
+  // the read fails with "chain unknown". The route stays in the registry only
+  // so the relayer blacklist can match its routers and avoid delivering
+  // messages that originated from it (registry#1696), not to be checked.
+  WarpRouteIds.NesaLegacyNES,
+  // Route on sei, a chain scheduled for deprecation on 2026-09-30 whose
+  // Elixir fastUSD route is dormant (last message 2026-06-03). Reading it fails
+  // for two reasons that would both need fixing to re-enable it:
+  // - The sei registry explorer (Seitrace) is down and is marked as an Etherscan
+  //   explorer, so the SDK sends its API key to the Etherscan V2 API, which
+  //   rejects it. Etherscan V2 itself serves sei (chain id 1329).
+  // - The xERC20 token never emits BridgeLimitsSet/ConfigurationChanged (its
+  //   limits are unlimited), so the explorer answers with no bridges, the SDK
+  //   treats that as an explorer failure and re-reads over the RPC, and every
+  //   sei RPC prunes the 2024 history that read needs.
+  WarpRouteIds.EthereumSeiFastUSD,
+];
+
+// Name segments that mark a warp route as a non-production (staging/test)
+// deployment. Matched against the `-`/`/`-delimited segments of the route
+// name so `USDC/moonpay-staging` is skipped but names like `attestation` are
+// not. These routes are excluded from check-warp-deploy so they don't produce
+// violations on mainnet.
+const STAGING_ROUTE_MARKERS = ['staging', 'test'];
+
+// Token-symbol suffixes that mark a route as staging, e.g. `USDCSTAGE`,
+// `HYPERSTAGE`, `REZSTAGING`. The staging marker is fused onto the symbol
+// (before the first `/`) rather than living in its own chain segment, so it is
+// not caught by STAGING_ROUTE_MARKERS above.
+const STAGING_SYMBOL_SUFFIXES = ['stage', 'staging'];
+
+function isStagingOrTestRoute(warpRouteId: string): boolean {
+  const [symbol = '', ...rest] = warpRouteId.split('/');
+  const lowerSymbol = symbol.toLowerCase();
+  if (STAGING_SYMBOL_SUFFIXES.some((suffix) => lowerSymbol.endsWith(suffix))) {
+    return true;
+  }
+  const segments = rest.join('/').toLowerCase().split(/[-/]/);
+  return segments.some((segment) => STAGING_ROUTE_MARKERS.includes(segment));
+}
+
+// Upper bound on how long a single warp route check may run before it is
+// abandoned. A hung/unresponsive RPC leg on one route would otherwise stall the
+// entire cron run indefinitely, starving every subsequent route of a check.
+const DEFAULT_PER_ROUTE_TIMEOUT_MS = 5 * 60 * 1000;
+const perRouteTimeoutMs = Number(
+  process.env.WARP_CHECK_PER_ROUTE_TIMEOUT_MS ?? DEFAULT_PER_ROUTE_TIMEOUT_MS,
+);
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  onTimeoutMessage: string,
+): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(
+      () => reject(new Error(onTimeoutMessage)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
 
 async function main() {
-  const { environment, asDeployer, chains, fork, context, pushMetrics } =
+  const { environment, chains, pushMetrics } =
     await getCheckWarpDeployArgs().argv;
 
-  const metricsRegister = new Registry();
-  const checkerViolationsGauge = new Gauge(
-    getCheckerViolationsGaugeObj(metricsRegister),
-  );
-  metricsRegister.registerMetric(checkerViolationsGauge);
-
   const failedWarpRoutesChecks: string[] = [];
-
-  const routesToSkip: string[] = [
-    WarpRouteIds.ArbitrumBaseBlastBscEthereumGnosisLiskMantleModeOptimismPolygonScrollZeroNetworkZoraMainnet,
-    'EDGEN/bsc-edgenchain-ethereum',
-    'INJ/inevm-injective',
-    'USDC/ethereum-inevm',
-    'USDT/ethereum-inevm',
-    'WBTC/ethereum-form',
-    'WSTETH/ethereum-form',
-    'USDT/ethereum-form',
-    'USDC/ethereum-form',
-    'TRUMP/arbitrum-avalanche-base-flowmainnet-form-optimism-solanamainnet-worldchain',
-    'AIXBT/base-form',
-    'FORM/ethereum-form',
-    'GAME/base-form',
-  ];
 
   const registries = [DEFAULT_REGISTRY_URI];
   const registry = getRegistry({
@@ -52,55 +148,69 @@ async function main() {
     enableProxy: true,
   });
 
-  const warpCoreConfigMap =
+  const registryWarpDeployConfigMap =
     await getWarpConfigMapFromMergedRegistry(registries);
 
   console.log(chalk.yellow('Skipping the following warp routes:'));
-  routesToSkip.forEach((route) => console.log(chalk.yellow(`- ${route}`)));
+  ROUTES_TO_SKIP.forEach((route) => console.log(chalk.yellow(`- ${route}`)));
 
-  const isTestnetRoute = async (warpRouteConfig: any) => {
-    for (const chain of Object.keys(warpRouteConfig)) {
-      const chainMetadata = await registry.getChainMetadata(chain);
-      if (chainMetadata?.isTestnet) return true;
-    }
-    return false;
-  };
-
-  const warpConfigChains = new Set<ChainName>();
-  const warpRouteIds = Object.keys(warpCoreConfigMap);
-
-  const filterResults = await Promise.all(
-    warpRouteIds.map(async (warpRouteId) => {
-      const warpRouteConfig = warpCoreConfigMap[warpRouteId];
-      const isTestnet = await isTestnetRoute(warpRouteConfig);
-      const shouldCheck =
-        (environment === 'mainnet3' && !isTestnet) ||
-        (environment === 'testnet4' && isTestnet);
-      return shouldCheck && !routesToSkip.includes(warpRouteId);
-    }),
+  const envConfig = getEnvironmentConfig(environment);
+  const {
+    routesWithUnsupportedChains: registryRoutesWithUnsupportedChains,
+    warpIdsToCheck: candidateWarpIdsToCheck,
+  } = await getWarpIdsToCheck({
+    environment,
+    envConfig,
+    registry,
+    registryWarpDeployConfigMap,
+  });
+  // Getter inputs only need env-wide chain metadata/core addresses, not signers.
+  // Keep the checker multiprovider narrow while avoiding missing-chain lookups in code getters.
+  const getterInputsRegistry = await envConfig.getRegistry(false);
+  const getterInputsMultiProvider = new MultiProvider(
+    await getterInputsRegistry.getMetadata(),
   );
-
-  const warpIdsToCheck = warpRouteIds.filter(
-    (_, index) => filterResults[index],
+  const warpConfigGetterInputs = await getWarpConfigGetterInputs(
+    getterInputsMultiProvider,
+    envConfig,
   );
+  const {
+    routesWithUnsupportedChains: getterRoutesWithUnsupportedChains,
+    warpCoreConfigMap,
+    warpDeployConfigMap,
+    failedWarpRouteConfigLoads,
+  } = await getWarpConfigsToCheck({
+    envConfig,
+    getterInputsMultiProvider,
+    registry,
+    registryUris: registries,
+    registryWarpDeployConfigMap,
+    warpConfigGetterInputs,
+    warpRouteIds: candidateWarpIdsToCheck,
+  });
+  failedWarpRoutesChecks.push(...failedWarpRouteConfigLoads);
 
-  warpIdsToCheck.forEach((warpRouteId) => {
-    const warpRouteConfig = warpCoreConfigMap[warpRouteId];
-    Object.keys(warpRouteConfig).forEach((chain) =>
-      warpConfigChains.add(chain),
-    );
+  const routesWithUnsupportedChains = [
+    ...registryRoutesWithUnsupportedChains,
+    ...getterRoutesWithUnsupportedChains,
+  ];
+  logUnsupportedRoutes(routesWithUnsupportedChains);
+
+  const warpIdsToCheck = Object.keys(warpDeployConfigMap);
+  const warpConfigChains = getWarpConfigChains({
+    warpCoreConfigMap,
+    warpDeployConfigMap,
+    warpRouteIds: warpIdsToCheck,
   });
 
   console.log(
-    `Found warp configs for chains: ${Array.from(warpConfigChains).join(', ')}`,
+    `Checking ${warpIdsToCheck.length} routes across chains: ${Array.from(warpConfigChains).join(', ')}`,
   );
 
-  // Get the multiprovider once to avoid recreating it for each warp route
+  // Get the multiprovider once to avoid recreating it for each warp route.
   // We specify the chains to avoid creating a multiprovider for all chains.
   // This ensures that we don't fail to fetch secrets for new chains in the cron job.
-  const envConfig = getEnvironmentConfig(environment);
-
-  // Use default values for context, role, and useSecrets
+  // Use default values for context, role, and useSecrets.
   const multiProvider = await envConfig.getMultiProvider(
     undefined,
     undefined,
@@ -108,61 +218,58 @@ async function main() {
     Array.from(warpConfigChains),
   );
 
+  // Passed into the SDK check to resolve Inactive ownerStatus false positives
+  // where a nonce-less / lazily-deployed leaf owner (Tron, AltVM) is a
+  // governance ICA of an Ethereum Safe. registry.getAddresses() spans every
+  // registry chain, but multiProvider only covers warpConfigChains;
+  // fromAddressesMap calls multiProvider.getProtocol() for every entry and
+  // throws on any chain the provider doesn't know, so filter to the scoped
+  // chains first.
+  const scopedAddresses = objFilter(
+    await registry.getAddresses(),
+    (chain, _addrs): _addrs is Record<string, string> =>
+      multiProvider.hasChain(chain),
+  );
+  const interchainAccountApp = InterchainAccount.fromAddressesMap(
+    scopedAddresses,
+    multiProvider,
+  );
+
   // TODO: consider retrying this if check throws an error
   for (const warpRouteId of warpIdsToCheck) {
     console.log(`\nChecking warp route ${warpRouteId}...`);
-    const warpModule = Modules.WARP;
 
     try {
-      const governor = await getGovernor(
-        warpModule,
-        context,
-        environment,
-        asDeployer,
-        warpRouteId,
-        chains,
-        fork,
-        false,
-        multiProvider,
-        registries,
+      const warpDeployConfig = warpDeployConfigMap[warpRouteId];
+      const result = await withTimeout(
+        runWarpRouteCheckFromRegistry({
+          chains,
+          chainMetadataMultiProvider: getterInputsMultiProvider,
+          multiProvider,
+          registry,
+          registryUris: registries,
+          warpRouteId,
+          warpCoreConfig: warpCoreConfigMap[warpRouteId],
+          warpDeployConfig,
+          interchainAccount: interchainAccountApp,
+        }),
+        perRouteTimeoutMs,
+        `Timed out checking warp route ${warpRouteId} after ${perRouteTimeoutMs}ms`,
       );
 
-      await governor.check();
+      result.violations = result.violations.filter(
+        (violation) =>
+          !isSkippedOwnerStatusViolation(warpRouteId, violation) &&
+          !isContractVerificationViolation(violation),
+      );
 
-      const violations: any = governor.getCheckerViolations();
-      if (violations.length > 0) {
-        logViolations(violations);
-
+      if (result.violations.length > 0) {
+        logWarpRouteCheckResult(result);
         if (pushMetrics) {
-          for (const violation of violations) {
-            checkerViolationsGauge
-              .labels({
-                module: warpModule,
-                warp_route_id: warpRouteId,
-                chain: violation.chain,
-                contract_name: violation.name,
-                type: violation.type,
-                actual: violation.actual,
-                expected: violation.expected,
-              })
-              .set(1);
-            console.log(
-              `Violation: ${violation.name} on ${violation.chain} with ${violation.actual} ${violation.type} ${violation.expected} pushed to metrics`,
-            );
-          }
+          await pushWarpViolationsMetrics(result, warpRouteId, environment);
         }
       } else {
-        console.info(chalk.green(`${warpModule} checker found no violations`));
-      }
-
-      if (pushMetrics) {
-        await submitMetrics(
-          metricsRegister,
-          `check-warp-deploy-${environment}`,
-          {
-            overwriteAllMetrics: true,
-          },
-        );
+        console.info(chalk.green(`warp checker found no violations`));
       }
     } catch (e) {
       console.error(
@@ -172,16 +279,56 @@ async function main() {
     }
   }
 
-  if (failedWarpRoutesChecks.length > 0) {
-    console.error(
-      chalk.red(
-        `Failed to check warp routes: ${failedWarpRoutesChecks.join(', ')}`,
-      ),
+  // Routes that went through the loop plus routes whose config failed to load (disjoint).
+  const attemptedRoutes =
+    warpIdsToCheck.length + failedWarpRouteConfigLoads.length;
+  let failedMetricPublications: string[] = [];
+  if (pushMetrics) {
+    failedMetricPublications = await pushWarpRouteErrorMetrics(
+      buildWarpRouteErrorMetricEntries({
+        attemptedRouteIds: [...warpIdsToCheck, ...failedWarpRouteConfigLoads],
+        failedRouteIds: failedWarpRoutesChecks,
+      }),
+      environment,
     );
-    process.exit(1);
   }
 
-  process.exit(0);
+  if (failedWarpRoutesChecks.length > 0) {
+    console.warn(
+      chalk.yellow(
+        `Could not check ${failedWarpRoutesChecks.length} of ${attemptedRoutes} warp routes (execution errors, not config violations): ${failedWarpRoutesChecks.join(', ')}`,
+      ),
+    );
+  }
+
+  const exitCode = getCheckWarpDeployExitCode({
+    attemptedRoutes,
+    failedRoutes: failedWarpRoutesChecks.length,
+    failedMetricPublications: failedMetricPublications.length,
+  });
+
+  if (failedMetricPublications.length > 0) {
+    console.error(
+      chalk.red(
+        `Route-error metric publication failed for ${failedMetricPublications.length} routes (monitoring failure, not a route/config problem): ${failedMetricPublications.join(', ')}`,
+      ),
+    );
+  }
+
+  if (
+    allAttemptedRoutesFailed({
+      attemptedRoutes,
+      failedRoutes: failedWarpRoutesChecks.length,
+    })
+  ) {
+    console.error(
+      chalk.red(
+        `No warp route could be checked: all ${attemptedRoutes} attempted routes errored`,
+      ),
+    );
+  }
+
+  process.exit(exitCode);
 }
 
 main()
@@ -190,3 +337,465 @@ main()
     console.error(e);
     process.exit(1);
   });
+
+async function runWarpRouteCheckFromRegistry({
+  multiProvider,
+  chainMetadataMultiProvider,
+  warpRouteId,
+  registryUris,
+  registry,
+  chains,
+  warpCoreConfig,
+  warpDeployConfig,
+  interchainAccount,
+}: {
+  chains?: string[];
+  multiProvider: Awaited<ReturnType<EnvironmentConfig['getMultiProvider']>>;
+  chainMetadataMultiProvider: MultiProvider;
+  registry?: ReturnType<typeof getRegistry>;
+  registryUris: string[];
+  warpCoreConfig?: WarpCoreConfig;
+  warpDeployConfig?: WarpRouteDeployConfigMailboxRequired;
+  warpRouteId: string;
+  interchainAccount?: InterchainAccount;
+}): Promise<WarpRouteCheckResult> {
+  const loadedConfigs = await loadWarpConfigsFromRegistry({
+    registry,
+    registryUris,
+    warpRouteId,
+    warpCoreConfig,
+    warpDeployConfig,
+  });
+
+  loadedConfigs.warpDeployConfig = resolveWarpDeployConfigRouterKeys(
+    chainMetadataMultiProvider,
+    loadedConfigs.warpDeployConfig,
+  );
+
+  const filteredConfigs = filterWarpConfigsByChains({
+    chains,
+    warpCoreConfig: loadedConfigs.warpCoreConfig,
+    warpDeployConfig: loadedConfigs.warpDeployConfig,
+  });
+
+  // Derive + verify the governance ICA owners this route accepts in an Inactive
+  // state. The declaration is the source of intent; derivation/Safe checks are
+  // fail-closed (see governance-ica-owners.ts). Without an ICA app we can't
+  // derive, so nothing is accepted and the ownerStatus check runs unchanged.
+  // Scope resolution to the (possibly --chains-filtered) destinations so an
+  // excluded leaf chain's ICA derivation + Safe RPC are never attempted.
+  const acceptedInactiveOwners = interchainAccount
+    ? await resolveAcceptedInactiveOwners({
+        warpRouteId,
+        interchainAccount,
+        multiProvider,
+        destinations: Object.keys(filteredConfigs.warpDeployConfig),
+      })
+    : undefined;
+
+  return checkWarpRouteDeployConfig({
+    multiProvider,
+    warpCoreConfig: filteredConfigs.warpCoreConfig,
+    warpDeployConfig: filteredConfigs.warpDeployConfig,
+    acceptedInactiveOwners,
+  });
+}
+
+function logWarpRouteCheckResult(result: WarpRouteCheckResult) {
+  if (Object.keys(result.diff).length > 0) {
+    console.log(chalk.yellow(yamlStringify(result.diff, null, 2)));
+  }
+
+  if (result.scaleViolations.length > 0) {
+    console.log(
+      chalk.red('Found invalid or missing scale for inconsistent decimals'),
+    );
+  }
+
+  if (result.violations.length > 0) {
+    console.table(result.violations, [
+      'chain',
+      'name',
+      'type',
+      'actual',
+      'expected',
+    ]);
+  }
+}
+
+async function loadWarpConfigsFromRegistry({
+  registry,
+  registryUris,
+  warpRouteId,
+  warpCoreConfig,
+  warpDeployConfig,
+}: {
+  registry?: ReturnType<typeof getRegistry>;
+  registryUris: string[];
+  warpRouteId: string;
+  warpCoreConfig?: WarpCoreConfig;
+  warpDeployConfig?: WarpRouteDeployConfigMailboxRequired;
+}): Promise<{
+  warpCoreConfig: WarpCoreConfig;
+  warpDeployConfig: WarpRouteDeployConfigMailboxRequired;
+}> {
+  const resolvedWarpCoreConfig =
+    warpCoreConfig ??
+    (await (
+      registry ??
+      getRegistry({
+        registryUris,
+        enableProxy: true,
+      })
+    ).getWarpRoute(warpRouteId));
+  const resolvedWarpDeployConfig =
+    warpDeployConfig ??
+    (await getWarpDeployConfigFromMergedRegistry(warpRouteId, registryUris));
+
+  assert(
+    resolvedWarpCoreConfig,
+    `Warp route config not found for ${warpRouteId}`,
+  );
+  assert(
+    resolvedWarpDeployConfig,
+    `Warp route deploy config not found for ${warpRouteId}`,
+  );
+
+  return {
+    warpCoreConfig: resolvedWarpCoreConfig,
+    warpDeployConfig: resolvedWarpDeployConfig,
+  };
+}
+
+function filterWarpConfigsByChains({
+  chains,
+  warpCoreConfig,
+  warpDeployConfig,
+}: {
+  chains?: string[];
+  warpCoreConfig: WarpCoreConfig;
+  warpDeployConfig: WarpRouteDeployConfigMailboxRequired;
+}) {
+  if (!chains?.length) {
+    return { warpCoreConfig, warpDeployConfig };
+  }
+
+  const requestedChains = new Set(chains);
+  const filteredWarpDeployConfig = objFilter(
+    warpDeployConfig,
+    (chain, _config): _config is WarpRouteDeployConfigMailboxRequired[string] =>
+      requestedChains.has(chain),
+  );
+  const matchingWarpCoreTokens = warpCoreConfig.tokens.filter((token) =>
+    requestedChains.has(token.chainName),
+  );
+
+  assert(
+    matchingWarpCoreTokens.length > 0,
+    `None of the requested chains are present in the warp core config: ${chains.join(', ')}`,
+  );
+  assert(
+    Object.keys(filteredWarpDeployConfig).length > 0,
+    `None of the requested chains are present in the warp deploy config: ${chains.join(', ')}`,
+  );
+
+  return {
+    // Keep the full core config so expected remote router sets are preserved
+    // for the selected route members.
+    warpCoreConfig,
+    warpDeployConfig: filteredWarpDeployConfig,
+  };
+}
+
+async function getWarpIdsToCheck({
+  environment,
+  envConfig,
+  registry,
+  registryWarpDeployConfigMap,
+}: {
+  environment: string;
+  envConfig: ReturnType<typeof getEnvironmentConfig>;
+  registry: ReturnType<typeof getRegistry>;
+  registryWarpDeployConfigMap: Record<
+    string,
+    WarpRouteDeployConfigMailboxRequired
+  >;
+}) {
+  const warpRouteIds = Object.keys(registryWarpDeployConfigMap);
+  const routesWithUnsupportedChains: string[] = [];
+
+  const filterResults = await Promise.all(
+    warpRouteIds.map(async (warpRouteId) => {
+      const warpRouteConfig = registryWarpDeployConfigMap[warpRouteId];
+      const isTestnet = await isTestnetRoute(registry, warpRouteConfig);
+      const shouldCheck =
+        (environment === 'mainnet3' && !isTestnet) ||
+        (environment === 'testnet4' && isTestnet);
+
+      if (
+        !shouldCheck ||
+        ROUTES_TO_SKIP.includes(warpRouteId) ||
+        isStagingOrTestRoute(warpRouteId)
+      ) {
+        return false;
+      }
+
+      const routeChains = Object.keys(warpRouteConfig);
+      const unsupportedChains = routeChains.filter(
+        (chain) => !envConfig.supportedChainNames.includes(chain),
+      );
+      if (unsupportedChains.length > 0) {
+        routesWithUnsupportedChains.push(
+          `${warpRouteId} (${unsupportedChains.join(', ')})`,
+        );
+        return false;
+      }
+
+      return true;
+    }),
+  );
+
+  return {
+    routesWithUnsupportedChains,
+    warpIdsToCheck: warpRouteIds.filter((_, index) => filterResults[index]),
+  };
+}
+
+function logUnsupportedRoutes(routesWithUnsupportedChains: string[]) {
+  if (routesWithUnsupportedChains.length === 0) {
+    return;
+  }
+
+  console.log(
+    chalk.yellow(
+      `Skipping ${routesWithUnsupportedChains.length} routes with unsupported chains:`,
+    ),
+  );
+  routesWithUnsupportedChains.forEach((route) =>
+    console.log(chalk.yellow(`  - ${route}`)),
+  );
+}
+
+function getWarpConfigChains({
+  warpCoreConfigMap,
+  warpDeployConfigMap,
+  warpRouteIds,
+}: {
+  warpCoreConfigMap: Record<string, WarpCoreConfig>;
+  warpDeployConfigMap: Record<string, WarpRouteDeployConfigMailboxRequired>;
+  warpRouteIds: string[];
+}) {
+  const warpConfigChains = new Set<ChainName>();
+  warpRouteIds.forEach((warpRouteId) => {
+    const warpDeployConfig = warpDeployConfigMap[warpRouteId];
+    Object.keys(warpDeployConfig).forEach((chain) =>
+      warpConfigChains.add(chain),
+    );
+    warpCoreConfigMap[warpRouteId].tokens.forEach((token) =>
+      warpConfigChains.add(token.chainName),
+    );
+  });
+  return warpConfigChains;
+}
+
+async function getWarpConfigsToCheck({
+  envConfig,
+  getterInputsMultiProvider,
+  registry,
+  registryUris,
+  registryWarpDeployConfigMap,
+  warpConfigGetterInputs,
+  warpRouteIds,
+}: {
+  envConfig: ReturnType<typeof getEnvironmentConfig>;
+  getterInputsMultiProvider: MultiProvider;
+  registry: ReturnType<typeof getRegistry>;
+  registryUris: string[];
+  registryWarpDeployConfigMap: Record<
+    string,
+    WarpRouteDeployConfigMailboxRequired
+  >;
+  warpConfigGetterInputs: Awaited<ReturnType<typeof getWarpConfigGetterInputs>>;
+  warpRouteIds: string[];
+}) {
+  const loadResults = await Promise.all(
+    warpRouteIds.map(async (warpRouteId) => {
+      try {
+        const warpCoreConfig = await registry.getWarpRoute(warpRouteId);
+        assert(
+          warpCoreConfig,
+          `Warp route config not found for ${warpRouteId}`,
+        );
+
+        // Both branches parse through the schema so defaults (e.g. the
+        // RateLimited ISM `duration`) and normalization are applied
+        // consistently. Registry configs arrive as raw YAML, so without this
+        // parse an omitted schema-defaulted field would false-positive against
+        // the on-chain value.
+        const warpDeployConfig =
+          WarpRouteDeployConfigMailboxRequiredSchema.parse(
+            warpConfigGetterMap[warpRouteId]
+              ? await getWarpConfig(
+                  getterInputsMultiProvider,
+                  envConfig,
+                  warpRouteId,
+                  registryUris,
+                  false,
+                  warpConfigGetterInputs,
+                )
+              : registryWarpDeployConfigMap[warpRouteId],
+          );
+
+        const requiredChains = new Set([
+          ...Object.keys(warpDeployConfig),
+          ...warpCoreConfig.tokens.map((token) => token.chainName),
+        ]);
+        const unsupportedChains = Array.from(requiredChains).filter(
+          (chain) => !envConfig.supportedChainNames.includes(chain),
+        );
+
+        return {
+          unsupportedChains,
+          warpCoreConfig,
+          warpDeployConfig,
+          warpRouteId,
+        };
+      } catch (error) {
+        return {
+          error,
+          warpRouteId,
+        };
+      }
+    }),
+  );
+
+  const routesWithUnsupportedChains: string[] = [];
+  const failedWarpRouteConfigLoads: string[] = [];
+  const warpDeployConfigMap: Record<
+    string,
+    WarpRouteDeployConfigMailboxRequired
+  > = {};
+  const warpCoreConfigMap: Record<string, WarpCoreConfig> = {};
+
+  for (const result of loadResults) {
+    if ('error' in result) {
+      console.error(
+        chalk.red(
+          `Error loading warp config for ${result.warpRouteId}: ${result.error}`,
+        ),
+      );
+      failedWarpRouteConfigLoads.push(result.warpRouteId);
+      continue;
+    }
+
+    if (result.unsupportedChains.length > 0) {
+      routesWithUnsupportedChains.push(
+        `${result.warpRouteId} (${result.unsupportedChains.join(', ')})`,
+      );
+      continue;
+    }
+
+    warpDeployConfigMap[result.warpRouteId] = result.warpDeployConfig;
+    warpCoreConfigMap[result.warpRouteId] = result.warpCoreConfig;
+  }
+
+  return {
+    failedWarpRouteConfigLoads,
+    routesWithUnsupportedChains,
+    warpCoreConfigMap,
+    warpDeployConfigMap,
+  };
+}
+
+async function isTestnetRoute(
+  registry: ReturnType<typeof getRegistry>,
+  warpRouteConfig: WarpRouteDeployConfigMailboxRequired,
+) {
+  for (const chain of Object.keys(warpRouteConfig)) {
+    const chainMetadata = await registry.getChainMetadata(chain);
+    if (chainMetadata?.isTestnet) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Pushes 1/0 per attempted route, each in its own route_key group, so it
+// auto-resets every run. Series for removed/skipped routes persist until
+// deleted via deleteMetrics with the route_key grouping.
+async function pushWarpRouteErrorMetrics(
+  entries: { warpRouteId: string; value: 0 | 1 }[],
+  environment: string,
+): Promise<string[]> {
+  const failedPublications: string[] = [];
+  for (const { warpRouteId, value } of entries) {
+    try {
+      const register = new Registry();
+      const gauge = new Gauge(getCheckRouteErrorGaugeObj(register));
+      register.registerMetric(gauge);
+      gauge.labels({ module: 'warp', warp_route_id: warpRouteId }).set(value);
+
+      // PUT only replaces this route's group (route_key), not the whole job.
+      await submitMetrics(register, `check-warp-deploy-${environment}`, {
+        groupings: warpRouteErrorGroupings(warpRouteId),
+        overwriteAllMetrics: true,
+        throwOnError: true,
+      });
+    } catch (e) {
+      console.error(
+        chalk.red(`Failed to push route error metric for ${warpRouteId}: ${e}`),
+      );
+      failedPublications.push(warpRouteId);
+    }
+  }
+  return failedPublications;
+}
+
+// Each violation is pushed to PushGateway under its own group, keyed by an
+// alert_key grouping label. This makes every violation an independently
+// addressable series that can be cleared on its own (DELETE / push 0) without
+// touching any other violation. We do NOT overwrite the whole job group: a run
+// that does not observe a given violation must leave that series untouched, so
+// stale RPCs or a partial run can never silently auto-clear a real alert.
+// Clearing is exclusively the human-confirmed action (see clear-warp-violation).
+async function pushWarpViolationsMetrics(
+  result: WarpRouteCheckResult,
+  warpRouteId: string,
+  environment: string,
+) {
+  for (const violation of result.violations) {
+    const register = new Registry();
+    const gauge = new Gauge(getCheckerViolationsGaugeObj(register));
+    register.registerMetric(gauge);
+    gauge
+      .labels({
+        actual: violation.actual,
+        chain: violation.chain,
+        contract_name: violation.name,
+        expected: violation.expected,
+        module: 'warp',
+        remote: '',
+        sub_type: '',
+        type: violation.type,
+        warp_route_id: warpRouteId,
+      })
+      .set(1);
+
+    const groupings = warpViolationGroupings(
+      warpRouteId,
+      violation.chain,
+      violation.name,
+      violation.type,
+    );
+
+    // PUT (overwriteAllMetrics) is safe here because this group holds exactly
+    // one series; it keeps the single-series group clean across refreshes.
+    await submitMetrics(register, `check-warp-deploy-${environment}`, {
+      groupings,
+      overwriteAllMetrics: true,
+    });
+    console.log(
+      `Violation: ${violation.name} on ${violation.chain} with ${violation.actual} ${violation.type} ${violation.expected} pushed to metrics`,
+    );
+  }
+}

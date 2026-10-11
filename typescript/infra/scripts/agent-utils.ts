@@ -1,6 +1,6 @@
 import { checkbox, select } from '@inquirer/prompts';
 import chalk from 'chalk';
-import path, { join } from 'path';
+import path from 'path';
 import yargs, { Argv } from 'yargs';
 
 import { ChainAddresses, IRegistry } from '@hyperlane-xyz/registry';
@@ -18,6 +18,7 @@ import {
   ProtocolType,
   difference,
   inCIMode,
+  isEVMLike,
   objFilter,
   objMap,
   promiseObjAll,
@@ -36,6 +37,7 @@ import {
   getChains,
   getEnvChains,
   getRegistry,
+  warpRouteExistsInRegistry,
 } from '../config/registry.js';
 import { getCurrentKubernetesContext } from '../src/agents/index.js';
 import { getCloudAgentKey } from '../src/agents/key-utils.js';
@@ -44,17 +46,17 @@ import { RootAgentConfig } from '../src/config/agent/agent.js';
 import {
   AgentEnvironment,
   DeployEnvironment,
-  EnvironmentConfig,
   assertEnvironment,
-} from '../src/config/environment.js';
+} from '../src/config/deploy-environment.js';
+import { EnvironmentConfig } from '../src/config/environment.js';
 import { BalanceThresholdType } from '../src/config/funding/balances.js';
 import { AlertType } from '../src/config/funding/grafanaAlerts.js';
+import { getEnvironmentDirectory } from '../src/paths.js';
 import { Role } from '../src/roles.js';
 import {
   assertContext,
   assertRole,
   filterRemoteDomainMetadata,
-  getInfraPath,
 } from '../src/utils/utils.js';
 
 const logger = rootLogger.child({ module: 'infra:scripts:agent-utils' });
@@ -69,8 +71,6 @@ export enum Modules {
   INTERCHAIN_QUERY_SYSTEM = 'iqs',
   TEST_QUERY_SENDER = 'testquerysender',
   TEST_RECIPIENT = 'testrecipient',
-  HELLO_WORLD = 'helloworld',
-  WARP = 'warp',
   HAAS = 'haas',
   CCIP = 'ccip',
 }
@@ -86,12 +86,21 @@ export const REGISTRY_MODULES = [
   Modules.CCIP,
 ];
 
-export function getArgs() {
-  return yargs(process.argv.slice(2))
+export function withEnvironment<T>(
+  args: Argv<T>,
+  opts?: { defaultEnv?: DeployEnvironment },
+) {
+  const chain = args
     .describe('environment', 'deploy environment')
     .coerce('environment', assertEnvironment)
-    .demandOption('environment')
     .alias('e', 'environment');
+  return opts?.defaultEnv
+    ? chain.default('environment', opts.defaultEnv)
+    : chain.demandOption('environment');
+}
+
+export function getArgs() {
+  return withEnvironment(yargs(process.argv.slice(2)));
 }
 
 export function withBalanceThresholdConfig<T>(args: Argv<T>) {
@@ -212,6 +221,25 @@ export function withWarpRouteId<T>(args: Argv<T>) {
   return args.describe('warpRouteId', 'warp route id').string('warpRouteId');
 }
 
+export function withRegistryCommit<T>(args: Argv<T>) {
+  return args
+    .describe(
+      'registryCommit',
+      'Registry version (commit, branch, or tag). If not provided, will prompt interactively.',
+    )
+    .string('registryCommit');
+}
+
+export function withWarpRouteIds<T>(args: Argv<T>) {
+  return args
+    .describe('warpRouteIds', 'warp route ids')
+    .array('warpRouteIds')
+    .coerce('warpRouteIds', (ids: string[] | undefined) =>
+      Array.isArray(ids) ? ids.map(String) : [],
+    )
+    .alias('w', 'warpRouteIds');
+}
+
 export function withMetrics<T>(args: Argv<T>) {
   return args
     .describe('metrics', 'metrics')
@@ -228,6 +256,14 @@ export function withDryRun<T>(args: Argv<T>) {
     .describe('dryRun', 'Dry run')
     .boolean('dryRun')
     .default('dryRun', false);
+}
+
+export function withYes<T>(args: Argv<T>) {
+  return args
+    .describe('yes', 'Skip confirmations and use defaults')
+    .boolean('yes')
+    .alias('y', 'yes')
+    .default('yes', false);
 }
 
 export function withKnownWarpRouteIdRequired<T>(args: Argv<T>) {
@@ -422,6 +458,24 @@ export async function getWarpRouteIdsInteractive(
   return selection;
 }
 
+export function filterOrphanedWarpRouteIds(warpRouteIds: string[]): {
+  validIds: string[];
+  orphanedIds: string[];
+} {
+  const validIds: string[] = [];
+  const orphanedIds: string[] = [];
+
+  for (const id of warpRouteIds) {
+    if (warpRouteExistsInRegistry(id)) {
+      validIds.push(id);
+    } else {
+      orphanedIds.push(id);
+    }
+  }
+
+  return { validIds, orphanedIds };
+}
+
 // not requiring to build coreConfig to get agentConfig
 export async function getAgentConfigsBasedOnArgs(argv?: {
   environment: DeployEnvironment;
@@ -444,12 +498,18 @@ export async function getAgentConfigsBasedOnArgs(argv?: {
   }
 
   const agentConfig = getAgentConfig(context, environment);
+  if (
+    Object.keys(newValidatorCounts).length > 0 &&
+    !agentConfig.rolesWithKeys.includes(Role.Validator)
+  ) {
+    agentConfig.rolesWithKeys.push(Role.Validator);
+  }
 
   for (const [chain, validatorCount] of Object.entries(newValidatorCounts)) {
     const baseConfig = {
       [Contexts.Hyperlane]: [],
       [Contexts.ReleaseCandidate]: [],
-      [Contexts.Neutron]: [],
+      [Contexts.FastPath]: [],
     };
     // supplementing with dummy addresses for validator as part of missingChains
     const validatorsConfig = validatorBaseConfigsFn(environment, context);
@@ -540,7 +600,7 @@ export function ensureValidatorConfigConsistency(
     ]}`;
 
     // So only throw if there are missing chains in the Hyperlane context.
-    // Only a subset of chains will have ephemeral validators in RC/Neutron contexts.
+    // Only a subset of chains will have ephemeral validators in the RC context.
     if (context === Contexts.Hyperlane) {
       throw new Error(
         chalk.bold.red(`Validator config invalid.\n${errorMessage}`),
@@ -549,7 +609,7 @@ export function ensureValidatorConfigConsistency(
       rootLogger.info(chalk.grey(errorMessage));
       rootLogger.info(
         chalk.bold.grey(
-          'This is expected for RC/Neutron contexts, as we only run validators for a subset of chains in them.',
+          'This is expected for the RC context, as we only run validators for a subset of chains in it.',
         ),
       );
     }
@@ -585,7 +645,9 @@ export async function getMultiProviderForRole(
 ): Promise<MultiProvider> {
   const chainMetadata = await registry.getMetadata();
   logger.debug(`Getting multiprovider for ${role} role`);
-  const multiProvider = new MultiProvider(chainMetadata);
+  const multiProvider = new MultiProvider(chainMetadata, {
+    minConfirmationTimeoutMs: 300_000,
+  });
   if (inCIMode()) {
     logger.debug('Running in CI, returning multiprovider without secret keys');
     return multiProvider;
@@ -593,13 +655,13 @@ export async function getMultiProviderForRole(
   await promiseObjAll(
     objMap(
       supportedChainNames.reduce((acc, chain) => {
-        if (chainMetadata[chain] && chain !== 'zeronetwork') {
+        if (chainMetadata[chain]) {
           acc[chain] = chainMetadata[chain];
         }
         return acc;
       }, {} as ChainMap<ChainMetadata>),
       async (chain, _) => {
-        if (multiProvider.getProtocol(chain) === ProtocolType.Ethereum) {
+        if (isEVMLike(multiProvider.getProtocol(chain))) {
           const key = getKeyForRole(environment, context, role, chain, index);
           const provider = multiProvider.tryGetProvider(chain);
           if (!provider) {
@@ -636,14 +698,10 @@ export async function getKeysForRole(
   return Object.fromEntries(keyEntries);
 }
 
-export function getEnvironmentDirectory(environment: DeployEnvironment) {
-  return path.join('./config/environments/', environment);
-}
-
 export function getModuleDirectory(
   environment: DeployEnvironment,
   module: Modules,
-  context?: Contexts,
+  _context?: Contexts,
 ) {
   // for backwards compatibility with existing paths
   const suffixFn = () => {
@@ -652,8 +710,6 @@ export function getModuleDirectory(
         return 'middleware/accounts';
       case Modules.INTERCHAIN_QUERY_SYSTEM:
         return 'middleware/queries';
-      case Modules.HELLO_WORLD:
-        return `helloworld/${context}`;
       default:
         return module;
     }
@@ -777,16 +833,4 @@ export function getValidatorsByChain(
     });
   }
   return validators;
-}
-
-export function getAWValidatorsPath(
-  environment: DeployEnvironment,
-  context: Contexts,
-) {
-  return join(
-    getInfraPath(),
-    getEnvironmentDirectory(environment),
-    'aw-validators',
-    `${context}.json`,
-  );
 }

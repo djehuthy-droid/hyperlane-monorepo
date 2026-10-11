@@ -12,7 +12,8 @@ import {
 
 import { WarpRouteIds } from '../../config/environments/mainnet3/warp/warpIds.js';
 import { getChain, getWarpAddresses } from '../../config/registry.js';
-import { DeployEnvironment } from '../../src/config/environment.js';
+import { getDisabledChains } from '../../src/config/chain.js';
+import { DeployEnvironment } from '../../src/config/deploy-environment.js';
 import { svmGasOracleConfigPath } from '../../src/utils/sealevel.js';
 import { writeAndFormatJsonAtPath } from '../../src/utils/utils.js';
 import { getArgs, withWrite } from '../agent-utils.js';
@@ -53,6 +54,13 @@ async function main() {
 
     return connectedChains.reduce((agg, destination) => {
       const oracleConfig = igpConfig.oracleConfig[destination];
+      // Skip destinations without oracle configs
+      if (!oracleConfig) {
+        console.debug(
+          `No oracle config for ${origin} -> ${destination}, skipping`,
+        );
+        return agg;
+      }
       if (oracleConfig.tokenDecimals === undefined) {
         throw new Error(
           `Token decimals not defined for ${origin} -> ${destination}`,
@@ -103,8 +111,6 @@ function getChainConnections(
   if (environment === 'mainnet3') {
     // All the mainnet3 warp route chains
     connectedChains = [
-      ['solanamainnet', 'everclear'],
-      ['solanamainnet', 'sophon'],
       ['solanamainnet', 'abstract'],
       ['solanamainnet', 'apechain'],
       ['solanamainnet', 'subtensor'],
@@ -113,21 +119,26 @@ function getChainConnections(
       ['solanamainnet', 'galactica'],
       ['solanamainnet', 'radix'],
       ['solanamainnet', 'carrchain'],
-      ['solanamainnet', 'incentiv'],
-      ['solanamainnet', 'litchain'],
+      ['solanamainnet', 'aleo'],
+      ['solanamainnet', 'eni'],
+      ['solanamainnet', 'citrea'],
+      ['solanamainnet', 'tron'],
+      ['solanamainnet', 'igra'],
+      ['solanamainnet', 'fluent'],
+      ['solanamainnet', 'nesa'],
       // For Starknet / Paradex
       ['solanamainnet', 'starknet'],
       ['solanamainnet', 'paradex'],
       ['solanamainnet', 'bsc'],
-      ['soon', 'solanamainnet'],
-      ['soon', 'bsc'],
       // for eclipse routes
       ['eclipsemainnet', 'sonicsvm'],
-      ['eclipsemainnet', 'soon'],
       ['eclipsemainnet', 'katana'],
       ['eclipsemainnet', 'unichain'],
       ['eclipsemainnet', 'optimism'],
       ['eclipsemainnet', 'polygon'],
+      ['eclipsemainnet', 'tron'],
+      ['eclipsemainnet', 'bsc'],
+      ['eclipsemainnet', 'plasma'],
       // for solaxy routes
       ['solaxy', 'solanamainnet'],
       ['solaxy', 'ethereum'],
@@ -144,17 +155,23 @@ function getChainConnections(
       ['solanatestnet', 'sonicsvmtestnet'],
       ['solanatestnet', 'connextsepolia'],
       ['solanatestnet', 'basesepolia'],
+      ['solanadevnet', 'solanatestnet'],
+      ['solanadevnet', 'sepolia'],
+      ['solanadevnet', 'arbitrumsepolia'],
+      ['solanadevnet', 'basesepolia'],
     ];
   } else {
     throw new Error(`Unknown environment: ${environment}`);
   }
 
+  const disabledSet = new Set<string>(getDisabledChains());
   return connectedChains.reduce(
     (agg, chains) => {
       // Make sure each chain is connected to every other chain
       chains.forEach((chainA) => {
+        if (disabledSet.has(chainA)) return;
         chains.forEach((chainB) => {
-          if (chainA === chainB) {
+          if (chainA === chainB || disabledSet.has(chainB)) {
             return;
           }
           if (agg[chainA] === undefined) {

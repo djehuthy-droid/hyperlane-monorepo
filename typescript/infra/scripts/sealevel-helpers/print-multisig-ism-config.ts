@@ -43,8 +43,18 @@ async function main() {
   const MAX_THRESHOLD = 4;
 
   for (const chain of Object.keys(config)) {
+    // `multisigIsms` already restricts origins to the environment's supported
+    // chain list. Registry availability must not remove a still-supported,
+    // potentially still-enrolled origin from the generated on-chain config.
     // exclude forma as it's not a core chain
     if (chain === 'forma') {
+      delete config[chain];
+      continue;
+    }
+
+    // exclude eden because that's eden<>celestia only
+    if (chain === 'eden') {
+      delete config[chain];
       continue;
     }
 

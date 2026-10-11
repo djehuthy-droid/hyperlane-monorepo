@@ -1,6 +1,6 @@
 use eyre::Result;
 
-use hyperlane_sealevel::SealevelTxCostEstimate;
+use hyperlane_sealevel::{SealevelTransactionFormat, SealevelTxCostEstimate};
 
 use crate::adapter::{AdaptsChain, TxBuildingResult};
 use crate::payload::PayloadDetails;
@@ -16,6 +16,7 @@ async fn test_build_transactions() {
     let payload = payload();
     let data = VmSpecificTxData::Svm(Box::new(SealevelTxPrecursor::new(
         instruction(),
+        SealevelTransactionFormat::Legacy,
         SealevelTxCostEstimate::default(),
     )));
     let expected = (payload.details.clone(), data);

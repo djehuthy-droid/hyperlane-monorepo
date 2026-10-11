@@ -1,3 +1,8 @@
+import {
+  assert,
+  isEmptyAddress,
+  ZERO_ADDRESS_HEX_32,
+} from '@hyperlane-xyz/utils';
 import { ISigner } from './altvm.js';
 import { AnnotatedTx, TxReceipt } from './module.js';
 
@@ -146,6 +151,8 @@ export interface ArtifactWriter<C, D> extends ArtifactReader<C, D> {
  * //   domains: Record<number, ArtifactOnChain<IsmConfig, IsmDeployed>>;
  * // }
  * ```
+ *
+ * @deprecated FIXME: remove usage of this type in a follow up PR for the hook and ISM artifacts
  */
 export type RawArtifact<C, D> = {
   [K in keyof C]: C[K] extends Artifact<infer CC>
@@ -155,6 +162,37 @@ export type RawArtifact<C, D> = {
       : C[K] extends { [L: string]: Artifact<infer CC> }
         ? { [L in keyof C[K]]: ArtifactOnChain<CC, D> }
         : C[K];
+};
+
+/**
+ * Helper type to transform nested objects containing Artifacts.
+ * Handles objects where all properties are Artifacts (required or optional).
+ */
+type NestedOnChain<T> =
+  T extends Record<string, unknown>
+    ? {
+        [L in keyof T]: T[L] extends Artifact<infer CC, infer DD>
+          ? ArtifactOnChain<CC, DD>
+          : T[L] extends Artifact<infer CC, infer DD> | undefined
+            ? ArtifactOnChain<CC, DD> | undefined
+            : T[L];
+      }
+    : T;
+
+/**
+ * Utility type to convert a config type to its on-chain representation.
+ * Replaces Artifact<> types one level deep with ArtifactOnChain<> types.
+ * Unlike RawArtifact, preserves the nested deployment types.
+ * Handles optional/undefined fields properly using conditional modifiers.
+ */
+export type ConfigOnChain<C> = {
+  [K in keyof C]: C[K] extends Artifact<infer CC, infer DD>
+    ? ArtifactOnChain<CC, DD>
+    : C[K] extends Artifact<infer CC, infer DD> | undefined
+      ? ArtifactOnChain<CC, DD> | undefined
+      : C[K] extends Artifact<infer CC, infer DD>[]
+        ? ArtifactOnChain<CC, DD>[]
+        : NestedOnChain<C[K]>;
 };
 
 /**
@@ -168,7 +206,7 @@ export type RawArtifact<C, D> = {
  */
 export interface IArtifactManager<
   TypeKey extends string,
-  ConfigMap extends Record<TypeKey, any>,
+  ConfigMap extends Record<TypeKey, unknown>,
   D,
 > {
   createReader<T extends TypeKey>(type: T): ArtifactReader<ConfigMap[T], D>;
@@ -177,4 +215,45 @@ export interface IArtifactManager<
     type: T,
     signer: ISigner<AnnotatedTx, TxReceipt>,
   ): ArtifactWriter<ConfigMap[T], D>;
+}
+
+export type UnsetArtifactAddress = typeof ZERO_ADDRESS_HEX_32;
+
+/**
+ * Returns the artifact if DEPLOYED, undefined if UNDERIVED with zero address.
+ * Throws if UNDERIVED with non-zero address.
+ */
+export function toDeployedOrUndefined<C, D extends { address: string }>(
+  artifact: ArtifactOnChain<C, D>,
+  name: string,
+): ArtifactDeployed<C, D> | undefined {
+  if (isArtifactDeployed(artifact)) return artifact;
+  assert(
+    isEmptyAddress(artifact.deployed.address),
+    `Expected ${name} to be DEPLOYED or UNDERIVED with zero address, got UNDERIVED with non-zero address ${artifact.deployed.address}`,
+  );
+  return undefined;
+}
+
+export function addressToUnderivedArtifact(
+  address: string | undefined,
+  formatter?: (value: string) => string,
+): ArtifactUnderived<{ address: string }> | undefined {
+  if (!address || isEmptyAddress(address)) return undefined;
+
+  return {
+    artifactState: ArtifactState.UNDERIVED,
+    deployed: {
+      address: formatter ? formatter(address) : address,
+    },
+  };
+}
+
+export function artifactOnChainToAddress<C>(
+  artifact: ArtifactOnChain<C, { address: string }> | undefined,
+  formatter?: (value: string) => string,
+): string | undefined {
+  const address = artifact?.deployed.address;
+  if (!address || isEmptyAddress(address)) return undefined;
+  return formatter ? formatter(address) : address;
 }

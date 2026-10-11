@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hyperlane_core::{
-    BlockInfo, ChainInfo, ChainResult, HyperlaneChain, HyperlaneDomain,
-    HyperlaneProvider, TxnInfo, H256, H512, U256,
+    BlockInfo, ChainInfo, ChainResult, HyperlaneChain, HyperlaneDomain, HyperlaneProvider, TxnInfo,
+    H256, H512, U256,
 };
 
 use crate::client::KaspaRpcClient;
@@ -100,8 +100,8 @@ impl HyperlaneProvider for KaspaProvider {
             max_priority_fee_per_gas: None,
             max_fee_per_gas: None,
             gas_price: Some(U256::from(1u64)), // 1 sompi/mass
-            nonce: 0, // Kaspa doesn't use nonces in the same way
-            sender: H256::zero(), // Would need to derive from inputs
+            nonce: 0,                          // Kaspa doesn't use nonces in the same way
+            sender: H256::zero(),              // Would need to derive from inputs
             recipient: None,
             receipt: None,
             raw_input_data: None,
@@ -126,17 +126,8 @@ impl HyperlaneProvider for KaspaProvider {
     async fn get_chain_metrics(&self) -> ChainResult<Option<ChainInfo>> {
         let chain_info = self.client.get_chain_info().await?;
 
-        // Get a block at the current DAA score for latest_block info
-        let block = self.client.get_block_by_daa_score(chain_info.virtual_daa_score).await?;
-        let hash = parse_h256(&block.hash)
-            .map_err(|e| hyperlane_core::ChainCommunicationError::from_other_str(&e))?;
-
         Ok(Some(ChainInfo {
-            latest_block: BlockInfo {
-                hash,
-                timestamp: block.timestamp,
-                number: block.daa_score,
-            },
+            block_height: chain_info.virtual_daa_score,
             // Gas price is nominal for Kaspa (1 sompi per mass unit)
             min_gas_price: Some(U256::from(1u64)),
         }))
@@ -146,6 +137,52 @@ impl HyperlaneProvider for KaspaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperlane_core::{HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    // Integration tests would go here, requiring a running igra-service
+    #[tokio::test]
+    async fn chain_metrics_use_virtual_daa_score_without_block_lookup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                request.push(socket.read_u8().await.unwrap());
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(request.starts_with(b"GET /rpc/chain/info HTTP/1.1\r\n"));
+            let body = serde_json::json!({
+                "virtual_daa_score": 4_294_967_300_u64,
+                "past_median_time": 0,
+                "pruning_point_hash": "",
+                "network_name": "devnet",
+                "is_synced": true
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            // Closing the listener makes an obsolete follow-up block lookup fail.
+        });
+        let conf =
+            ConnectionConf::new(format!("http://{address}").parse().unwrap()).with_timeout(2);
+        let domain = HyperlaneDomain::from_config(
+            10000001,
+            "kaspa",
+            HyperlaneDomainProtocol::Kaspa,
+            HyperlaneDomainTechnicalStack::Other,
+        )
+        .unwrap();
+        let provider = KaspaProvider::new(domain, &conf).unwrap();
+        let metrics = provider.get_chain_metrics().await.unwrap().unwrap();
+        assert_eq!(metrics.block_height, 4_294_967_300);
+        assert_eq!(metrics.min_gas_price, Some(U256::from(1)));
+        server.await.unwrap();
+    }
 }

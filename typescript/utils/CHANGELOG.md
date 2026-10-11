@@ -1,5 +1,243 @@
 # @hyperlane-xyz/utils
 
+## 45.0.1
+
+## 45.0.0
+
+### Major Changes
+
+- 28eda66: Removed `ValidatorMetadata.additional_quorum_rpcs`.
+
+### Minor Changes
+
+- 4e2ab65: Added `SealevelRoutingMessageIdMultisigIsmReader`, `SealevelRoutingMessageIdMultisigIsmWriter` and `SealevelRoutingMessageIdMultisigIsmWriterConfig` to the Sealevel SDK, which read and write a message-id multisig ISM holding an independent validator set and threshold per origin domain. The writer enforces per-domain caps of 24 validators and a threshold of 8 when writing a domain (on create, and for added or changed domains on update, not for unchanged on-chain domains), and the reader and writer take a non-empty list of candidate domain ids. They replace `SealevelMessageIdMultisigIsmReader`, `SealevelMessageIdMultisigIsmWriter` and `SealevelMultisigIsmConfig`, which were removed. The multisig ISM set-validators and transfer-ownership instruction builders now take `Address` owners.
+
+  `NonEmptyArray`, `nonEmptyArray` and `isNonEmptyArray` were added to `@hyperlane-xyz/utils`. `@hyperlane-xyz/provider-sdk/ism` exports `DomainMultisigConfig` and `RoutingMessageIdMultisigIsmArtifactConfig`.
+
+### Patch Changes
+
+- 9a59116: Updated Solana clients to versions with transaction v1 codecs while preserving existing transaction-version defaults.
+
+## 44.0.2
+
+## 44.0.1
+
+## 44.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+## 43.0.0
+
+### Patch Changes
+
+- 7cf9c01: Added cursor pagination to scraper message queries. Message cursors must contain exactly one non-null `id`; `order_by` may be omitted, in which case the cursor direction determines the ordering.
+
+  Added lightweight error, set, and validation utility subpath exports.
+
+## 42.0.0
+
+## 41.3.1
+
+## 41.3.0
+
+## 41.2.0
+
+## 41.1.0
+
+## 41.0.0
+
+### Patch Changes
+
+- fa19409: Exported an EVM-specific zeroish address helper.
+
+## 40.0.0
+
+## 39.1.0
+
+### Minor Changes
+
+- 4976bb1: Renamed the validator quorum RPC verification config fields to make clear they only add to, rather than replace, a chain's `rpcUrls`. `AgentChainMetadataSchema`'s `quorumRpcUrls` and `customQuorumRpcUrls` are now `additionalQuorumRpcUrls` and `customAdditionalQuorumRpcUrls`. `ValidatorMetadata.quorum_rpcs` is now `additional_quorum_rpcs`. This is a breaking rename with no backwards-compatible alias, since these fields shipped very recently and have no known external consumers yet.
+
+## 39.0.0
+
+### Patch Changes
+
+- 735793b: Added validator quorum RPC verification support. `AgentChainMetadataSchema` gained an optional `quorumRpcUrls` array (mirroring `rpcUrls`) alongside the existing `customQuorumRpcUrls` override, so a chain's statically configured quorum pool can be expressed in typed config rather than only via the comma-separated override string. `ValidatorMetadata.rpcs` was widened to `Array<string | ValidatorMetadataRpcEntry>` to cover both the historical (pre-agents-v1.6.0) flat hash-string wire shape and the current `{ url_hash, host_hash }` object shape, since metadata blobs are unversioned and a rolling validator fleet can publish either. A new `validatorMetadataRpcUrlHash` helper narrows an `rpcs` entry to its URL hash regardless of which shape it was serialized in. `ValidatorMetadata` also gained an optional `quorum_rpcs` field, reported separately from `rpcs`.
+
+## 38.0.0
+
+## 37.0.0
+
+## 36.0.0
+
+### Patch Changes
+
+- 9cd7606: `normalizeAddressEvm` now lowercases its input before checksumming, canonicalizing a bad-EIP-55-casing EVM address instead of returning it unchanged. `EvmIcaTxSubmitter.fromConfig` normalizes its origin-side EVM addresses (`owner`, origin `interchainAccountRouter`) up front, so bad casing no longer throws deep inside ethers mid-submission after irreversible deploys have run. Destination router and ISM (remote chain, not assumed EVM) are untouched.
+
+## 35.2.0
+
+## 35.1.0
+
+## 35.0.1
+
+### Patch Changes
+
+- da1cfb1: A `syntheticCcrSwapMessageId` helper was added to `@hyperlane-xyz/utils` for deterministically computing the synthetic message ID of a same-chain CCR swap given its transaction hash and log index. The scraper agent config schema in `@hyperlane-xyz/sdk` was extended with an optional `ccrRouters` field mapping domain IDs to their CCR router-to-collateral address pairs.
+
+## 35.0.0
+
+## 34.0.0
+
+## 33.1.1
+
+## 33.1.0
+
+## 33.0.2
+
+### Patch Changes
+
+- 1f918d0: Added `@hyperlane-xyz/sdk` subpath exports for `core`, `hook`, and `ism` modules. Hardened `@hyperlane-xyz/utils` pretty-mode logging with a graceful fallback when `pino-pretty` is not installed.
+
+## 33.0.1
+
+## 33.0.0
+
+## 32.0.1
+
+## 32.0.0
+
+## 31.2.1
+
+## 31.2.0
+
+## 31.1.0
+
+## 31.0.1
+
+### Patch Changes
+
+- d5168fc: Fixed `parseMessage` crash in browser environments by using `readUInt8` instead of the Node.js 16+ `readUint8` alias, which is missing from common Buffer polyfills.
+
+## 31.0.0
+
+## 30.1.1
+
+## 30.1.0
+
+## 30.0.0
+
+### Patch Changes
+
+- 7646819: Yaml sorting helpers were exported from `@hyperlane-xyz/utils` so repo tooling can reuse a single implementation for YAML transforms and warp config ordering.
+
+## 29.1.0
+
+## 29.0.1
+
+## 29.0.0
+
+### Patch Changes
+
+- 3c6b1ad: Fixed Tron gas estimation and transaction building for wallet integration.
+- 084c6b6: The TypeScript packages were updated to support TypeScript 6.0 and to make ambient type loading explicit so the future TypeScript 7.0 upgrade is smoother.
+
+## 28.1.0
+
+## 28.0.0
+
+## 27.1.0
+
+### Patch Changes
+
+- b892e61: Added `isEmptyAddress` utility function that returns true when an address is undefined, null, empty string, or matches a known zero address pattern.
+
+## 27.0.0
+
+## 26.0.0
+
+### Major Changes
+
+- 1d116d8: Added Tron ProtocolType & deprecated Tron TechnicalStack. Add support for TronLink wallet in the widgets.
+
+### Patch Changes
+
+- 06aacac: Fix aleo empty program prefix
+
+## 25.5.0
+
+## 25.4.1
+
+## 25.4.0
+
+### Patch Changes
+
+- 1f021bf: Implemented warp token artifact API for Aleo. Added warp token readers and writers for native, collateral, and synthetic tokens, with AleoWarpArtifactManager providing factory methods for type-specific operations. Writers support creating new warp tokens with ISM and Hook configuration, enrolling remote routers, and transferring ownership. Update operations generate transaction arrays for ISM and Hook changes, router enrollment/unenrollment, and ownership transfers.
+
+## 25.3.2
+
+## 25.3.1
+
+## 25.3.0
+
+## 25.2.0
+
+### Minor Changes
+
+- ccd638d: Improved shared RPC override handling across TypeScript services.
+
+### Patch Changes
+
+- 360db52: Fixed `timeout()` to clear its internal `setTimeout` when the wrapped promise settles, preventing lingering timers from keeping the Node.js event loop alive.
+
+## 25.1.0
+
+### Patch Changes
+
+- b930534: Added oxlint as a fast first-pass linter and converted imports to type-only where appropriate to resolve import cycle warnings.
+
+## 25.0.0
+
+### Minor Changes
+
+- 52ce778: A `LazyAsync` helper was added to `@hyperlane-xyz/utils` for safe, deduplicated async initialization. It replaces the scattered pattern of `if (!cached) { cached = await init(); } return cached` with an approach that deduplicates concurrent callers, clears state on errors to allow retries, and supports reset capability. Consumer packages were migrated to use this utility.
+
+## 24.0.0
+
+### Minor Changes
+
+- 9dc71fe: Added forward-compatible enum validation to prevent SDK failures when the registry contains new enum values. Added `Unknown` variants to `ProtocolType`, `TokenType`, `IsmType`, `HookType`, `ExplorerFamily`, and `ChainTechnicalStack` enums. Exported `KnownProtocolType` and `DeployableTokenType` for type-safe mappings.
+
+### Patch Changes
+
+- 57461b2: The arrow wrapper in fetchWithTimeout was replaced with a bound method to prevent closure from capturing surrounding scope and keeping large objects alive for the lifetime of the AbortSignal timeout. Removed duplicate dead code from SDK.
+- d580bb6: fix: provide common bech32 method
+- bde05e9: Fixed GCP logging configuration not being applied to SDK components like SmartProvider. When createServiceLogger initializes a GCP logger, it now also updates rootLogger so child loggers inherit the GCP config.
+
+## 23.0.0
+
+### Minor Changes
+
+- 52fd0f8: Added StandardHookMetadata utilities: `formatStandardHookMetadata()` for building hook metadata, `parseStandardHookMetadata()` for parsing all fields, `extractRefundAddressFromMetadata()` and `hasValidRefundAddress()` for refund address helpers.
+
+### Patch Changes
+
+- a10cfc8: ISM update test coverage was improved by creating a shared test factory that works across AltVM protocols (Cosmos, Aleo, Radix). The factory supports explicit test skipping configuration through a `skipTests` parameter, making protocol-specific limitations clear in test configuration rather than hidden in implementation.
+
+  Aleo address handling was fixed to properly support ISM unsetting. The `isZeroishAddress` regex now matches Aleo null addresses both with and without program ID prefix. The `fromAleoAddress` helper was updated to handle addresses without the '/' separator. The `getSetTokenIsmTransaction` method now converts zero addresses to `ALEO_NULL_ADDRESS` before processing.
+
+## 22.0.0
+
+### Minor Changes
+
+- 66ef635: Added `mapAllSettled` helper to @hyperlane-xyz/utils for typed parallel operations with key-based error tracking. Migrated Promise.allSettled patterns across sdk, cli, infra, and rebalancer packages to use the new helper.
+- 3aec1c4: Added `timedAsync` utility for trace-level timing instrumentation of async operations.
+
+### Patch Changes
+
+- b892d63: Created new `@hyperlane-xyz/metrics` package to consolidate Prometheus metric utilities across the monorepo. Includes shared gauge definitions, metric update functions, balance utilities, metrics server, pushgateway utilities, and types. Added `tryFn` utility to `@hyperlane-xyz/utils`.
+
 ## 21.1.0
 
 ## 21.0.0
@@ -13,7 +251,6 @@
 ### Minor Changes
 
 - 11fa887: Upgrade TypeScript from 5.3.3 to 5.8.3 and compilation target to ES2023
-
   - Upgraded TypeScript from 5.3.3 to 5.8.3 across all packages
   - Updated compilation target from ES2022 to ES2023 (Node 16+ fully supported)
   - Converted internal const enums to 'as const' pattern for better compatibility

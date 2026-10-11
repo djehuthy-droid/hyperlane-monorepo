@@ -1,12 +1,13 @@
 import { confirm, input, select } from '@inquirer/prompts';
 import { stringify as yamlStringify } from 'yaml';
+import { z } from 'zod';
 
 import {
   type ChainMap,
   ChainTechnicalStack,
+  type DeployableTokenType,
   type DeployedOwnableConfig,
   HypERC20Deployer,
-  type HypTokenRouterConfig,
   type IsmConfig,
   IsmType,
   type MailboxClientConfig,
@@ -17,8 +18,7 @@ import {
   type WarpRouteDeployConfigMailboxRequired,
   WarpRouteDeployConfigMailboxRequiredSchema,
   WarpRouteDeployConfigSchema,
-  isMovableCollateralTokenConfig,
-  resolveRouterMapConfig,
+  resolveWarpDeployConfigRouterKeys,
 } from '@hyperlane-xyz/sdk';
 import {
   type Address,
@@ -28,11 +28,11 @@ import {
 } from '@hyperlane-xyz/utils';
 
 import { type CommandContext } from '../context/types.js';
+import { tryResolveSignerAddress } from '../context/strategies/signer/resolveSignerAddress.js';
 import { errorRed, log, logBlue, logGreen } from '../logger.js';
 import { runMultiChainSelectionStep } from '../utils/chains.js';
 import {
   indentYamlOrJson,
-  isFile,
   readYamlOrJson,
   writeYamlOrJson,
 } from '../utils/files.js';
@@ -41,11 +41,9 @@ import {
   getWarpRouteIdFromWarpDeployConfig,
   setProxyAdminConfig,
 } from '../utils/input.js';
-import { useProvidedWarpRouteIdOrPrompt } from '../utils/warp.js';
-
 import { createAdvancedIsmConfig } from './ism.js';
 
-const TYPE_DESCRIPTIONS: Record<TokenType, string> = {
+const TYPE_DESCRIPTIONS: Record<DeployableTokenType, string> = {
   [TokenType.synthetic]: 'A new ERC20 with remote transfer functionality',
   [TokenType.syntheticRebase]: `A rebasing ERC20 with remote transfer functionality. Must be paired with ${TokenType.collateralVaultRebase}`,
   [TokenType.collateral]:
@@ -70,17 +68,39 @@ const TYPE_DESCRIPTIONS: Record<TokenType, string> = {
     'A collateral token that can be transferred via Everclear intents',
   [TokenType.ethEverclear]:
     'An ETH token that can be transferred via Everclear intents',
+  [TokenType.collateralDepositAddress]:
+    'A collateral token that bridges by depositing into a configured address',
   // TODO: describe
   [TokenType.syntheticUri]: '',
   [TokenType.collateralUri]: '',
   [TokenType.nativeScaled]: '',
+  [TokenType.collateralOft]:
+    'A collateral token that bridges via LayerZero OFT',
+  [TokenType.atomicLocalRebalancing]:
+    'A same-chain atomic local rebalancing bridge bound to a source collateral router',
+  [TokenType.crossCollateral]:
+    'A collateral token that can route to multiple routers across chains',
 };
 
-const TYPE_CHOICES = Object.values(TokenType).map((type) => ({
-  name: type,
-  value: type,
-  description: TYPE_DESCRIPTIONS[type],
-}));
+// Types that are only configurable via YAML, not the interactive prompt
+const YAML_ONLY_TYPES: TokenType[] = [
+  TokenType.collateralOft,
+  TokenType.collateralCctp,
+  TokenType.collateralDepositAddress,
+  // Needs a sourceRouter arg the interactive prompt can't gather; YAML-only.
+  TokenType.atomicLocalRebalancing,
+];
+
+const TYPE_CHOICES = Object.values(TokenType)
+  .filter(
+    (type): type is DeployableTokenType =>
+      type !== TokenType.unknown && !YAML_ONLY_TYPES.includes(type),
+  )
+  .map((type) => ({
+    name: type,
+    value: type,
+    description: TYPE_DESCRIPTIONS[type],
+  }));
 
 export async function fillDefaults(
   context: CommandContext,
@@ -96,9 +116,8 @@ export async function fillDefaults(
       }
       let owner = config.owner;
       if (!owner) {
-        owner =
-          context.signerAddress ??
-          (await context.multiProvider.getSignerAddress(chain));
+        owner = await tryResolveSignerAddress(context, chain);
+        assert(owner, `No signer address available for ${chain}`);
       }
       return {
         owner,
@@ -130,44 +149,17 @@ export async function readWarpRouteDeployConfig({
 
   config = await fillDefaults(context, config as any);
 
-  config = objMap(
+  config = resolveWarpDeployConfigRouterKeys(
+    context.multiProvider,
     config as any,
-    (_chain, chainConfig: HypTokenRouterConfig) => {
-      if (chainConfig.destinationGas) {
-        chainConfig.destinationGas = resolveRouterMapConfig(
-          context.multiProvider,
-          chainConfig.destinationGas,
-        );
-      }
-
-      if (chainConfig.remoteRouters) {
-        chainConfig.remoteRouters = resolveRouterMapConfig(
-          context.multiProvider,
-          chainConfig.remoteRouters,
-        );
-      }
-
-      if (!isMovableCollateralTokenConfig(chainConfig)) {
-        return chainConfig;
-      }
-
-      if (chainConfig.allowedRebalancingBridges) {
-        chainConfig.allowedRebalancingBridges = resolveRouterMapConfig(
-          context.multiProvider,
-          chainConfig.allowedRebalancingBridges,
-        );
-      }
-
-      return chainConfig;
-    },
   );
 
   //fillDefaults would have added a mailbox to the config if it was missing
   return WarpRouteDeployConfigMailboxRequiredSchema.parse(config);
 }
 
-export function isValidWarpRouteDeployConfig(config: any) {
-  return WarpRouteDeployConfigSchema.safeParse(config).success;
+export function isValidWarpRouteDeployConfig(config: unknown) {
+  return z.validate(WarpRouteDeployConfigSchema, config);
 }
 
 export async function createWarpRouteDeployConfig({
@@ -195,7 +187,7 @@ export async function createWarpRouteDeployConfig({
   for (const chain of warpChains) {
     logBlue(`${chain}: Configuring warp route...`);
     const owner = await detectAndConfirmOrPrompt(
-      async () => context.signerAddress,
+      () => tryResolveSignerAddress(context, chain),
       'Enter the desired',
       'owner address',
       'signer',
@@ -245,6 +237,7 @@ export async function createWarpRouteDeployConfig({
       case TokenType.XERC20:
       case TokenType.XERC20Lockbox:
       case TokenType.collateralFiat:
+      case TokenType.crossCollateral:
         result[chain] = {
           type,
           owner,
@@ -445,45 +438,4 @@ function createFallbackRoutingConfig(owner: Address): IsmConfig {
     domains: {},
     owner,
   };
-}
-
-export async function getWarpRouteDeployConfig({
-  context,
-  warpRouteDeployConfigPath,
-  warpRouteId: providedWarpRouteId,
-  symbol,
-}: {
-  context: CommandContext;
-  warpRouteDeployConfigPath?: string;
-  warpRouteId?: string;
-  symbol?: string;
-}): Promise<WarpRouteDeployConfigMailboxRequired> {
-  let warpDeployConfig: WarpRouteDeployConfigMailboxRequired;
-
-  if (warpRouteDeployConfigPath) {
-    assert(
-      isFile(warpRouteDeployConfigPath),
-      `Warp route deployment config file not found at ${warpRouteDeployConfigPath}`,
-    );
-    log(`Using warp route deployment config at ${warpRouteDeployConfigPath}`);
-
-    warpDeployConfig = await readWarpRouteDeployConfig({
-      context,
-      filePath: warpRouteDeployConfigPath,
-    });
-  } else {
-    const warpRouteId = await useProvidedWarpRouteIdOrPrompt({
-      warpRouteId: providedWarpRouteId,
-      context,
-      symbol,
-      promptByDeploymentConfigs: true,
-    });
-
-    warpDeployConfig = await readWarpRouteDeployConfig({
-      context,
-      warpRouteId,
-    });
-  }
-
-  return warpDeployConfig;
 }

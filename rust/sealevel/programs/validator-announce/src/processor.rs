@@ -10,9 +10,9 @@ use solana_program::{
     program_error::ProgramError,
     pubkey::Pubkey,
     rent::Rent,
-    system_instruction,
     sysvar::Sysvar,
 };
+use solana_system_interface::{instruction as system_instruction, program as system_program};
 
 use crate::{
     accounts::{
@@ -28,12 +28,21 @@ use crate::{
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
+/// Marker type for PackageVersioned trait implementation.
+pub struct ValidatorAnnounceProgram;
+impl package_versioned::PackageVersioned for ValidatorAnnounceProgram {}
+
 /// The entrypoint of the program that processes an instruction.
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    // Universal version query — discriminator-based, independent of instruction enum.
+    if package_versioned::is_get_program_version(instruction_data) {
+        return package_versioned::process_get_program_version::<ValidatorAnnounceProgram>();
+    }
+
     match Instruction::from_instruction_data(instruction_data)? {
         Instruction::Init(init) => {
             process_init(program_id, accounts, init)?;
@@ -58,7 +67,7 @@ pub fn process_init(
     init: InitInstruction,
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
-    let system_program_id = solana_program::system_program::id();
+    let system_program_id = system_program::ID;
 
     // Account 0: The payer.
     let payer_info = next_account_info(account_info_iter)?;
@@ -126,7 +135,7 @@ fn process_announce(
     announcement: AnnounceInstruction,
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
-    let system_program_id = solana_program::system_program::id();
+    let system_program_id = system_program::ID;
 
     // Account 0: The payer.
     let payer_info = next_account_info(account_info_iter)?;
@@ -303,7 +312,7 @@ fn update_validator_storage_locations<'a>(
         )?;
     }
     if existing_serialized_size != new_serialized_size {
-        validator_storage_locations_info.realloc(new_serialized_size, false)?;
+        validator_storage_locations_info.resize(new_serialized_size)?;
     }
 
     // Store the updated validator_storage_locations.

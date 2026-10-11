@@ -1,8 +1,13 @@
 import { stringify as yamlStringify } from 'yaml';
 
 import { buildArtifact as coreBuildArtifact } from '@hyperlane-xyz/core/buildArtifact.js';
-import { AltVMCoreModule } from '@hyperlane-xyz/deploy-sdk';
-import { GasAction, ProtocolType } from '@hyperlane-xyz/provider-sdk';
+import { createCoreWriter } from '@hyperlane-xyz/deploy-sdk';
+import {
+  GasAction,
+  ProtocolType,
+  coreConfigToArtifact,
+  coreResultToDeployedAddresses,
+} from '@hyperlane-xyz/provider-sdk';
 import { type ChainAddresses } from '@hyperlane-xyz/registry';
 import {
   type ChainName,
@@ -13,7 +18,7 @@ import {
   ExplorerLicenseType,
   altVmChainLookup,
 } from '@hyperlane-xyz/sdk';
-import { mustGet } from '@hyperlane-xyz/utils';
+import { deepEquals, mustGet } from '@hyperlane-xyz/utils';
 
 import { type MultiProtocolSignerManager } from '../context/strategies/signer/MultiProtocolSignerManager.js';
 import { type WriteCommandContext } from '../context/types.js';
@@ -29,6 +34,7 @@ import {
   validateCoreIsmCompatibility,
 } from './utils.js';
 import { getSubmitterByStrategy } from './warp.js';
+import { ArtifactState } from '@hyperlane-xyz/provider-sdk/artifact';
 
 interface DeployParams {
   context: WriteCommandContext;
@@ -70,6 +76,7 @@ export async function runCoreDeploy(params: DeployParams) {
   let deployedAddresses: ChainAddresses;
   const protocol = multiProvider.getProtocol(chain);
   switch (protocol) {
+    case ProtocolType.Tron:
     case ProtocolType.Ethereum:
       {
         const signer = multiProvider.getSigner(chain);
@@ -110,17 +117,22 @@ export async function runCoreDeploy(params: DeployParams) {
       const userAddress = signer.getSignerAddress();
       const initialBalances = await getBalances(context, [chain], userAddress);
 
-      const coreModule = await AltVMCoreModule.create({
+      const validatedConfig = validateCoreConfigForAltVM(
+        config,
         chain,
-        config: validateCoreConfigForAltVM(config, chain),
-        chainLookup: altVmChainLookup(multiProvider),
-        signer,
-      });
+        protocol,
+      );
+      const chainLookup = altVmChainLookup(multiProvider);
+      const metadata = chainLookup.getChainMetadata(chain);
+
+      const coreWriter = createCoreWriter(metadata, chainLookup, signer);
+      const coreArtifact = coreConfigToArtifact(validatedConfig, chainLookup);
+      const [result] = await coreWriter.create(coreArtifact);
 
       await completeDeploy(context, 'core', initialBalances, userAddress, [
         chain,
       ]);
-      deployedAddresses = coreModule.serialize();
+      deployedAddresses = coreResultToDeployedAddresses(result);
     }
   }
 
@@ -139,14 +151,24 @@ export async function runCoreApply(params: ApplyParams) {
 
   const protocol = multiProvider.getProtocol(chain);
   switch (protocol) {
+    case ProtocolType.Tron:
     case ProtocolType.Ethereum: {
       const evmCoreModule = new EvmCoreModule(multiProvider, {
         chain,
         config,
-        addresses: deployedCoreAddresses,
+        addresses: { ...deployedCoreAddresses },
       });
 
       const transactions = await evmCoreModule.update(config);
+
+      // Write back addresses if update() deployed new contracts
+      const updatedAddresses = evmCoreModule.serialize();
+      if (!deepEquals(updatedAddresses, deployedCoreAddresses)) {
+        await context.registry.updateChain({
+          chainName: chain,
+          addresses: updatedAddresses,
+        });
+      }
 
       if (transactions.length) {
         logGray('Updating deployed core contracts');
@@ -175,19 +197,23 @@ export async function runCoreApply(params: ApplyParams) {
         strategyUrl: params.strategyUrl,
       });
 
-      const validatedConfig = validateCoreConfigForAltVM(config, chain);
-
-      const coreModule = new AltVMCoreModule(
-        altVmChainLookup(multiProvider),
-        signer,
-        {
-          chain,
-          config: validatedConfig,
-          addresses: deployedCoreAddresses,
-        },
+      const validatedConfig = validateCoreConfigForAltVM(
+        config,
+        chain,
+        protocol,
       );
+      const chainLookup = altVmChainLookup(multiProvider);
+      const metadata = chainLookup.getChainMetadata(chain);
 
-      const transactions = await coreModule.update(validatedConfig);
+      const coreWriter = createCoreWriter(metadata, chainLookup, signer);
+      const coreArtifact = coreConfigToArtifact(validatedConfig, chainLookup);
+      const transactions = await coreWriter.update({
+        artifactState: ArtifactState.DEPLOYED,
+        config: coreArtifact.config,
+        deployed: {
+          address: deployedCoreAddresses.mailbox,
+        },
+      });
 
       if (transactions.length) {
         logGray('Updating deployed core contracts');

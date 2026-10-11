@@ -5,7 +5,7 @@ import type { AltVM, ProtocolType } from '@hyperlane-xyz/provider-sdk';
 import type { Address, Domain } from '@hyperlane-xyz/utils';
 
 import { ZHash } from './metadata/customZodTypes.js';
-import { MultiProvider } from './providers/MultiProvider.js';
+import type { MultiProvider } from './providers/MultiProvider.js';
 import {
   ProtocolReceipt,
   ProtocolTransaction,
@@ -22,9 +22,12 @@ export type ChainNameOrId = ChainName | Domain;
 
 export type Connection = ethers.providers.Provider | ethers.Signer;
 
+/** Default RateLimited refill window (1 day, in seconds), applied when a config omits `duration`. */
+export const RATE_LIMIT_DEFAULT_DURATION_SECONDS = 86_400n;
+
 export const OwnableSchema = z.object({
   owner: ZHash,
-  ownerOverrides: z.record(ZHash).optional(),
+  ownerOverrides: z.record(z.string(), ZHash).optional(),
 });
 
 export type OwnableConfig = z.infer<typeof OwnableSchema>;

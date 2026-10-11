@@ -1,3 +1,19 @@
+## [2.3.0] - 2026-07-20
+
+* feat: aleo ARC-20 v2 tokens + mainnet USDC/USDT/ETH/WBTC/SOL rollout (#8969)
+
+## [2.2.0] - 2026-03-09
+
+* chore: migrate spellchecker from codespell to typos (#8214)
+
+## [2.1.0] - 2026-03-04
+
+* chore: update chunk size again (#7825)
+* feat(aleo): local proving fallback (#8072)
+* feat(aleo): move to encrypted proving requests (#8071)
+* feat: clear auth token when request is unauthorzied (#7929)
+* fix: only use the first slug for provider methods (#7869)
+
 ## [2.0.0] - 2026-01-06
 
 * chore: aleo testnet deployment (#7589)

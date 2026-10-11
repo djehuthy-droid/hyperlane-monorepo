@@ -95,10 +95,25 @@ async function getPrometheusConfig(
             {
               action: 'keep',
               regex: `(${[
-                'container.*',
-                'prometheus.*',
+                // Container metrics - only those with actual dashboard/query usage
+                'container_cpu_usage_seconds_total',
+                'container_memory_working_set_bytes',
+                'container_memory_usage_bytes',
+                'container_network_receive_bytes_total',
+                'container_network_transmit_bytes_total',
+                'container_fs_reads_total',
+                'container_fs_writes_total',
+                // Prometheus remote write health (heavily queried)
+                'prometheus_remote_storage_samples_failed_total',
+                'prometheus_remote_storage_samples_pending',
+                'prometheus_remote_storage_samples_total',
+                // PushGateway job freshness
+                'push_time_seconds',
+                // Application metrics
                 'ethereum.*',
                 'hyperlane.*',
+                'tollkeeper.*',
+                // Kubernetes metrics
                 'kube_pod_status_phase',
                 'kube_pod_container_status_restarts_total',
                 'kube_pod_container_resource_requests',
@@ -117,7 +132,29 @@ async function getPrometheusConfig(
       resources: {
         requests: {
           cpu: '200m',
-          memory: '3Gi',
+          memory: '8Gi',
+        },
+        limits: {
+          memory: '12Gi',
+        },
+      },
+    },
+    'prometheus-pushgateway': {
+      extraArgs: [
+        '--persistence.file=/data/pushgateway.data',
+        '--persistence.interval=5m',
+      ],
+      persistentVolume: {
+        enabled: true,
+        size: '2Gi',
+      },
+      resources: {
+        requests: {
+          cpu: '50m',
+          memory: '64Mi',
+        },
+        limits: {
+          memory: '128Mi',
         },
       },
     },

@@ -47,7 +47,7 @@ impl KaspaRpcClient {
         let mut req = self.http.post(&url).json(body);
 
         if let Some(token) = &self.token {
-            req = req.header(header::AUTHORIZATION, format!("Bearer {}", token));
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
 
         let resp = req.send().await.map_err(|e| {
@@ -58,15 +58,12 @@ impl KaspaRpcClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(KaspaError::RpcRequest(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
+            return Err(KaspaError::RpcRequest(format!("HTTP {status}: {body}")));
         }
 
-        resp.json().await.map_err(|e| {
-            KaspaError::RpcParse(format!("failed to parse response: {}", e))
-        })
+        resp.json()
+            .await
+            .map_err(|e| KaspaError::RpcParse(format!("failed to parse response: {e}")))
     }
 
     /// Make a GET request to the RPC endpoint.
@@ -77,7 +74,7 @@ impl KaspaRpcClient {
         let mut req = self.http.get(&url);
 
         if let Some(token) = &self.token {
-            req = req.header(header::AUTHORIZATION, format!("Bearer {}", token));
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
 
         let resp = req.send().await.map_err(|e| {
@@ -88,15 +85,12 @@ impl KaspaRpcClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(KaspaError::RpcRequest(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
+            return Err(KaspaError::RpcRequest(format!("HTTP {status}: {body}")));
         }
 
-        resp.json().await.map_err(|e| {
-            KaspaError::RpcParse(format!("failed to parse response: {}", e))
-        })
+        resp.json()
+            .await
+            .map_err(|e| KaspaError::RpcParse(format!("failed to parse response: {e}")))
     }
 
     /// Make a JSON-RPC request.
@@ -218,7 +212,7 @@ impl KaspaRpcClient {
 
         if resp.success {
             if let Some(gas) = resp.gas_estimate {
-                return Ok(Some(parse_u256(&gas).map_err(|e| KaspaError::RpcParse(e))?));
+                return Ok(Some(parse_u256(&gas).map_err(KaspaError::RpcParse)?));
             }
             Ok(Some(U256::from(100_000u64))) // Default estimate
         } else {
@@ -237,16 +231,14 @@ impl KaspaRpcClient {
             origin_domain: message.origin,
         };
 
-        let resp: ValidatorsAndThresholdResponse =
-            self.json_rpc("hyperlane.validators_and_threshold", params).await?;
+        let resp: ValidatorsAndThresholdResponse = self
+            .json_rpc("hyperlane.validators_and_threshold", params)
+            .await?;
 
-        let validators: Result<Vec<H256>, _> = resp
-            .validators
-            .iter()
-            .map(|v| parse_h256(v))
-            .collect();
+        let validators: Result<Vec<H256>, _> =
+            resp.validators.iter().map(|v| parse_h256(v)).collect();
 
-        let validators = validators.map_err(|e| KaspaError::RpcParse(e))?;
+        let validators = validators.map_err(KaspaError::RpcParse)?;
 
         Ok((validators, resp.threshold))
     }
@@ -267,7 +259,7 @@ impl KaspaRpcClient {
         from: u32,
         to: u32,
     ) -> ChainResult<Vec<DeliveryRecord>> {
-        let path = format!("/rpc/indexer/deliveries?from={}&to={}", from, to);
+        let path = format!("/rpc/indexer/deliveries?from={from}&to={to}");
         let resp: DeliveriesResponse = self.get(&path).await?;
         Ok(resp.deliveries)
     }
@@ -284,7 +276,7 @@ impl KaspaRpcClient {
         from: u32,
         to: u32,
     ) -> ChainResult<Vec<MessageRecord>> {
-        let path = format!("/rpc/indexer/messages?from={}&to={}", from, to);
+        let path = format!("/rpc/indexer/messages?from={from}&to={to}");
         let resp: MessagesResponse = self.get(&path).await?;
         Ok(resp.messages)
     }
@@ -301,14 +293,14 @@ impl KaspaRpcClient {
 
     /// Get block by DAA score.
     pub async fn get_block_by_daa_score(&self, daa_score: u64) -> ChainResult<BlockInfoResponse> {
-        let path = format!("/rpc/chain/block/{}", daa_score);
+        let path = format!("/rpc/chain/block/{daa_score}");
         let resp: BlockInfoResponse = self.get(&path).await?;
         Ok(resp)
     }
 
     /// Get balance for an address.
     pub async fn get_balance(&self, address: &str) -> ChainResult<U256> {
-        let path = format!("/rpc/chain/balance/{}", address);
+        let path = format!("/rpc/chain/balance/{address}");
         let resp: BalanceResponse = self.get(&path).await?;
         parse_u256(&resp.balance).map_err(|e| KaspaError::RpcParse(e).into())
     }

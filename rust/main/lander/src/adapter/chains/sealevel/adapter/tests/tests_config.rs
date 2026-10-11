@@ -4,6 +4,7 @@ use hyperlane_base::settings::{ChainConf, ChainConnectionConf, SignerConf};
 use hyperlane_core::{
     config::OpSubmissionConfig, HyperlaneDomain, KnownHyperlaneDomain, ReorgPeriod, SubmitterType,
 };
+use hyperlane_sealevel::SealevelTransactionFormat;
 
 use crate::adapter::AdaptsChain;
 
@@ -21,11 +22,13 @@ fn test_configuration_fields() {
         signer: Some(SignerConf::HexKey {
             key: Default::default(),
         }),
+        identity: None,
         submitter: SubmitterType::Lander,
         estimated_block_time: expected_estimated_block_time,
         reorg_period: expected_reorg_period.clone(),
         addresses: Default::default(),
         connection: ChainConnectionConf::Sealevel(hyperlane_sealevel::ConnectionConf {
+            max_supported_transaction_version: 0,
             urls: vec![],
             op_submission_config: OpSubmissionConfig {
                 batch_contract_address: None,
@@ -35,10 +38,16 @@ fn test_configuration_fields() {
             native_token: Default::default(),
             priority_fee_oracle: Default::default(),
             transaction_submitter: Default::default(),
+            mailbox_process_alts: SealevelTransactionFormat::Legacy,
+            process_alt_overrides: vec![],
+            ur_reveal: None,
         }),
         metrics_conf: Default::default(),
         index: Default::default(),
+        confirmations: Default::default(),
+        chain_id: Default::default(),
         ignore_reorg_reports: false,
+        native_token: Default::default(),
     };
     let adapter = adapter_config(conf);
 

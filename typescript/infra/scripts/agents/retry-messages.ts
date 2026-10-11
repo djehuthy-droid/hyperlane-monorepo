@@ -1,8 +1,7 @@
 import { spawn } from 'child_process';
-import yargs from 'yargs';
 
 import { Contexts } from '../../config/contexts.js';
-import { DeployEnvironment } from '../../src/config/environment.js';
+import { DeployEnvironment } from '../../src/config/deploy-environment.js';
 import {
   assertCorrectKubeContext,
   getArgs,
@@ -64,7 +63,6 @@ async function retryMessage(options: RetryOptions) {
     ns,
   ]);
 
-  let isConnected = false;
   let retries = 0;
   const maxRetries = 30; // 30 seconds max wait
 
@@ -75,10 +73,9 @@ async function retryMessage(options: RetryOptions) {
         await fetch(`http://localhost:${port}/health`, {
           signal: AbortSignal.timeout(1000),
         });
-        isConnected = true;
         console.log(`✅ Port-forward established on port ${port}`);
         resolve();
-      } catch (error) {
+      } catch {
         retries++;
         if (retries >= maxRetries) {
           reject(
@@ -218,10 +215,7 @@ async function main() {
         '$0 -e mainnet3 -s 0x1234... -r 0x5678...',
         'Retry messages from sender to recipient',
       ],
-      [
-        '$0 -e testnet4 -x neutron',
-        'Retry messages in testnet4 with neutron context',
-      ],
+      ['$0 -e testnet4 -x rc', 'Retry messages in testnet4 with rc context'],
     ]).argv;
 
   // Validate that at least one filter method is provided when using whitelist

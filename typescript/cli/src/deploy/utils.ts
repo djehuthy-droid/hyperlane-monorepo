@@ -3,6 +3,7 @@ import { BigNumber, ethers } from 'ethers';
 import path from 'path';
 
 import { type GasAction, ProtocolType } from '@hyperlane-xyz/provider-sdk';
+import { type WarpArtifactConfig } from '@hyperlane-xyz/provider-sdk/warp';
 import { createWarpRouteConfigId } from '@hyperlane-xyz/registry';
 import {
   type ChainMap,
@@ -15,7 +16,7 @@ import {
   type WarpRouteDeployConfig,
   isIsmCompatible,
 } from '@hyperlane-xyz/sdk';
-import { type Address, assert, mustGet } from '@hyperlane-xyz/utils';
+import { type Address, assert, isEVMLike, mustGet } from '@hyperlane-xyz/utils';
 
 import { parseIsmConfig } from '../config/ism.js';
 import {
@@ -37,6 +38,7 @@ export async function runPreflightChecksForChains({
   chains,
   minGas,
   chainsToGasCheck,
+  warpConfigByChain,
 }: {
   context: WriteCommandContext;
   chains: ChainName[];
@@ -44,6 +46,12 @@ export async function runPreflightChecksForChains({
   // Chains for which to assert a native balance
   // Defaults to all chains if not specified
   chainsToGasCheck?: ChainName[];
+  // Per-chain warp artifact config, only passed when
+  // `minGas === WARP_DEPLOY_GAS`. Threaded down to
+  // `nativeBalancesAreSufficient` so the AltVM branch can size the preflight
+  // against feature-composed deploy cost instead of the flat base-router
+  // constant.
+  warpConfigByChain?: ChainMap<WarpArtifactConfig>;
 }) {
   log('Running pre-flight checks for chains...');
   const { multiProvider, skipConfirmation, altVmSigners } = context;
@@ -53,10 +61,9 @@ export async function runPreflightChecksForChains({
     const metadata = multiProvider.tryGetChainMetadata(chain);
     if (!metadata) throw new Error(`No chain config found for ${chain}`);
 
-    const signer =
-      metadata.protocol === ProtocolType.Ethereum
-        ? multiProvider.getSigner(chain)
-        : mustGet(altVmSigners, chain);
+    const signer = isEVMLike(metadata.protocol)
+      ? multiProvider.getSigner(chain)
+      : mustGet(altVmSigners, chain);
 
     if (!signer) {
       throw new Error('signer is invalid');
@@ -72,6 +79,7 @@ export async function runPreflightChecksForChains({
     chainsToGasCheck ?? chains,
     minGas,
     skipConfirmation,
+    warpConfigByChain,
   );
 }
 
@@ -92,6 +100,7 @@ export async function runDeployPlanStep({
 
   const protocol = context.multiProvider.getProtocol(chain);
   switch (protocol) {
+    case ProtocolType.Tron:
     case ProtocolType.Ethereum: {
       address = await multiProvider.getSigner(chain).getAddress();
       break;
@@ -162,7 +171,7 @@ export async function getBalances(
   for (const chain of chains) {
     const { nativeToken, protocol } = multiProvider.getChainMetadata(chain);
 
-    if (protocol === ProtocolType.Ethereum) {
+    if (isEVMLike(protocol)) {
       const address =
         userAddress ?? (await multiProvider.getSignerAddress(chain));
       const provider = await multiProvider.getProvider(chain);

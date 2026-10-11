@@ -1,10 +1,16 @@
-import { HexString, ProtocolType, rootLogger } from '@hyperlane-xyz/utils';
+import {
+  HexString,
+  ProtocolType,
+  isEVMLike,
+  rootLogger,
+} from '@hyperlane-xyz/utils';
 
 import { AdapterClassType, MultiProtocolApp } from '../app/MultiProtocolApp.js';
-import { MultiProtocolProvider } from '../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../providers/MultiProviderAdapter.js';
 import { TypedTransactionReceipt } from '../providers/ProviderType.js';
 import { ChainMap, ChainName } from '../types.js';
 
+import { AleoCoreAdapter } from './adapters/AleoCoreAdapter.js';
 import { CosmNativeCoreAdapter } from './adapters/CosmNativeCoreAdapter.js';
 import { CosmWasmCoreAdapter } from './adapters/CosmWasmCoreAdapter.js';
 import { EvmCoreAdapter } from './adapters/EvmCoreAdapter.js';
@@ -19,7 +25,7 @@ export class MultiProtocolCore extends MultiProtocolApp<
   CoreAddresses
 > {
   constructor(
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: ChainMap<CoreAddresses>,
     public readonly logger = rootLogger.child({ module: 'MultiProtocolCore' }),
   ) {
@@ -28,7 +34,7 @@ export class MultiProtocolCore extends MultiProtocolApp<
 
   static fromAddressesMap(
     addressesMap: ChainMap<CoreAddresses>,
-    multiProvider: MultiProtocolProvider,
+    multiProvider: MultiProviderAdapter,
   ): MultiProtocolCore {
     return new MultiProtocolCore(
       multiProvider.intersect(Object.keys(addressesMap)).result,
@@ -39,19 +45,20 @@ export class MultiProtocolCore extends MultiProtocolApp<
   override protocolToAdapter(
     protocol: ProtocolType,
   ): AdapterClassType<ICoreAdapter> {
-    if (protocol === ProtocolType.Ethereum) return EvmCoreAdapter;
+    if (isEVMLike(protocol)) return EvmCoreAdapter;
     if (protocol === ProtocolType.Sealevel) return SealevelCoreAdapter;
     if (protocol === ProtocolType.Cosmos) return CosmWasmCoreAdapter;
     if (protocol === ProtocolType.CosmosNative) return CosmNativeCoreAdapter;
     if (protocol === ProtocolType.Starknet) return StarknetCoreAdapter;
     if (protocol === ProtocolType.Radix) return RadixCoreAdapter;
+    if (protocol === ProtocolType.Aleo) return AleoCoreAdapter;
     throw new Error(`No adapter for protocol ${protocol}`);
   }
 
-  extractMessageIds(
+  async extractMessageIds(
     origin: ChainName,
     sourceTx: TypedTransactionReceipt,
-  ): Array<{ messageId: HexString; destination: ChainName }> {
+  ): Promise<Array<{ messageId: HexString; destination: ChainName }>> {
     return this.adapter(origin).extractMessageIds(sourceTx);
   }
 
@@ -62,7 +69,7 @@ export class MultiProtocolCore extends MultiProtocolApp<
     delayMs?: number,
     maxAttempts?: number,
   ): Promise<boolean> {
-    const messages = this.adapter(origin).extractMessageIds(sourceTx);
+    const messages = await this.adapter(origin).extractMessageIds(sourceTx);
     await Promise.all(
       messages.map((msg) =>
         this.adapter(destination).waitForMessageProcessed(

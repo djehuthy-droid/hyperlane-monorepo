@@ -1,5 +1,6 @@
 import { execSync } from 'child_process';
 import fs from 'fs';
+import path from 'path';
 import tmp from 'tmp';
 
 import { rootLogger, stringifyObject } from '@hyperlane-xyz/utils';
@@ -95,10 +96,57 @@ export function getDeployableHelmChartName(helmChartConfig: HelmChartConfig) {
   return helmChartConfig.name;
 }
 
+function helmDependenciesNeedRebuild(chartPath: string): boolean {
+  const chartYamlPath = path.join(chartPath, 'Chart.yaml');
+  const chartLockPath = path.join(chartPath, 'Chart.lock');
+  const chartsDir = path.join(chartPath, 'charts');
+
+  if (!fs.existsSync(chartLockPath) || !fs.existsSync(chartsDir)) {
+    return true;
+  }
+
+  try {
+    const chartYamlStat = fs.statSync(chartYamlPath);
+    const chartLockStat = fs.statSync(chartLockPath);
+
+    if (chartYamlStat.mtimeMs > chartLockStat.mtimeMs) {
+      return true;
+    }
+
+    const tgzFiles = fs
+      .readdirSync(chartsDir)
+      .filter((f) => f.endsWith('.tgz'));
+    if (tgzFiles.length === 0) {
+      return true;
+    }
+
+    const newestTgzMtime = Math.max(
+      ...tgzFiles.map((f) => fs.statSync(path.join(chartsDir, f)).mtimeMs),
+    );
+
+    if (chartLockStat.mtimeMs > newestTgzMtime) {
+      return true;
+    }
+
+    return false;
+  } catch (_) {
+    return true;
+  }
+}
+
 export function buildHelmChartDependencies(
   chartPath: string,
   updateRepoCache: boolean,
+  forceRebuild: boolean = false,
 ) {
+  // Skip rebuild if dependencies are up to date (optimization)
+  if (!forceRebuild && !helmDependenciesNeedRebuild(chartPath)) {
+    rootLogger.debug(
+      `Helm dependencies for ${chartPath} are up to date, skipping build`,
+    );
+    return Promise.resolve();
+  }
+
   const flags = updateRepoCache ? '' : '--skip-refresh';
   return execCmd(
     `cd ${chartPath} && helm dependency build ${flags}`,
@@ -111,6 +159,14 @@ export function buildHelmChartDependencies(
 // Convenience function to remove a helm release without having a HelmManger for it.
 export function removeHelmRelease(releaseName: string, namespace: string) {
   return execCmd(`helm uninstall ${releaseName} --namespace ${namespace}`);
+}
+
+function isHelmReleaseNotFoundError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message.includes('release: not found') ||
+      error.message.includes('Release not loaded'))
+  );
 }
 
 export type HelmValues = Record<string, any>;
@@ -152,8 +208,18 @@ export abstract class HelmManager<T = HelmValues> {
 
     if (action == HelmCommand.Remove) {
       if (dryRun) cmd.push('--dry-run');
-      cmd.push(this.helmReleaseName, this.namespace);
-      await execCmd(cmd, {}, false, true);
+      cmd.push(this.helmReleaseName, '--namespace', this.namespace);
+      try {
+        await execCmd(cmd, {}, true, true);
+      } catch (error) {
+        if (isHelmReleaseNotFoundError(error)) {
+          rootLogger.warn(
+            `Helm release ${this.helmReleaseName} not found in ${this.namespace}; skipping uninstall`,
+          );
+          return;
+        }
+        throw error;
+      }
       return;
     }
 
@@ -225,17 +291,10 @@ export abstract class HelmManager<T = HelmValues> {
     releaseName: string,
     namespace: string,
   ): Promise<boolean> {
-    try {
-      await execCmd(
-        `helm status ${releaseName} --namespace ${namespace}`,
-        {},
-        false,
-        false,
-      );
-      return true;
-    } catch (error) {
-      return false;
-    }
+    const releases = await execCmdAndParseJson(
+      `helm list --namespace ${namespace} --deployed --failed --pending --uninstalling --filter '^${releaseName}$' --output json`,
+    );
+    return releases.length > 0;
   }
 
   async getExistingK8sSecrets(): Promise<string[]> {
@@ -405,7 +464,7 @@ export function getHelmReleaseName(id: string, prefix: string): string {
   let name = `${prefix}-${id.toLowerCase().replaceAll('/', '-')}`;
 
   // 52 because the max label length is 63, and there is an auto appended 11 char
-  // suffix, e.g. `controller-revision-hash=hyperlane-warp-route-tia-mantapacific-neutron-566dc75599`
+  // suffix, e.g. `controller-revision-hash=hyperlane-warp-route-tia-eclipsemainnet-566dc75599`
   const maxChars = 52;
 
   // Max out length, and it can't end with a dash.
@@ -414,4 +473,41 @@ export function getHelmReleaseName(id: string, prefix: string): string {
     name = name.replace(/-+$/, '');
   }
   return name;
+}
+
+/**
+ * Extract registry commit from helm values.
+ * Supports standalone image (registryUri with /tree/{commit}) and legacy monorepo (registryCommit).
+ */
+export function extractRegistryCommitFromHelmValues(
+  values: HelmValues | null,
+): string | undefined {
+  if (!values) return undefined;
+
+  const registryUri = values?.hyperlane?.registryUri;
+  if (registryUri) {
+    const match = registryUri.match(/\/tree\/(.+)$/);
+    if (match?.[1]) return match[1];
+  }
+
+  return values?.hyperlane?.registryCommit;
+}
+
+/**
+ * Get registry commit from a deployed helm release.
+ */
+export async function getDeployedRegistryCommit(
+  warpRouteId: string,
+  namespace: string,
+  helmReleasePrefix: string,
+): Promise<string | undefined> {
+  const helmReleaseName = getHelmReleaseName(warpRouteId, helmReleasePrefix);
+  try {
+    const values = await execCmdAndParseJson(
+      `helm get values ${helmReleaseName} --namespace ${namespace} -o json`,
+    );
+    return extractRegistryCommitFromHelmValues(values);
+  } catch {
+    return undefined;
+  }
 }

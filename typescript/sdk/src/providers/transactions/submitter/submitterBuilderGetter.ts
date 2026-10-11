@@ -13,6 +13,7 @@ import { EV5GnosisSafeTxSubmitter } from './ethersV5/EV5GnosisSafeTxSubmitter.js
 import { EV5ImpersonatedAccountTxSubmitter } from './ethersV5/EV5ImpersonatedAccountTxSubmitter.js';
 import { EV5JsonRpcTxSubmitter } from './ethersV5/EV5JsonRpcTxSubmitter.js';
 import { EV5TimelockSubmitter } from './ethersV5/EV5TimelockSubmitter.js';
+import type { SubmitterGetter } from './types.js';
 import { SubmitterMetadata } from './types.js';
 
 export type SubmitterBuilderSettings = {
@@ -42,11 +43,11 @@ export type SubmitterFactory<TProtocol extends ProtocolType = any> = (
   multiProvider: MultiProvider,
   metadata: SubmitterMetadata,
   coreAddressesByChain: ChainMap<Record<string, string>>,
+  getSubmitterFn: SubmitterGetter,
 ) => Promise<TxSubmitterInterface<TProtocol>> | TxSubmitterInterface<TProtocol>;
 
 const EVM_SUBMITTERS_FACTORIES: Record<string, SubmitterFactory> = {
   [TxSubmitterType.JSON_RPC]: (multiProvider, metadata) => {
-    // Used to type narrow metadata
     assert(
       metadata.type === TxSubmitterType.JSON_RPC,
       `Invalid metadata type: ${metadata.type}, expected ${TxSubmitterType.JSON_RPC}`,
@@ -78,6 +79,7 @@ const EVM_SUBMITTERS_FACTORIES: Record<string, SubmitterFactory> = {
     multiProvider,
     metadata,
     coreAddressesByChain,
+    getSubmitterFn,
   ) => {
     assert(
       metadata.type === TxSubmitterType.INTERCHAIN_ACCOUNT,
@@ -87,12 +89,14 @@ const EVM_SUBMITTERS_FACTORIES: Record<string, SubmitterFactory> = {
       metadata,
       multiProvider,
       coreAddressesByChain,
+      getSubmitterFn,
     );
   },
   [TxSubmitterType.TIMELOCK_CONTROLLER]: (
     multiProvider,
     metadata,
     coreAddressesByChain,
+    getSubmitterFn,
   ) => {
     assert(
       metadata.type === TxSubmitterType.TIMELOCK_CONTROLLER,
@@ -103,6 +107,7 @@ const EVM_SUBMITTERS_FACTORIES: Record<string, SubmitterFactory> = {
       metadata,
       multiProvider,
       coreAddressesByChain,
+      getSubmitterFn,
     );
   },
 };
@@ -110,6 +115,7 @@ const EVM_SUBMITTERS_FACTORIES: Record<string, SubmitterFactory> = {
 const defaultSubmitterFactories: ProtocolMap<Record<string, SubmitterFactory>> =
   {
     [ProtocolType.Ethereum]: EVM_SUBMITTERS_FACTORIES,
+    [ProtocolType.Tron]: EVM_SUBMITTERS_FACTORIES,
   };
 
 /**
@@ -169,5 +175,27 @@ export async function getSubmitter<TProtocol extends ProtocolType>(
       `No submitter factory registered for protocol ${protocolType} and type ${submitterMetadata.type}`,
     );
   }
-  return factory(multiProvider, submitterMetadata, coreAddressesByChain);
+  // Thread additionalSubmitterFactories through nested submitter resolution
+  // (e.g. an ICA/timelock submitter resolving its internalSubmitter) so custom
+  // factories like the CLI's `file` submitter remain available recursively. The
+  // parent's factories are always merged in so a nested caller passing its own
+  // (or an empty) factory map can never drop them and re-introduce the bug at
+  // recursion depth >= 2.
+  const getSubmitterWithInheritedFactories: SubmitterGetter = (
+    nestedMultiProvider,
+    nestedMetadata,
+    nestedCoreAddresses,
+    nestedFactories,
+  ) =>
+    getSubmitter(nestedMultiProvider, nestedMetadata, nestedCoreAddresses, {
+      ...additionalSubmitterFactories,
+      ...nestedFactories,
+    });
+
+  return factory(
+    multiProvider,
+    submitterMetadata,
+    coreAddressesByChain,
+    getSubmitterWithInheritedFactories,
+  );
 }

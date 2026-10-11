@@ -1,5 +1,191 @@
 # @hyperlane-xyz/core
 
+## 12.2.0
+
+### Minor Changes
+
+- ebf3922: ICA fee-token dispatches were fixed to quote the actual remote router, message body, and resolved hook. QuotedCalls ICA commands were changed to reconstruct the messages they execute, and Minimal ICA routers gained support for salted calls. Commit-reveal calls were changed to forward and refund only native value from the current call, leaving existing router balances untouched. Token-pulling child hooks still require explicit approval.
+
+    Existing immutable ICA routers are not supported for these fee-token commands. The updated QuotedCalls and ICA routers must be deployed together, and registry configuration must be migrated to the paired deployments.
+
+### Patch Changes
+
+- 0aeb76a: Reduced contract build times by compiling Tron without shared source mutations, retaining its incremental compiler cache, and parallelizing Starknet artifact generation. Generated contract artifacts were preserved.
+
+## 12.1.0
+
+### Minor Changes
+
+- 5899416: Support was added for Blacklist ISM deployments that predate on-chain enumeration.
+
+    - `EvmIsmReader` now probes `blacklistedIds(bytes32)` and `values()` separately, so a deployment without `values()` is derived as a `blacklistIsm` rather than falling through to `testIsm`.
+    - Enumeration was shared by the reader and `moduleMatchesConfig` through `readBlacklistedIds`, so both reached the same verdict for the same deployment. When `values()` was unavailable, the set was replayed from `MessageBlacklisted` logs, de-duplicated and sorted; entries are append-only, so a complete log sequence defined the current set.
+    - Reading was made to fail on detectable incompleteness rather than yielding a known partial set, since a Blacklist ISM config without its entries did not describe the deployment it named. Legacy replay required an explorer- or receipt-derived deployment block instead of relying on RPC bisection over historical state. Successful log responses continued to be trusted to describe the exact ranges requested. A deployment that had never blacklisted anything was read as an empty set, which remained a result and not a failure.
+    - Explorer-backed `getLogs` calls were made to page to completion or fail over without returning a prefix, and RPC deployment-block discovery was made to fail rather than start an infeasible scan from genesis when historical state was unavailable.
+    - `EvmIsmModule` redeploys a fresh Blacklist ISM instead of appending in place when the deployed one predates on-chain enumeration, so entries are never appended to a contract that is being phased out.
+    - Blacklist ISM and Test ISM config checks no longer accept a deployment purely on its module type. A Blacklist ISM config is checked against `blacklistedIds(bytes32)` before its entries are read, and a Test ISM config is confirmed by deriving the deployed module rather than matching any address whose module type is NULL. A deployment that cannot be shown to be one of those two configured types is now reported as a mismatch instead of passing. Checks for other ISM types are unchanged.
+    - `TestLegacyBlacklistIsm` was added as a test fixture reproducing the pre-audit contract, renamed from `BlacklistIsm` and compiled with a raised `>=0.8.18` pragma for its named mapping parameters; it is otherwise unchanged.
+
+## 12.0.0
+
+### Major Changes
+
+- 469da6d: The core Solidity package adds `AtomicLocalRebalancingBridge` for same-chain local rebalances. The bridge binds its source router at construction so the caller cannot supply an arbitrary router, guards the entire local-rebalance flow (including the user-supplied calls) against reentrancy, funds the destination router only from output produced by those calls, and refunds the token balances accrued during the call to the rebalancer while leaving any pre-existing token balance untouched (unspent native is refunded in full). Its entry point `rebalance(uint32,uint256,ITokenBridge,bytes32,bytes)`, defined by the new `IRebalancingBridge` interface, mirrors the canonical rebalance signature: the source argument is a checked echo of the bound router, the destination recipient is supplied per call and validated against the source's rebalance targets, and the trailing bytes carry the ABI-encoded calls. The bridge is `Ownable`; tokens or native accidentally sent to it are recoverable via `recoverToken`/`recoverNativeBalance`, callable only by its owner.
+
+    `CrossCollateralRouter` implements the new `IRebalanceTargets` interface, allowing multiple local rebalance recipients per domain beyond the enrolled remote router. Owners manage the additional targets with `addRebalanceTarget`/`removeRebalanceTarget`, and `isRebalanceTarget` authorizes a recipient (the zero address is never authorized, even on a domain with no enrolled router). The source of an `AtomicLocalRebalancingBridge` must implement `IRebalanceTargets`; the constructor verifies the source is a contract.
+
+    `MovableCollateralRouter` no longer creates standing bridge token approvals. `addBridge` only allowlists a bridge, `HypERC20Collateral` no longer approves bridges during bridge enrollment, and `rebalance` grants an exact temporary collateral-token approval based on the bridge quote and revokes any unconsumed allowance after `transferRemote`.
+
+    The `approveTokenForBridge(address,address)` helper is deprecated and clears legacy standing approval instead of setting max approval. The selector is retained for upgrade and governance-tooling compatibility.
+
+    The SDK only emits bridge-approval transactions from `allowedRebalancingBridges[].approvedTokens` for routers on a legacy (pre-atomic-rebalancing) contract version, where `approveTokenForBridge` still grants a standing max approval. On newer routers the field is ignored because allowances are granted per rebalance and the same selector revokes. During `warp apply`, the SDK also revokes legacy standing rebalancing-bridge allowances when a route is being upgraded to, or is already on, the revoke-semantics implementation (so a partially-applied upgrade whose revokes did not execute can be retried), covering both the collateral token and any configured `approvedTokens` for every bridge that remains allowlisted, matched by bridge address across all domains (so a bridge moved between domains is still cleaned up), so an upgraded route does not retain the old max approvals. The SDK exports `MAX_LEGACY_BRIDGE_APPROVAL_VERSION` and `bridgeApprovalGrantsMaxAllowance(version)` so callers can determine whether `approveTokenForBridge` grants or revokes for a given contract version; the governance transaction reader uses this to read the target router's version and describe the call as a grant or a revoke accordingly.
+
+- 57b1e14: The `RateLimited` refill window is made configurable per instance. `RateLimited` now takes a `_duration` constructor argument (previously a hardcoded `1 days` constant), and `RateLimitedHook`, `RateLimitedIsm`, and `DelayedFlowRouterHookIsm` thread it through. The `DURATION` getter is preserved as a `public immutable` so existing on-chain reads still work. `RateLimitedHookConfig` and `RateLimitedIsmConfig` gain a `duration` field: parsing a config that omits it applies a default of 1 day (86400s), matching the previous on-chain window, but the field is present on the exported (inferred) config types, so TypeScript callers constructing these configs must supply it. The deploy/read paths surface it. Duration is immutable on-chain, so `EvmHookModule` and `EvmIsmModule` redeploy a fresh `RateLimited` hook/ISM when the desired duration changes.
+- de37b68: The `DelayedFlowRouter` contract and its artifact were renamed to `DelayedFlowRouterHookIsm`, matching the sibling `NetFlowRateLimitedHookIsm` and making its combined hook + ISM role explicit in the name. Downstream imports of the old name must be updated; the contract's behavior, interface, and storage slots are unchanged.
+
+### Minor Changes
+
+- 745fb77: AVS stake registry ownership was established atomically before its service manager was deployed and configured.
+- 745fb77: Constructor-configured variants were added for directly deployed domain, incremental domain, and default fallback routing ISMs.
+- 74f3760: `AtomicLocalRebalancingBridge` runs the rebalancer-supplied calls with these constraints:
+    - They execute through the new `CallLib.safeMulticall`, which rejects delegatecalls, so a call cannot run in the bridge's storage context or re-arm its transient callback slot to pull the source router more than once.
+    - The source's `LpCollateralRouter.totalAssets()` must be unchanged across the calls, preventing a source-collateral drain masked by depositing into the source's LP vault for redeemable shares.
+
+    `rebalance` also documents that the calls run with the bridge's authority and can grant a standing token allowance over any balance it holds, so `recoverToken` does not protect those holdings; and `MovableCollateralRouter`'s `CollateralMoved` event documents that its `recipient`/`amount` do not describe an atomic-bridge-driven move (consumers should read the bridge's `LocalRebalanceExecuted` event).
+
+- abeeb52: The Blacklist ISM contract is added to support owner-controlled message ID blocking. Blacklisted IDs are stored in an enumerable set, exposing a `values()` getter so the full blacklist can be read on-chain and off-chain. Entries are append-only and permanent.
+- eb9c37c: `MovableCollateralRouter.addBridge` and `setRecipient` were made `external virtual`, and `CrossCollateralRouter` overrode them to also accept domains enrolled only via `_crossCollateralRouters` (mirroring the existing widening in `_setDestinationGas`). For CCR-only domains, `setRecipient` must be called to pin a target router since `_recipient`'s fallback cannot disambiguate among multiple CCR routers per domain. The overrides emit new `CCRRecipientSet` / `CCRBridgeAdded` events so CCR-only admin changes are observable off-chain.
+- f3a6a4e: Added `DefaultIsm`, an ownerless routing ISM that always defers to the mailbox's default ISM, for recipients that want to track the mailbox default without per-domain overrides or owner-controlled configuration.
+- d6e923f: `DelayedFlowRouterHookIsm` keeps its outstanding over-limit debt in a public `debt` state variable rather than a hashed storage slot, so the unsettled overage is readable on-chain alongside `RateLimited`'s public bucket state.
+- 4c4f3f9: `DelayedFlowRouterHookIsm` was added: an amount-sensitive hook + ISM that pairs with a warp route to delay cross-chain withdrawals proportionally when net flow exceeds a configurable fraction of the pool. It extends `TimelockRouter` + `RateLimited`, crediting its bucket 1:1 on local dispatches and deriving a per-message delay (capped at `maxDelay`) from a soft-consume at preverify time. `TimelockRouter` was refactored for extension: `postDispatch`, `quoteDispatch`, and `verify` enforce `_isLatestDispatched`, and subclasses customize behavior through the internal hooks `_TimelockRouter_onDispatch`, `_encodePayload` (shared by `postDispatch` and `quoteDispatch`), `_handle` (via `_TimelockRouter_commitReadyAt`), and `_TimelockRouter_verify`. `RateLimited` exposes `maxCapacity()` as virtual so subclasses may back it dynamically (with the refill rate derived automatically), adds `_credit` / `_consume` primitives, and uses `Math.mulDiv` for the token-bucket math.
+
+    `DelayedFlowRouterHookIsm` retains over-limit outflow as debt (exposed via the public `debt` accessor) that heals at the refill rate and is paid down by credits before granting headroom, so splitting one transfer into many messages — or keeping each below the per-second refill — no longer shrinks the enforced delay. `RateLimited` routes `calculateCurrentLevel`, `_consume`, `_credit`, and `_validateAndConsumeFilledLevel` through four overridable `_RateLimited_*` hooks whose defaults reproduce the prior reject-mode behavior; the delay router overrides them for the debt accounting. Every consume/credit touch — including the reject-mode `_validateAndConsumeFilledLevel` — heals tracked debt by the elapsed refill, so the level and the debt stay consistent across all entrypoints.
+
+- 4c4f3f9: Added delayed flow rate limit ISM support.
+- 5830b8e: - Added a net-flow rate-limited warp hook ISM that caps a router's net collateral outflow per day at a basis-point fraction of its live TVL, installed as both the router's hook and its ISM so symmetric flow nets out.
+    - Moved the token-bucket capacity shared with `DelayedFlowRouterHookIsm` — sized as a bps fraction of native balance, synthetic supply, or collateral balance — into a `TvlRateLimited` base that both contracts extend.
+    - `TvlRateLimited` limiters report full at the current capacity until first consumed or credited, so a limiter deployed before its pool is funded starts full on first use instead of snapshotting a zero deploy-time capacity. The init flag lives in a hashed storage slot, leaving the layout of `RateLimited` and its deployed consumers unchanged.
+    - The threshold basis points are validated via an overridable
+      `TvlRateLimited._validateThresholdBps`: reject-mode limiters (`NetFlow`)
+      require strictly below 100% (a 100% cap collapses on the synthetic
+      post-burn supply), while delay-mode `DelayedFlowRouterHookIsm` permits up to 100%
+      since over-limit messages are delayed rather than reverted.
+    - Added a `MailboxClient._isProcessing` helper that binds a check to the message being delivered in the current transaction; the net-flow ISM uses it as its inbound flow guard.
+    - `TvlRateLimited` now sizes the collateral/native capacity on non-reclaimable collateral — the router's balance minus its LP-reclaimable pool (`totalAssets()`) — via a reusable `LpCollateral.effectiveCollateralBalance` library, so reversible ERC4626 `deposit`/`redeem`/`donate` on the `LpCollateralRouter`-based routers are capacity-neutral and can no longer inflate the limit; only genuinely locked collateral and irreversible transfers size it. Collateral routers that are not `LpCollateralRouter` vaults are unsupported and revert on the read.
+    - Documented that the synthetic (`totalSupply`) capacity basis shifts with the mint/burn being metered: inbound mints raise the capacity and refill rate, and burn-first outbound metering caps the largest single outbound at `S·thresholdBps / (BPS + thresholdBps)`.
+- d3bbedf: Added ICA delegatecall sentinel support.
+- e5908e9: Added ICA native balance sentinel support.
+- c2301b2: - TVL rate limiters now meter cross-chain transfers in local token units. `NetFlowRateLimitedHookIsm` and `DelayedFlowRouterHookIsm` convert the message (wire) amount to local units via `TvlRateLimited._toLocalAmount` — mirroring `TokenRouter._inboundAmount` (`mulDiv`, round down) — before consuming or crediting the bucket.
+    - This makes limiters correct for routes whose local decimals differ from the wire format (`scaleNumerator != scaleDenominator`); the amount metered now matches the collateral the router actually moves. `DelayedFlowRouterHookIsm` carries the wire amount cross-chain and converts on each side, so origin and destination meter with their own router's scale.
+- c0ca851: Added `setIsms(IsmConfig[])` and `removeIsms(uint32[])` to `DomainRoutingIsm` so routing ISM owners could enroll or unenroll many domains in a single transaction after initialization. Emitted `ModuleSet` and `ModuleRemoved` when domain ISM mappings changed. Mirrored the `setHooks(HookConfig[])` pattern on `DomainRoutingHook`. Was inherited by `IncrementalDomainRoutingIsm` (where `removeIsms` reverted, consistent with `remove`) and `DefaultFallbackRoutingIsm`.
+
+### Patch Changes
+
+- 8944dd2: Fixed standing offchain quote replacement validation.
+- 3a74600: `CrossCollateralRouter` now clears a domain's rebalance recipient and allowed bridges when its last cross-collateral route is unenrolled and the domain has no classic remote router, so an unenrolled route no longer retains rebalance authority.
+- 8944dd2: AbstractOffchainQuoter.submitQuote was updated to reject standing quotes with future-dated issuedAt, preventing a compromised signer from permanently locking the monotonic issuedAt barrier near uint48 max with an indefinite expiry (HL-2026Q2-001). A later legitimate quote can always overwrite by having a strictly larger issuedAt at submission time. Transient quotes (expiry == issuedAt) are unaffected.
+- 89e6a8e: The Solidity optimizer runs were raised from 5,800 to 10,000 for the whole suite, lowering runtime gas across the contracts. `CrossCollateralRouter` is pinned at 3,599 runs — via a Foundry compilation restriction and a matching Hardhat override — so its runtime bytecode stays under the EIP-170 24,576-byte limit.
+
+## 11.3.1
+
+### Patch Changes
+
+- 7ad1f9e: The prepublishOnly script is replaced with a prepack script that validates dist/ exists.
+
+## 11.3.0
+
+### Minor Changes
+
+- 4c4462f: CrossCollateral contracts and tests were moved into the core Solidity package under `contracts/token` and `test/token`, and SDK imports were updated to use `@hyperlane-xyz/core` factories instead of `@hyperlane-xyz/multicollateral`.
+- 696da11: Add quoteTransferRemote to Predicate warp route wrapper
+- 46dda6c: Offchain fee quoting was added to InterchainGasPaymaster via AbstractOffchainQuoter inheritance. OffchainQuotedLinearFee was added as a new ITokenFee implementation for warp route fees. QuotedCalls command-based router was added for atomic quote submission with Permit2 and transient approvals. Solc was bumped to 0.8.28 with Cancun EVM target for transient storage support.
+- 9061916: CrossCollateralRoutingFee exposed an explicit feeType in the core contract interface.
+- d41d088: feat: predicate router wrapper for compliance attestations with Hyperlane warp routes
+- b691b87: A deposit-address token bridge adapter was added in core, and the SDK deployer, reader, and config types were updated to support `collateralDepositAddress` routes.
+- ef4399b: Addressed minor audit suggestions: renamed `setDestinationConfig` to `addDestinationConfig` in TokenBridgeDepositAddress to prevent accidental overwrites, added `getRemoteInterchainAccount` view to AbstractInterchainAccountRouter, added message type validation in MinimalInterchainAccountRouter, switched to `forceApprove` in TokenRouter fee charging, added zero-amount and same-domain guard checks in CrossCollateralRouter, and restored NatSpec documentation on shared functions.
+- 40356c6: Native fee refund logic was added to PredicateRouterWrapper to return excess ETH to callers using address(this).balance after the warp route call.
+- 6f8c503: QuotedCalls.quoteExecute was added for fee discovery via eth_call, returning per-command Quote[][] arrays. The SDK gained a QuotedCalls client with codec, builder, and WarpCore integration for atomic quoted transfers.
+- f2749a6: Added reentrancy guard using transient storage to QuotedCalls.execute and a corresponding test that verifies reentrant calls revert.
+- 6bd4fd1: feat: added PredicateCrossCollateralRouterWrapper.sol and extracted shared predicate wrapper logic into an abstract class
+- 57e46b1: The TokenBridgeOft contract, LayerZero IOFT interface, and Forge tests were moved into the core Solidity package. The SDK was updated to resolve TokenBridgeOft factories from `@hyperlane-xyz/core`, and the deprecated `@hyperlane-xyz/multicollateral` package was removed.
+- 993de2b: Added MinimalInterchainAccountRouter for chains with tight deployment size limits.
+
+### Patch Changes
+
+- 9ac480a: AmountRoutingHook.\_postDispatch() was updated to forward msg.value directly to the child hook instead of computing and forwarding the quoted amount, fixing native value handling for ERC20 fee flows.
+- 9eefa2d: The WeightedMultisigIsm non-sequential signer verification bug was fixed.
+- ac1acbb: The Tron build excluded CrossCollateral contracts that currently crash tron-solc.
+- d38fad1: Support erc20 fees for commit message of ICA commit reveal
+- cfed1d2: CrossCollateral routing fee quotes were updated to revert when no router-specific or destination-default fee contract is configured.
+- 7018cc6: Added documentation that standing ERC20 approvals to fee hooks are unsafe; in the worst case, funds are recoverable by hook operators rather than profiting an attacker.
+- 3fef31c: Fee quoting was updated to use local token amounts at call sites while ensuring message bodies use outbound (scaled) amounts for accurate hook routing.
+- d98726f: Permit2 permit call in QuotedCalls was wrapped in try/catch to handle front-running gracefully. If an attacker submits the same permit signature first, the allowance is already set and execution continues without reverting.
+- b5f897c: Standing quote staleness behavior was refined: strictly older quotes still revert with `StaleQuote`, equal `issuedAt` quotes are now silently skipped (no revert, no storage update), and only newer quotes trigger storage writes and `QuoteSubmitted` event emission.
+- 9515191: Check native fees are covered in predicate wrapper for all warp route types
+
+## 11.2.0
+
+### Minor Changes
+
+- ac297da: Added a sender check in CctpBase.\_postDispatch to prevent misuse when called via transferRemote.
+
+### Patch Changes
+
+- 77db719: Fixed SafeERC20.sol operations for Tron
+
+## 11.1.0
+
+### Minor Changes
+
+- 6c715a7: Added MinimalInterchainAccountRouter for chains with tight deployment size limits.
+
+## 11.0.3
+
+### Patch Changes
+
+- a4a74d8: TokenBridgeOft was refactored to remove TokenRouter inheritance, implementing ITokenBridge directly with OwnableUpgradeable. The contract no longer requires a mailbox, remote router enrollment, or destination gas configuration. Fee recipient support was removed and OFT fee quotes were consolidated into a single token quote entry. SDK deployer, warp route reader, and warp module were updated to handle OFT configs separately from Router-based configs.
+
+## 11.0.2
+
+### Patch Changes
+
+- f7ebf6c: `quoteTransferRemoteTo` was fixed to work without a default `Router._routers` enrollment by adding a target-router-aware gas quote helper. `GasRouter._setDestinationGas` was made virtual and overridden in MultiCollateral to accept MC-enrolled-only domains, keeping the existing `setDestinationGas` function selector working for all domain types. Authorization checks were deduplicated into `_requireAuthorizedRouter`. SDK EvmWarpRouteReader was updated to include MC-enrolled domains when reading destination gas.
+
+## 11.0.1
+
+### Patch Changes
+
+- 027eeac: Fix typechain ethers v5/v6 webpack compat by replacing `import { utils } from "ethers"` with direct `Interface` import from `@ethersproject/abi` in generated factory files.
+
+## 11.0.0
+
+### Major Changes
+
+- d4a5026510: Renamed `maxFeeBps` to `maxFeePpm` on `TokenBridgeCctpV2` to accurately reflect the parts-per-million denomination. The on-chain getter, setter, event, and storage slot were all renamed.
+- 34649cd54f: Refactored InterchainGasPaymaster storage layout to support token-based gas payments. The `destinationGasConfigs` mapping is deprecated and replaced with `tokenGasOracles` and `destinationGasOverhead` mappings. A backward-compatible getter maintains the original ABI signature.
+- 29f14a1259: Update TokenRouter with fractional scaling
+
+### Minor Changes
+
+- 934d8577c7: Made maxFeeBps mutable on TokenBridgeCctpV2 and increased fee precision from bps (1/10,000) to ppm (1/1,000,000) to support Circle's fractional basis point fees (e.g., 1.3 bps). SDK converts bps config to ppm for deployment and ppm back to bps when reading.
+- 25f5bcfb36: Add ERC20 token payment support for interchain gas fees
+- d5e8e98119: Added ERC20 token fee payment support to InterchainAccountRouter. Users can now pay interchain gas fees using ERC20 tokens by passing hook metadata with a fee token address.
+- 942bbfbfe0: Added `approveFeeTokenForHook` function to InterchainAccountRouter allowing pre-approval of ERC-20 fee tokens for hooks. This fixes an issue where ERC-20 fee payments fail when using StaticAggregationHook, since the router only approved the top-level hook but the actual fee transfer happens in a child hook (IGP).
+- a3f7fd3c09: Added IncrementalDomainRoutingIsm, an append-only variant of DomainRoutingIsm that prevents domain removal and re-configuration. Includes factory, SDK integration for deployment and reading, and proper delta handling in routingModuleDelta.
+- c70b2159ff: Add enumerable domains() interface for contracts with ChainMap
+- c07a406a48: Added TimelockRouter, a combined hook and ISM for time-delayed message verification. Enables optimistic security patterns where messages must wait a configurable timelock window before verification, allowing time for off-chain observation and watcher intervention.
+
+### Patch Changes
+
+- fc9e1af786: Revert in hooks when fee token denominations are mixed
+- bf5fb9d0c3: Restrict timelock hook to Mailbox dispatched messages
+
+## 10.2.0
+
+### Minor Changes
+
+- 521d42b: Add tron artifacts
+
 ## 10.1.5
 
 ### Patch Changes
@@ -11,30 +197,29 @@
 ### Patch Changes
 
 - Updated dependencies [0bce4e7]
-  - @hyperlane-xyz/utils@21.0.0
+    - @hyperlane-xyz/utils@21.0.0
 
 ## 10.1.3
 
 ### Patch Changes
 
 - 11fa887: Upgrade TypeScript from 5.3.3 to 5.8.3 and compilation target to ES2023
-
-  - Upgraded TypeScript from 5.3.3 to 5.8.3 across all packages
-  - Updated compilation target from ES2022 to ES2023 (Node 16+ fully supported)
-  - Converted internal const enums to 'as const' pattern for better compatibility
-  - Updated @types/node from ^18.14.5 to ^20.17.0 for TypeScript 5.7+ compatibility
-  - Fixed JSON imports to use required 'with { type: "json" }' attribute (TS 5.7+ requirement)
-  - No breaking changes to public API - all changes are internal or non-breaking
+    - Upgraded TypeScript from 5.3.3 to 5.8.3 across all packages
+    - Updated compilation target from ES2022 to ES2023 (Node 16+ fully supported)
+    - Converted internal const enums to 'as const' pattern for better compatibility
+    - Updated @types/node from ^18.14.5 to ^20.17.0 for TypeScript 5.7+ compatibility
+    - Fixed JSON imports to use required 'with { type: "json" }' attribute (TS 5.7+ requirement)
+    - No breaking changes to public API - all changes are internal or non-breaking
 
 - Updated dependencies [11fa887]
-  - @hyperlane-xyz/utils@20.1.0
+    - @hyperlane-xyz/utils@20.1.0
 
 ## 10.1.2
 
 ### Patch Changes
 
 - Updated dependencies [b3ebc08]
-  - @hyperlane-xyz/utils@20.0.0
+    - @hyperlane-xyz/utils@20.0.0
 
 ## 10.1.1
 
@@ -53,7 +238,7 @@
 - Updated dependencies [08cf7eca9]
 - Updated dependencies [af2cd1729]
 - Updated dependencies [e37100e2e]
-  - @hyperlane-xyz/utils@19.12.0
+    - @hyperlane-xyz/utils@19.12.0
 
 ## 10.0.5
 
@@ -69,14 +254,14 @@
 - 29ad1d225: Fix bug that prevents addBridge to be called multiple times with the same address on collateral token adapters
 - Updated dependencies [aad2988c9]
 - Updated dependencies [c2a64e8c5]
-  - @hyperlane-xyz/utils@19.10.0
+    - @hyperlane-xyz/utils@19.10.0
 
 ## 10.0.3
 
 ### Patch Changes
 
 - Updated dependencies [8c027d852]
-  - @hyperlane-xyz/utils@19.9.0
+    - @hyperlane-xyz/utils@19.9.0
 
 ## 10.0.2
 
@@ -85,7 +270,7 @@
 - Updated dependencies [2ed21c97d]
 - Updated dependencies [78ff6cd47]
 - Updated dependencies [3f75ad86d]
-  - @hyperlane-xyz/utils@19.8.0
+    - @hyperlane-xyz/utils@19.8.0
 
 ## 10.0.1
 
@@ -99,21 +284,21 @@
 
 - 18c32ed2b: Refactor warp route contracts for shallower inheritance tree and smaller bytecode size.
 
-  Deprecated `Router` and `GasRouter` internal functions have been removed.
+    Deprecated `Router` and `GasRouter` internal functions have been removed.
 
-  `FungibleTokenRouter` has been removed and functionality lifted into `TokenRouter`.
+    `FungibleTokenRouter` has been removed and functionality lifted into `TokenRouter`.
 
-  `quoteTransferRemote` and `transferRemote` can no longer be overridden with optional `hook` and `hookMetadata` for simplicity.
+    `quoteTransferRemote` and `transferRemote` can no longer be overridden with optional `hook` and `hookMetadata` for simplicity.
 
-  `quoteTransferRemote` returns a consistent shape of `[nativeMailboxDispatchFee, internalTokenFee, externalTokenFee]`.
+    `quoteTransferRemote` returns a consistent shape of `[nativeMailboxDispatchFee, internalTokenFee, externalTokenFee]`.
 
-  `HypNative` and `HypERC20Collateral` inherit from `MovableCollateral` and `LpCollateral` but other extensions (eg `HypXERC20`) do not. Storage layouts have been preserved to ensure upgrade compatibility.
+    `HypNative` and `HypERC20Collateral` inherit from `MovableCollateral` and `LpCollateral` but other extensions (eg `HypXERC20`) do not. Storage layouts have been preserved to ensure upgrade compatibility.
 
 - dd16e3df4: Add LP interface to collateral routers
 
-  The `balanceOf` function has been removed from `TokenRouter` to remove ambiguity between `LpCollateralRouter.balanceOf`.
+    The `balanceOf` function has been removed from `TokenRouter` to remove ambiguity between `LpCollateralRouter.balanceOf`.
 
-  To migrate, use the new `TokenRouter.token()` to get an `IERC20` or `IERC721` compliant address that you can call `balanceOf` on.
+    To migrate, use the new `TokenRouter.token()` to get an `IERC20` or `IERC721` compliant address that you can call `balanceOf` on.
 
 ### Minor Changes
 
@@ -122,9 +307,9 @@
 - 799751606: Extend CCTP TokenBridge with GMP support via hook
 - e0c69e255: Implement token fees on FungibleTokenRouter
 
-  Removes `metadata` from return type of internal `TokenRouter._transferFromSender` hook
+    Removes `metadata` from return type of internal `TokenRouter._transferFromSender` hook
 
-  To append `metadata` to `TokenMessage`, override the `TokenRouter._beforeDispatch` hook
+    To append `metadata` to `TokenMessage`, override the `TokenRouter._beforeDispatch` hook
 
 - 737ea2b35: feat: emit event on protocol fee payment
 - e0c69e255: Adds fees to FungibleTokenRouter
@@ -139,21 +324,21 @@
 - f930794d7: Update Yield Routes (HypERC4626OwnerCollateral and HypERC4626Collateral) to use safeApprove
 - 9a43cdca9: Remove absolute imports. Fixes compilation for users who import from files under `solidity/contracts`.
 - Updated dependencies [419e16910]
-  - @hyperlane-xyz/utils@19.6.0
+    - @hyperlane-xyz/utils@19.6.0
 
 ## 9.0.17
 
 ### Patch Changes
 
 - Updated dependencies [312826d10]
-  - @hyperlane-xyz/utils@19.5.0
+    - @hyperlane-xyz/utils@19.5.0
 
 ## 9.0.16
 
 ### Patch Changes
 
 - Updated dependencies [5a4e22d34]
-  - @hyperlane-xyz/utils@19.4.0
+    - @hyperlane-xyz/utils@19.4.0
 
 ## 9.0.15
 
@@ -186,7 +371,7 @@
 - Updated dependencies [8eab305bd]
 - Updated dependencies [e42a0e8e1]
 - Updated dependencies [32479e139]
-  - @hyperlane-xyz/utils@19.0.0
+    - @hyperlane-xyz/utils@19.0.0
 
 ## 9.0.10
 
@@ -196,7 +381,7 @@
 - Updated dependencies [c41bc3b93]
 - Updated dependencies [2c47e1143]
 - Updated dependencies [6b8419370]
-  - @hyperlane-xyz/utils@18.3.0
+    - @hyperlane-xyz/utils@18.3.0
 
 ## 9.0.9
 
@@ -215,7 +400,7 @@
 ### Patch Changes
 
 - Updated dependencies [cfc0eb2a7]
-  - @hyperlane-xyz/utils@18.0.0
+    - @hyperlane-xyz/utils@18.0.0
 
 ## 9.0.6
 
@@ -223,7 +408,7 @@
 
 - Updated dependencies [8c15edc67]
 - Updated dependencies [e0bda316a]
-  - @hyperlane-xyz/utils@17.0.0
+    - @hyperlane-xyz/utils@17.0.0
 
 ## 9.0.5
 
@@ -255,7 +440,7 @@
 
 - Updated dependencies [451f3f6c3]
 - Updated dependencies [a33c8abd4]
-  - @hyperlane-xyz/utils@15.0.0
+    - @hyperlane-xyz/utils@15.0.0
 
 ## 9.0.0
 
@@ -278,7 +463,7 @@
 ### Patch Changes
 
 - c177c4733: Remove absolute imports. Fixes compilation for users who import from files under `solidity/contracts`.
-  - @hyperlane-xyz/utils@14.2.0
+    - @hyperlane-xyz/utils@14.2.0
 
 ## 8.1.0
 
@@ -290,14 +475,14 @@
 
 - bd91094c3: Export CONTRACTS_PACKAGE_VERSION from core package.
 - 04fc563f4: Fix TokenBridgeCCTP.verify burn message sender enforcement
-  - @hyperlane-xyz/utils@14.1.0
+    - @hyperlane-xyz/utils@14.1.0
 
 ## 8.0.2
 
 ### Patch Changes
 
 - Updated dependencies [7ad8e394c]
-  - @hyperlane-xyz/utils@14.0.0
+    - @hyperlane-xyz/utils@14.0.0
 
 ## 8.0.1
 
@@ -306,7 +491,7 @@
 - Updated dependencies [0ec92f775]
 - Updated dependencies [ec8d196d9]
 - Updated dependencies [bacf16a80]
-  - @hyperlane-xyz/utils@13.4.0
+    - @hyperlane-xyz/utils@13.4.0
 
 ## 8.0.0
 
@@ -316,26 +501,24 @@
 - 4544120: Update ICA router event emission with salt and commitment
 - 119a1a8: Remove `accountOwners` from `InterchainAccountRouter`
 
-  This reverse mapping was intended to index from a given proxy account what the corresponding derivation inputs were.
+    This reverse mapping was intended to index from a given proxy account what the corresponding derivation inputs were.
 
-  However, this implied 2 cold SSTORE instructions per account creation.
+    However, this implied 2 cold SSTORE instructions per account creation.
 
-  Instead, the `InterchainAccountCreated` event can be used which now has an `indexed` account key to filter by.
+    Instead, the `InterchainAccountCreated` event can be used which now has an `indexed` account key to filter by.
 
 ### Minor Changes
 
 - db19435: Add Rebalancing Multi-Collateral Warp Routes
 - b977a28: Add call commitments (shielded calls) to ICA Router
-
-  - Add `callRemoteCommitReveal`
-  - Add `MessageType` to `InterchainAccountMessage`
-  - Make ICA Router its own ISM, and route to ica included in message
+    - Add `callRemoteCommitReveal`
+    - Add `MessageType` to `InterchainAccountMessage`
+    - Make ICA Router its own ISM, and route to ica included in message
 
 - 7a3165f: Allow users to pass salts in ICA derivation
 - b977a28: Add multiple TokenBridge contracts
-
-  - Add OP Stack TokenBridge
-  - Add CCTP TokenBridge
+    - Add OP Stack TokenBridge
+    - Add CCTP TokenBridge
 
 - 88fe35f: Add Rebalancing Warp Route for Native Tokens
 - 3327a6e: Add MovableCollateralRouter, a router whose collateral can be removed to a remote chain
@@ -343,7 +526,7 @@
 ### Patch Changes
 
 - fd3bb39: Use SafeERC20.safeApprove instead of IERC20.approve in HypXERC20Lockbox.approveLockbox()
-  - @hyperlane-xyz/utils@13.3.0
+    - @hyperlane-xyz/utils@13.3.0
 
 ## 7.1.10
 
@@ -351,7 +534,7 @@
 
 - 72887f7: Update to ethers v5.8.0.
 - Updated dependencies [72887f7]
-  - @hyperlane-xyz/utils@13.2.1
+    - @hyperlane-xyz/utils@13.2.1
 
 ## 7.1.9
 
@@ -365,21 +548,21 @@
 
 - ba4deea: Revert workspace dependency syntax.
 - Updated dependencies [ba4deea]
-  - @hyperlane-xyz/utils@13.1.1
+    - @hyperlane-xyz/utils@13.1.1
 
 ## 7.1.7
 
 ### Patch Changes
 
 - Updated dependencies [f41f766]
-  - @hyperlane-xyz/utils@13.1.0
+    - @hyperlane-xyz/utils@13.1.0
 
 ## 7.1.6
 
 ### Patch Changes
 
 - Updated dependencies [0de63e0]
-  - @hyperlane-xyz/utils@13.0.0
+    - @hyperlane-xyz/utils@13.0.0
 
 ## 7.1.5
 
@@ -387,7 +570,7 @@
 
 - Updated dependencies [d182d7d]
 - Updated dependencies [b360802]
-  - @hyperlane-xyz/utils@12.6.0
+    - @hyperlane-xyz/utils@12.6.0
 
 ## 7.1.4
 
@@ -406,7 +589,7 @@
 ### Patch Changes
 
 - Updated dependencies [7500bd6fe]
-  - @hyperlane-xyz/utils@12.3.0
+    - @hyperlane-xyz/utils@12.3.0
 
 ## 7.1.1
 
@@ -431,44 +614,43 @@
 - 59a087ded: Remove unused FastTokenRouter
 - 59a087ded: ## Changes
 
-  Add immutable `scale` parameter to all warp route variants which scales outbound amounts **down** and inbound amounts **up**. This is useful when different chains of the route have different decimal places to unify semantics of amounts in messages.
+    Add immutable `scale` parameter to all warp route variants which scales outbound amounts **down** and inbound amounts **up**. This is useful when different chains of the route have different decimal places to unify semantics of amounts in messages.
 
-  Removes `HypNativeScaled` in favor of `HypNative` with `scale` parameter.
+    Removes `HypNativeScaled` in favor of `HypNative` with `scale` parameter.
 
-  ## Migration
+    ## Migration
 
-  If you want to keep the same behavior as before, you can set `scale` to `1` in all your routes.
+    If you want to keep the same behavior as before, you can set `scale` to `1` in all your routes.
 
-  ### `HypNativeScaled` Usage
+    ### `HypNativeScaled` Usage
 
-  ```diff
-  - HypNativeScaled(scale, mailbox)
-  + HypNative(scale, mailbox)
-  ```
+    ```diff
+    - HypNativeScaled(scale, mailbox)
+    + HypNative(scale, mailbox)
+    ```
 
-  ### `HypERC20` Usage
+    ### `HypERC20` Usage
 
-  ```diff
-  - HypERC20(decimals, mailbox)
-  + HypERC20(decimals, scale, mailbox)
-  ```
+    ```diff
+    - HypERC20(decimals, mailbox)
+    + HypERC20(decimals, scale, mailbox)
+    ```
 
-  ### `HypERC20Collateral` Usage
+    ### `HypERC20Collateral` Usage
 
-  ```diff
-  - HypERC20Collateral(erc20, mailbox)
-  + HypERC20Collateral(erc20, scale, mailbox)
-  ```
+    ```diff
+    - HypERC20Collateral(erc20, mailbox)
+    + HypERC20Collateral(erc20, scale, mailbox)
+    ```
 
 ### Minor Changes
 
 - 07321f6f0: Add ZKSync support and restructure build artifacts:
-
-  - Add ZKSync compilation support
-  - Restructure typechain directory location to core-utils/typechain
-  - Add ZKSync-specific artifact generation and exports
-  - Update build process to handle both standard and ZKSync artifacts
-  - Add new exports for ZKSync build artifacts and contract types
+    - Add ZKSync compilation support
+    - Restructure typechain directory location to core-utils/typechain
+    - Add ZKSync-specific artifact generation and exports
+    - Update build process to handle both standard and ZKSync artifacts
+    - Add new exports for ZKSync build artifacts and contract types
 
 - 59a087ded: Fixed misuse of aggregation hook funds for relaying messages by making sure msg.value is adequate and refunding if excess.
 
@@ -476,24 +658,23 @@
 
 - 59a087ded: Refactor TokenRouter internal amount accounting for use in scaling Warp Routes
 - 59a087ded: Fix yield route (`HypERC4626`/`HypERC4626Collateral`) decimal scaling by leveraging `FungibleTokenRouter`
-  - @hyperlane-xyz/utils@12.0.0
+    - @hyperlane-xyz/utils@12.0.0
 
 ## 6.1.0
 
 ### Minor Changes
 
 - cd0424595: Add ZKSync support and restructure build artifacts:
-
-  - Add ZKSync compilation support
-  - Restructure typechain directory location to core-utils/typechain
-  - Add ZKSync-specific artifact generation and exports
-  - Update build process to handle both standard and ZKSync artifacts
-  - Add new exports for ZKSync build artifacts and contract types
+    - Add ZKSync compilation support
+    - Restructure typechain directory location to core-utils/typechain
+    - Add ZKSync-specific artifact generation and exports
+    - Update build process to handle both standard and ZKSync artifacts
+    - Add new exports for ZKSync build artifacts and contract types
 
 ### Patch Changes
 
 - Updated dependencies [3b060c3e1]
-  - @hyperlane-xyz/utils@11.0.0
+    - @hyperlane-xyz/utils@11.0.0
 
 ## 6.0.4
 
@@ -501,7 +682,7 @@
 
 - fff9cbf57: pin zksync deps from ccip package
 - Updated dependencies [b8d95fc95]
-  - @hyperlane-xyz/utils@10.0.0
+    - @hyperlane-xyz/utils@10.0.0
 
 ## 6.0.3
 
@@ -527,34 +708,34 @@
 
 - 88970a78c: ## Changes
 
-  Add immutable `scale` parameter to all warp route variants which scales outbound amounts **down** and inbound amounts **up**. This is useful when different chains of the route have different decimal places to unify semantics of amounts in messages.
+    Add immutable `scale` parameter to all warp route variants which scales outbound amounts **down** and inbound amounts **up**. This is useful when different chains of the route have different decimal places to unify semantics of amounts in messages.
 
-  Removes `HypNativeScaled` in favor of `HypNative` with `scale` parameter.
+    Removes `HypNativeScaled` in favor of `HypNative` with `scale` parameter.
 
-  ## Migration
+    ## Migration
 
-  If you want to keep the same behavior as before, you can set `scale` to `1` in all your routes.
+    If you want to keep the same behavior as before, you can set `scale` to `1` in all your routes.
 
-  ### `HypNativeScaled` Usage
+    ### `HypNativeScaled` Usage
 
-  ```diff
-  - HypNativeScaled(scale, mailbox)
-  + HypNative(scale, mailbox)
-  ```
+    ```diff
+    - HypNativeScaled(scale, mailbox)
+    + HypNative(scale, mailbox)
+    ```
 
-  ### `HypERC20` Usage
+    ### `HypERC20` Usage
 
-  ```diff
-  - HypERC20(decimals, mailbox)
-  + HypERC20(decimals, scale, mailbox)
-  ```
+    ```diff
+    - HypERC20(decimals, mailbox)
+    + HypERC20(decimals, scale, mailbox)
+    ```
 
-  ### `HypERC20Collateral` Usage
+    ### `HypERC20Collateral` Usage
 
-  ```diff
-  - HypERC20Collateral(erc20, mailbox)
-  + HypERC20Collateral(erc20, scale, mailbox)
-  ```
+    ```diff
+    - HypERC20Collateral(erc20, mailbox)
+    + HypERC20Collateral(erc20, scale, mailbox)
+    ```
 
 ### Minor Changes
 
@@ -564,7 +745,7 @@
 
 - 88970a78c: Refactor TokenRouter internal amount accounting for use in scaling Warp Routes
 - Updated dependencies [4df37393f]
-  - @hyperlane-xyz/utils@9.0.0
+    - @hyperlane-xyz/utils@9.0.0
 
 ## 5.12.0
 
@@ -583,7 +764,7 @@
 - 27eadbfc3: Add internal refund logic to hooks
 - Updated dependencies [05f89650b]
 - Updated dependencies [3518f8901]
-  - @hyperlane-xyz/utils@8.9.0
+    - @hyperlane-xyz/utils@8.9.0
 
 ## 5.11.6
 
@@ -614,14 +795,14 @@
 ### Patch Changes
 
 - ba50e62fc: Added ESLint configuration and dependency to enforce Node.js module restrictions
-  - @hyperlane-xyz/utils@8.6.0
+    - @hyperlane-xyz/utils@8.6.0
 
 ## 5.11.1
 
 ### Patch Changes
 
 - 044665692: Make `initialize` function public virtual
-  - @hyperlane-xyz/utils@8.5.0
+    - @hyperlane-xyz/utils@8.5.0
 
 ## 5.11.0
 
@@ -638,17 +819,16 @@
 ### Minor Changes
 
 - db8c09011: Add ZKSync support and restructure build artifacts:
-
-  - Add ZKSync compilation support
-  - Restructure typechain directory location to core-utils/typechain
-  - Add ZKSync-specific artifact generation and exports
-  - Update build process to handle both standard and ZKSync artifacts
-  - Add new exports for ZKSync build artifacts and contract types
+    - Add ZKSync compilation support
+    - Restructure typechain directory location to core-utils/typechain
+    - Add ZKSync-specific artifact generation and exports
+    - Update build process to handle both standard and ZKSync artifacts
+    - Add new exports for ZKSync build artifacts and contract types
 
 ### Patch Changes
 
 - 11cf66c5e: Export empty zksync buildArtifact to satisfy package.json exports
-  - @hyperlane-xyz/utils@8.3.0
+    - @hyperlane-xyz/utils@8.3.0
 
 ## 5.9.2
 
@@ -672,7 +852,7 @@
 
 - Updated dependencies [79f8197f3]
 - Updated dependencies [8834a8c92]
-  - @hyperlane-xyz/utils@8.0.0
+    - @hyperlane-xyz/utils@8.0.0
 
 ## 5.8.3
 
@@ -685,14 +865,14 @@
 ### Patch Changes
 
 - Updated dependencies [fa6d5f5c6]
-  - @hyperlane-xyz/utils@7.2.0
+    - @hyperlane-xyz/utils@7.2.0
 
 ## 5.8.1
 
 ### Patch Changes
 
 - Updated dependencies [0e285a443]
-  - @hyperlane-xyz/utils@7.1.0
+    - @hyperlane-xyz/utils@7.1.0
 
 ## 5.8.0
 
@@ -704,14 +884,14 @@
 
 - Updated dependencies [f48cf8766]
 - Updated dependencies [e6f9d5c4f]
-  - @hyperlane-xyz/utils@7.0.0
+    - @hyperlane-xyz/utils@7.0.0
 
 ## 5.7.1
 
 ### Patch Changes
 
 - Updated dependencies [e3b97c455]
-  - @hyperlane-xyz/utils@6.0.0
+    - @hyperlane-xyz/utils@6.0.0
 
 ## 5.7.0
 
@@ -727,7 +907,7 @@
 - Updated dependencies [e104cf6aa]
 - Updated dependencies [04108155d]
 - Updated dependencies [39a9b2038]
-  - @hyperlane-xyz/utils@5.7.0
+    - @hyperlane-xyz/utils@5.7.0
 
 ## 5.6.1
 
@@ -736,7 +916,7 @@
 - a42616ff3: Added overrides for transferFrom, totalSupply to reflect the internal share based accounting for the 4626 mirror asset
 - Updated dependencies [5fd4267e7]
 - Updated dependencies [a36fc5fb2]
-  - @hyperlane-xyz/utils@5.6.2
+    - @hyperlane-xyz/utils@5.6.2
 
 ## 5.6.0
 
@@ -748,7 +928,7 @@
 ### Patch Changes
 
 - 8cc0d9a4a: Add wrapped HypERC4626 for easy defi use
-  - @hyperlane-xyz/utils@5.6.1
+    - @hyperlane-xyz/utils@5.6.1
 
 ## 5.5.0
 
@@ -762,7 +942,7 @@
 - ec6b874b1: Added nonce to HypERC4626
 - Updated dependencies [f1712deb7]
 - Updated dependencies [29341950e]
-  - @hyperlane-xyz/utils@5.6.0
+    - @hyperlane-xyz/utils@5.6.0
 
 ## 5.4.1
 
@@ -770,7 +950,7 @@
 
 - 92c86cca6: Forward value from ICA router to proxy for multicall
 - Updated dependencies [2afc484a2]
-  - @hyperlane-xyz/utils@5.5.0
+    - @hyperlane-xyz/utils@5.5.0
 
 ## 5.4.0
 
@@ -782,7 +962,7 @@
 ### Patch Changes
 
 - Updated dependencies [4415ac224]
-  - @hyperlane-xyz/utils@5.4.0
+    - @hyperlane-xyz/utils@5.4.0
 
 ## 5.3.0
 
@@ -790,14 +970,14 @@
 
 - Updated dependencies [746eeb9d9]
 - Updated dependencies [50319d8ba]
-  - @hyperlane-xyz/utils@5.3.0
+    - @hyperlane-xyz/utils@5.3.0
 
 ## 5.2.1
 
 ### Patch Changes
 
 - eb5afcf3e: Patch `HypNative` with hook overrides `transferRemote` behavior
-  - @hyperlane-xyz/utils@5.2.1
+    - @hyperlane-xyz/utils@5.2.1
 
 ## 5.2.0
 
@@ -810,7 +990,7 @@
 
 - Updated dependencies [d6de34ad5]
 - Updated dependencies [291c5fe36]
-  - @hyperlane-xyz/utils@5.2.0
+    - @hyperlane-xyz/utils@5.2.0
 
 ## 5.1.0
 
@@ -825,7 +1005,7 @@
 ### Patch Changes
 
 - 013f19c64: fix: only evaluate dynamic revert reasons in reverting branch
-  - @hyperlane-xyz/utils@5.1.0
+    - @hyperlane-xyz/utils@5.1.0
 
 ## 5.0.0
 
@@ -836,7 +1016,7 @@
 - Updated dependencies [488f949ef]
 - Updated dependencies [dfa908796]
 - Updated dependencies [1474865ae]
-  - @hyperlane-xyz/utils@5.0.0
+    - @hyperlane-xyz/utils@5.0.0
 
 ## 4.1.0
 
@@ -865,7 +1045,7 @@
 ### Patch Changes
 
 - 6620fe636: fix: `TokenRouter.transferRemote` with hook overrides
-  - @hyperlane-xyz/utils@3.15.1
+    - @hyperlane-xyz/utils@3.15.1
 
 ## 3.15.0
 
@@ -883,7 +1063,7 @@
 ### Patch Changes
 
 - a8a68f6f6: fix: make XERC20 and XERC20 Lockbox proxy-able
-  - @hyperlane-xyz/utils@3.14.0
+    - @hyperlane-xyz/utils@3.14.0
 
 ## 3.13.0
 
@@ -895,14 +1075,14 @@
 ### Patch Changes
 
 - Updated dependencies [0cf692e73]
-  - @hyperlane-xyz/utils@3.13.0
+    - @hyperlane-xyz/utils@3.13.0
 
 ## 3.12.0
 
 ### Patch Changes
 
 - Updated dependencies [69de68a66]
-  - @hyperlane-xyz/utils@3.12.0
+    - @hyperlane-xyz/utils@3.12.0
 
 ## 3.11.1
 
@@ -922,7 +1102,7 @@
 - Updated dependencies [b63714ede]
 - Updated dependencies [2b3f75836]
 - Updated dependencies [af2634207]
-  - @hyperlane-xyz/utils@3.11.0
+    - @hyperlane-xyz/utils@3.11.0
 
 ## 3.10.0
 
@@ -935,7 +1115,7 @@
 
 - Updated dependencies [96485144a]
 - Updated dependencies [4e7a43be6]
-  - @hyperlane-xyz/utils@3.10.0
+    - @hyperlane-xyz/utils@3.10.0
 
 ## 3.9.0
 
@@ -954,7 +1134,7 @@
 ### Patch Changes
 
 - Updated dependencies [5daaae274]
-  - @hyperlane-xyz/utils@3.8.1
+    - @hyperlane-xyz/utils@3.8.1
 
 ## 3.8.0
 
@@ -962,16 +1142,15 @@
 
 - 9681df08d: Remove support for goerli networks (including optimismgoerli, arbitrumgoerli, lineagoerli and polygonzkevmtestnet)
 - 9681df08d: Enabled verification of contracts as part of the deployment flow.
-
-  - Solidity build artifact is now included as part of the `@hyperlane-xyz/core` package.
-  - Updated the `HyperlaneDeployer` to perform contract verification immediately after deploying a contract. A default verifier is instantiated using the core build artifact.
-  - Updated the `HyperlaneIsmFactory` to re-use the `HyperlaneDeployer` for deployment where possible.
-  - Minor logging improvements throughout deployers.
+    - Solidity build artifact is now included as part of the `@hyperlane-xyz/core` package.
+    - Updated the `HyperlaneDeployer` to perform contract verification immediately after deploying a contract. A default verifier is instantiated using the core build artifact.
+    - Updated the `HyperlaneIsmFactory` to re-use the `HyperlaneDeployer` for deployment where possible.
+    - Minor logging improvements throughout deployers.
 
 ### Patch Changes
 
 - Updated dependencies [9681df08d]
-  - @hyperlane-xyz/utils@3.8.0
+    - @hyperlane-xyz/utils@3.8.0
 
 ## 3.7.0
 
@@ -993,7 +1172,7 @@
 - Updated dependencies [3c298d064]
 - Updated dependencies [df24eec8b]
 - Updated dependencies [78e50e7da]
-  - @hyperlane-xyz/utils@3.6.1
+    - @hyperlane-xyz/utils@3.6.1
 
 ## 3.6.0
 
@@ -1019,14 +1198,14 @@
 
 - e06fe0b32: Supporting DefaultFallbackRoutingIsm through non-factory deployments
 - Updated dependencies [fd4fc1898]
-  - @hyperlane-xyz/utils@3.4.0
+    - @hyperlane-xyz/utils@3.4.0
 
 ## 3.3.0
 
 ### Patch Changes
 
 - 350175581: Rename StaticProtocolFee hook to ProtocolFee for clarity
-  - @hyperlane-xyz/utils@3.3.0
+    - @hyperlane-xyz/utils@3.3.0
 
 ## 3.2.0
 
@@ -1043,4 +1222,4 @@
 ### Patch Changes
 
 - c9e0aedae: Improve client side StandardHookMetadata library interface
-  - @hyperlane-xyz/utils@3.1.10
+    - @hyperlane-xyz/utils@3.1.10

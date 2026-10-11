@@ -15,7 +15,7 @@ import {
   QueryMsg,
   RequiredHookResponse,
 } from '../../cw-types/Mailbox.types.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
 import {
   ProviderType,
   TypedTransactionReceipt,
@@ -44,7 +44,7 @@ export class CosmWasmCoreAdapter
 {
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider<any>,
+    public readonly multiProvider: MultiProviderAdapter<any>,
     public readonly addresses: { mailbox: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -166,9 +166,9 @@ export class CosmWasmCoreAdapter
     return response.delivered;
   }
 
-  extractMessageIds(
+  async extractMessageIds(
     sourceTx: TypedTransactionReceipt,
-  ): Array<{ messageId: string; destination: ChainName }> {
+  ): Promise<Array<{ messageId: string; destination: ChainName }>> {
     if (sourceTx.type !== ProviderType.CosmJsWasm) {
       throw new Error(
         `Unsupported provider type for CosmosCoreAdapter ${sourceTx.type}`,
@@ -209,5 +209,12 @@ export class CosmWasmCoreAdapter
     _maxAttempts?: number,
   ): Promise<boolean> {
     throw new Error('Method not implemented.');
+  }
+
+  async isDelivered(
+    messageId: HexString,
+    _blockTag?: string | number,
+  ): Promise<boolean> {
+    return this.delivered(messageId);
   }
 }

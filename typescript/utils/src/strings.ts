@@ -1,5 +1,7 @@
 import { ensure0x, strip0x } from './addresses.js';
 
+export { formatError } from './errors.js';
+
 export function toTitleCase(str: string) {
   return str.replace(/\w\S*/g, (txt) => {
     return txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase();
@@ -31,7 +33,9 @@ export function streamToString(stream: NodeJS.ReadableStream): Promise<string> {
     stream
       .setEncoding('utf8')
       .on('data', (chunk) => chunks.push(chunk))
-      .on('error', (err) => reject(err))
+      .on('error', (err) =>
+        reject(err instanceof Error ? err : new Error(String(err))),
+      )
       .on('end', () => resolve(String.prototype.concat(...chunks)));
   });
 }

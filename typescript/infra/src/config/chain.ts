@@ -5,75 +5,85 @@ import {
   ChainMap,
   ChainMetadata,
   ChainName,
+  ChainStatus,
   HyperlaneSmartProvider,
   ProviderRetryOptions,
   safeApiKeyRequired,
 } from '@hyperlane-xyz/sdk';
 import {
   Address,
-  ProtocolType,
   inCIMode,
   inKubernetes,
+  isEVMLike,
   objFilter,
   objMerge,
+  rootLogger,
 } from '@hyperlane-xyz/utils';
 
-import { getChain, getRegistryWithOverrides } from '../../config/registry.js';
+import {
+  getChain,
+  getChainMetadata,
+  getRegistryWithOverrides,
+} from '../../config/registry.js';
 import { getSecretRpcEndpoints } from '../agents/index.js';
-import { getSafeApiKey } from '../utils/safe.js';
+import { fetchExplorerApiKeys } from '../deployment/verify.js';
+import { getSafeApiKey } from '../utils/safeApiKey.js';
 
-import { DeployEnvironment } from './environment.js';
+import { DeployEnvironment } from './deploy-environment.js';
 
-// V2 ICAs are not supported on these chains, due to the block gas limit being
-// lower than the amount required to deploy the new InterchainAccountRouter
-// implementation.
-export const legacyIcaChainRouters: Record<
-  ChainName,
-  {
-    interchainAccountIsm: Address;
-    interchainAccountRouter: Address;
-  }
-> = {
-  viction: {
-    interchainAccountIsm: '0x551BbEc45FD665a8C95ca8731CbC32b7653Bc59B',
-    interchainAccountRouter: '0xc11f8Cf2343d3788405582F65B8af6A4F7a6FfC8',
-  },
-  ontology: {
-    interchainAccountIsm: '0x8BdD5bf519714515083801448A99F84882A8F61E',
-    interchainAccountRouter: '0x718f11e349374481Be8c8B7589eC4B4316ddDCc2',
-  },
+// Historical routers retained for contracts still owned by legacy ICAs.
+// Viction's current router is deployed; migration calls use this old pair.
+export const legacyIcaChainRouters: Record<ChainName, Address> = {
+  viction: '0xc11f8Cf2343d3788405582F65B8af6A4F7a6FfC8',
 };
-export const legacyIcaChains = Object.keys(legacyIcaChainRouters);
 export const legacyEthIcaRouter = '0x5E532F7B610618eE73C2B462978e94CB1F7995Ce';
+
+// Chains that require MinimalInterchainAccountRouter due to deployment size limits
+export const minimalIcaChains: ChainName[] = ['igra'];
+
+// Chains marked as disabled in registry metadata.
+// Derived programmatically from chain availability status.
+export function getDisabledChains(): ChainName[] {
+  return Object.entries(getChainMetadata())
+    .filter(([_, meta]) => meta.availability?.status === ChainStatus.Disabled)
+    .map(([name]) => name);
+}
+
+// Chains that should keep the legacy IGP path. Deploy flows should recover
+// existing IGP deployments and skip latest-only contracts on these chains.
+// Disabled chains are included so operations never try to auto-heal them from
+// legacy recover-only deployments to latest IGP deployments while disabled.
+export const legacyIgpChains: ChainName[] = Array.from(
+  new Set([
+    'coti',
+    'electroneum',
+    'metis',
+    'torus',
+
+    // Keep chains with repeatedly unreliable deployment/proposal execution on
+    // legacy IGP for now.
+    'krown',
+    'pulsechain',
+    'viction',
+    ...getDisabledChains(),
+  ]),
+);
 
 // A list of chains to skip during deploy, check-deploy and ICA operations.
 // Used by scripts like check-owner-ica.ts to exclude chains that are temporarily
-// unsupported (e.g. zksync, zeronetwork) or have known issues
+// unsupported or have known issues.
 export const chainsToSkip: ChainName[] = [
-  // downtime
-  'flowmainnet',
-  'molten',
-
   // not AW owned
   'forma',
+  'eden',
 
-  // TODO: remove once zksync PR is merged into main
-  // mainnets
-  'zksync',
-  'zeronetwork',
+  // ZKSync stack chains
   'abstract',
-  'sophon',
 
-  // testnets
-  'abstracttestnet',
+  // temp during downtime
+  'nesa',
 
-  // legacy ICAs
-  'viction',
-  'ontology',
-
-  // legacy icas
-  'carrchaintestnet',
-  'rometestnet',
+  ...getDisabledChains(),
 ];
 
 export const defaultRetry: ProviderRetryOptions = {
@@ -111,13 +121,11 @@ export function getChainMetadatas(chains: Array<ChainName>) {
 
   const ethereumMetadatas = objFilter(
     allMetadatas,
-    (_, metadata): metadata is ChainMetadata =>
-      metadata.protocol === ProtocolType.Ethereum,
+    (_, metadata): metadata is ChainMetadata => isEVMLike(metadata.protocol),
   );
   const nonEthereumMetadatas = objFilter(
     allMetadatas,
-    (_, metadata): metadata is ChainMetadata =>
-      metadata.protocol !== ProtocolType.Ethereum,
+    (_, metadata): metadata is ChainMetadata => !isEVMLike(metadata.protocol),
   );
 
   return { ethereumMetadatas, nonEthereumMetadatas };
@@ -159,7 +167,36 @@ export async function getRegistryForEnvironment(
  * @param chains The chains to get metadata overrides for.
  * @returns A partial chain metadata map with the secret overrides.
  */
-export async function getSecretMetadataOverrides(
+// Process-level cache for secret metadata overrides. Explorer/Safe keys and
+// secret RPC URLs don't change within a single process run, so re-fetching
+// them on every MultiProvider construction is wasteful.
+const secretMetadataOverridesCache = new Map<
+  string,
+  Promise<ChainMap<Partial<ChainMetadata>>>
+>();
+const githubSecretMetadataOverridesCache = new Map<
+  string,
+  Promise<ChainMap<Partial<ChainMetadata>>>
+>();
+
+export function getSecretMetadataOverrides(
+  deployEnv: DeployEnvironment,
+  chains: string[],
+): Promise<ChainMap<Partial<ChainMetadata>>> {
+  const cacheKey = `${deployEnv}:${[...chains].sort().join(',')}`;
+  const cached = secretMetadataOverridesCache.get(cacheKey);
+  if (cached) return cached;
+  const promise = fetchSecretMetadataOverrides(deployEnv, chains).catch(
+    (error) => {
+      secretMetadataOverridesCache.delete(cacheKey);
+      throw error;
+    },
+  );
+  secretMetadataOverridesCache.set(cacheKey, promise);
+  return promise;
+}
+
+async function fetchSecretMetadataOverrides(
   deployEnv: DeployEnvironment,
   chains: string[],
 ): Promise<ChainMap<Partial<ChainMetadata>>> {
@@ -177,7 +214,12 @@ export async function getSecretMetadataOverrides(
 
   for (const { chain, rpcUrls } of secretRpcUrls) {
     if (rpcUrls.length === 0) {
-      throw Error(`No secret RPC URLs found for chain: ${chain}`);
+      // Don't throw - just skip the override. The registry will use public RPCs.
+      // This allows warp routes with deprecated chains to still be checked on supported chains.
+      rootLogger.warn(
+        `No secret RPC URLs found for chain: ${chain}. Using public RPCs from registry.`,
+      );
+      continue;
     }
     // Need explicit casting here because Zod expects a non-empty array.
     const metadataRpcUrls = rpcUrls.map((rpcUrl: string) => ({
@@ -196,9 +238,36 @@ export async function getSecretMetadataOverrides(
       const chainMetadata = getChain(chain);
       const txServiceUrl = chainMetadata.gnosisSafeTransactionServiceUrl;
       if (txServiceUrl && safeApiKeyRequired(txServiceUrl)) {
+        chainMetadataOverrides[chain] ??= {};
         chainMetadataOverrides[chain].gnosisSafeApiKey = safeApiKey;
       }
     }
+  }
+
+  // Merge explorer API keys into chain metadata so that block explorer
+  // verification checks (e.g. warp check) use authenticated requests.
+  // These overrides live only in the PartialRegistry layer and are never
+  // persisted back to the on-disk registry.
+  // Only fetch from GCP when running locally (not in k8s), mirroring the Safe
+  // API key handling above: the pod has no GCP identity, and the registry
+  // already provides explorer API keys inline, so the fetch is unnecessary
+  // (and previously fatal) in-cluster.
+  const explorerApiKeys: ChainMap<string> = !inKubernetes()
+    ? await fetchExplorerApiKeys()
+    : {};
+  for (const chain of chains) {
+    const apiKey = explorerApiKeys[chain];
+    if (!apiKey) continue;
+
+    const chainMetadata = getChain(chain);
+    if (!chainMetadata.blockExplorers?.length) continue;
+
+    chainMetadataOverrides[chain] ??= {};
+    chainMetadataOverrides[chain].blockExplorers =
+      chainMetadata.blockExplorers.map((explorer) => ({
+        ...explorer,
+        apiKey,
+      }));
   }
 
   return chainMetadataOverrides;
@@ -213,6 +282,24 @@ export async function getSecretMetadataOverrides(
  * @returns A partial chain metadata map with the secret overrides.
  */
 export async function getSecretMetadataOverridesFromGitHubSecrets(
+  deployEnv: DeployEnvironment,
+  chains: string[],
+): Promise<ChainMap<Partial<ChainMetadata>>> {
+  const cacheKey = `${deployEnv}:${[...chains].sort().join(',')}`;
+  const cached = githubSecretMetadataOverridesCache.get(cacheKey);
+  if (cached) return cached;
+  const promise = fetchSecretMetadataOverridesFromGitHubSecrets(
+    deployEnv,
+    chains,
+  ).catch((error) => {
+    githubSecretMetadataOverridesCache.delete(cacheKey);
+    throw error;
+  });
+  githubSecretMetadataOverridesCache.set(cacheKey, promise);
+  return promise;
+}
+
+async function fetchSecretMetadataOverridesFromGitHubSecrets(
   deployEnv: DeployEnvironment,
   chains: string[],
 ): Promise<ChainMap<Partial<ChainMetadata>>> {

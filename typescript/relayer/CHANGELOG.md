@@ -1,0 +1,934 @@
+# @hyperlane-xyz/relayer
+
+## 4.0.4
+
+### Patch Changes
+
+- Updated dependencies [4efffd5]
+- Updated dependencies [35d3002]
+- Updated dependencies [fe26a26]
+- Updated dependencies [19dbb59]
+  - @hyperlane-xyz/sdk@45.0.1
+  - @hyperlane-xyz/metrics@1.0.4
+  - @hyperlane-xyz/utils@45.0.1
+  - @hyperlane-xyz/core@12.2.0
+
+## 4.0.3
+
+### Patch Changes
+
+- Updated dependencies [e0d3394]
+- Updated dependencies [b83bac5]
+- Updated dependencies [9b9de8d]
+- Updated dependencies [4975a40]
+- Updated dependencies [d02c93e]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [ee50f43]
+- Updated dependencies [12678bc]
+- Updated dependencies [0aeb76a]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [9a59116]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [ebf3922]
+- Updated dependencies [87b2c63]
+- Updated dependencies [28eda66]
+- Updated dependencies [f05bb6d]
+- Updated dependencies [8373a74]
+- Updated dependencies [0015102]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [6f7b511]
+- Updated dependencies [249517a]
+- Updated dependencies [2762075]
+- Updated dependencies [f9cf910]
+- Updated dependencies [323faae]
+- Updated dependencies [55e6699]
+- Updated dependencies [e994943]
+- Updated dependencies [28eda66]
+- Updated dependencies [6eaa8c6]
+- Updated dependencies [11d5de3]
+- Updated dependencies [98ec7d5]
+- Updated dependencies [2a938f3]
+- Updated dependencies [43f89c6]
+- Updated dependencies [4e2ab65]
+- Updated dependencies [4c644c0]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [692cdb4]
+- Updated dependencies [ea5b010]
+- Updated dependencies [b83bac5]
+- Updated dependencies [67f3cd3]
+  - @hyperlane-xyz/sdk@45.0.0
+  - @hyperlane-xyz/metrics@1.0.3
+  - @hyperlane-xyz/core@12.2.0
+  - @hyperlane-xyz/utils@45.0.0
+
+## 4.0.2
+
+### Patch Changes
+
+- Updated dependencies [16df6ee]
+  - @hyperlane-xyz/sdk@44.0.2
+  - @hyperlane-xyz/metrics@1.0.2
+  - @hyperlane-xyz/utils@44.0.2
+  - @hyperlane-xyz/core@12.1.0
+
+## 4.0.1
+
+### Patch Changes
+
+- f269e03: Zod was updated to 4.5.4 to prevent function-valued default factories from running during schema cycle detection and compilation.
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/sdk@44.0.1
+  - @hyperlane-xyz/metrics@1.0.1
+  - @hyperlane-xyz/utils@44.0.1
+  - @hyperlane-xyz/core@12.1.0
+
+## 4.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+### Patch Changes
+
+- Updated dependencies [85c44af]
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/sdk@44.0.0
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/metrics@1.0.0
+  - @hyperlane-xyz/core@12.1.0
+
+## 3.0.0
+
+### Major Changes
+
+- 8bcc7ab: Zod was upgraded to 4.5.2 across the TypeScript workspace. Public schemas and validation types were migrated to Zod 4, recursive fee configuration types were made explicit, application entrypoints adopted compiled parsing, and validation errors were changed to use Zod 4's built-in formatting.
+
+### Patch Changes
+
+- 3c65f58: Multisig metadata builders were updated to read validator checkpoints from GCS announcements in addition to S3.
+- Updated dependencies [0848474]
+- Updated dependencies [e76189e]
+- Updated dependencies [3ced099]
+- Updated dependencies [a00b342]
+- Updated dependencies [b58c7eb]
+- Updated dependencies [60fc463]
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+- Updated dependencies [8d91ef8]
+- Updated dependencies [11f2dee]
+  - @hyperlane-xyz/sdk@43.0.0
+  - @hyperlane-xyz/utils@43.0.0
+  - @hyperlane-xyz/metrics@0.2.40
+  - @hyperlane-xyz/core@12.1.0
+
+## 2.0.0
+
+### Major Changes
+
+- 1b136e1: Added SDK support for the new EVM warp-route flow-limiting ISM contracts:
+
+  - `DefaultIsm` was modeled as `IsmType.MAILBOX_DEFAULT`, deployed with its mailbox, derived through a contract-specific probe, and matched against that mailbox.
+  - `NetFlowRateLimitedHookIsm` and `DelayedFlowRouterHookIsm` were modeled as shared hook/ISM instances with typed config, deployment, derivation, matching, mutable ownership, and delayed-flow counterpart enrollment support. The hook side remains read-only so only the ISM deployment path creates the shared instance.
+  - Hybrid configs were required to sit in an exhaustive aggregation with a supported authenticating sibling. Core default-ISM configs and random mutable-ISM tests reject the warp-route-only hybrids.
+  - Hook and ISM readers use contract-specific probes so NULL-module hybrids are not mistaken for test ISMs and the net-flow hybrid is not mistaken for a plain rate-limited hook.
+  - Delayed-flow `maxDelay` values were bounded to a conservative operational maximum so adding the delay to the on-chain `uint48` timestamp cannot overflow in practical use.
+  - The relayer gained metadata building and decoding for all three types. `RoutingMetadata['type']` now includes `MAILBOX_DEFAULT`; because that exported union widening is breaking, the relayer package receives a major bump.
+  - `HookConfig` was expressed as an explicit union to avoid downstream TypeScript union-complexity failures.
+
+### Patch Changes
+
+- Updated dependencies [1713edd]
+- Updated dependencies [9003bab]
+- Updated dependencies [aa29187]
+- Updated dependencies [f0f8a56]
+- Updated dependencies [1b136e1]
+- Updated dependencies [1b136e1]
+- Updated dependencies [1b136e1]
+- Updated dependencies [9a8bb17]
+  - @hyperlane-xyz/sdk@42.0.0
+  - @hyperlane-xyz/metrics@0.2.39
+  - @hyperlane-xyz/utils@42.0.0
+  - @hyperlane-xyz/core@12.1.0
+
+## 1.1.45
+
+### Patch Changes
+
+- Updated dependencies [c201794]
+  - @hyperlane-xyz/sdk@41.3.1
+  - @hyperlane-xyz/metrics@0.2.38
+  - @hyperlane-xyz/utils@41.3.1
+  - @hyperlane-xyz/core@12.1.0
+
+## 1.1.44
+
+### Patch Changes
+
+- Updated dependencies [4a21153]
+- Updated dependencies [c328efa]
+- Updated dependencies [4a21153]
+- Updated dependencies [4a21153]
+- Updated dependencies [322a418]
+- Updated dependencies [d5d7d1a]
+  - @hyperlane-xyz/sdk@41.3.0
+  - @hyperlane-xyz/metrics@0.2.37
+  - @hyperlane-xyz/utils@41.3.0
+  - @hyperlane-xyz/core@12.1.0
+
+## 1.1.43
+
+### Patch Changes
+
+- Updated dependencies [e7666ef]
+- Updated dependencies [5fac94d]
+- Updated dependencies [5899416]
+- Updated dependencies [5fac94d]
+  - @hyperlane-xyz/sdk@41.2.0
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/metrics@0.2.36
+  - @hyperlane-xyz/utils@41.2.0
+
+## 1.1.42
+
+### Patch Changes
+
+- @hyperlane-xyz/sdk@41.1.0
+- @hyperlane-xyz/metrics@0.2.35
+- @hyperlane-xyz/utils@41.1.0
+- @hyperlane-xyz/core@12.0.0
+
+## 1.1.41
+
+### Patch Changes
+
+- 72738e2: Added SDK support for the Blacklist ISM:
+
+  - Blacklist ISM configs can now be deployed, derived from on-chain state (including the full list of blacklisted message IDs) and matched against existing deployments using exact set equality.
+  - Updates that only add message IDs are applied in-place by submitting a single `blacklist` transaction with the missing IDs.
+  - Updates that drop a currently blacklisted message ID redeploy a fresh ISM, since on-chain entries are append-only and cannot be removed.
+  - Blacklisted message IDs are validated as 32-byte hex strings and normalized to lowercase at config parse time.
+  - The relayer now treats the blacklist ISM as a null-metadata ISM when building message metadata.
+  - `moduleCanCertainlyVerify` reports that a Blacklist ISM cannot certainly verify a message whose ID is in the blacklisted set.
+  - Blacklist ISM configs are validated at parse time to require a mandatory composition: they must be a member of an aggregation whose threshold equals its module count, and are rejected when used standalone, as a routing target, or under a non-exhaustive aggregation.
+
+- Updated dependencies [0057c5d]
+- Updated dependencies [fa19409]
+- Updated dependencies [1a32515]
+- Updated dependencies [1ba623d]
+- Updated dependencies [fcb4331]
+- Updated dependencies [eb24243]
+- Updated dependencies [72738e2]
+- Updated dependencies [fa19409]
+- Updated dependencies [7846658]
+- Updated dependencies [0765fe0]
+- Updated dependencies [b1c6b7e]
+- Updated dependencies [a09ba71]
+- Updated dependencies [d9426bc]
+  - @hyperlane-xyz/sdk@41.0.0
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/metrics@0.2.34
+  - @hyperlane-xyz/core@12.0.0
+
+## 1.1.40
+
+### Patch Changes
+
+- Updated dependencies [745fb77]
+- Updated dependencies [745fb77]
+- Updated dependencies [469da6d]
+- Updated dependencies [745fb77]
+- Updated dependencies [74f3760]
+- Updated dependencies [abeeb52]
+- Updated dependencies [8944dd2]
+- Updated dependencies [eb9c37c]
+- Updated dependencies [3a74600]
+- Updated dependencies [57b1e14]
+- Updated dependencies [f3a6a4e]
+- Updated dependencies [d6e923f]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [5830b8e]
+- Updated dependencies [d3bbedf]
+- Updated dependencies [e5908e9]
+- Updated dependencies [8944dd2]
+- Updated dependencies [89e6a8e]
+- Updated dependencies [c2301b2]
+- Updated dependencies [de37b68]
+- Updated dependencies [1cac66f]
+- Updated dependencies [c0ca851]
+- Updated dependencies [a7f757b]
+- Updated dependencies [4acd9a6]
+- Updated dependencies [c6a2f61]
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/sdk@40.0.0
+  - @hyperlane-xyz/metrics@0.2.33
+  - @hyperlane-xyz/utils@40.0.0
+
+## 1.1.39
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+- Updated dependencies [6c9210b]
+- Updated dependencies [086ec59]
+  - @hyperlane-xyz/sdk@39.1.0
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/metrics@0.2.32
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.38
+
+### Patch Changes
+
+- Updated dependencies [f41f9fd]
+- Updated dependencies [ba0e9c1]
+- Updated dependencies [4ef1fde]
+- Updated dependencies [43eb24a]
+- Updated dependencies [406b5c7]
+- Updated dependencies [11e215e]
+- Updated dependencies [bf7c658]
+- Updated dependencies [7e40466]
+- Updated dependencies [496198d]
+- Updated dependencies [4bebbbf]
+- Updated dependencies [735793b]
+- Updated dependencies [2d398b9]
+- Updated dependencies [15b249c]
+- Updated dependencies [6967bef]
+- Updated dependencies [213f626]
+- Updated dependencies [3811ba9]
+- Updated dependencies [6c2ca1d]
+- Updated dependencies [1a31d04]
+- Updated dependencies [9997aee]
+  - @hyperlane-xyz/sdk@39.0.0
+  - @hyperlane-xyz/metrics@0.2.31
+  - @hyperlane-xyz/utils@39.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.37
+
+### Patch Changes
+
+- Updated dependencies [961a89d]
+- Updated dependencies [2208b91]
+- Updated dependencies [2208b91]
+- Updated dependencies [2208b91]
+- Updated dependencies [197b1e0]
+- Updated dependencies [293abdc]
+  - @hyperlane-xyz/sdk@38.0.0
+  - @hyperlane-xyz/metrics@0.2.30
+  - @hyperlane-xyz/utils@38.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.36
+
+### Patch Changes
+
+- Updated dependencies [92909f8]
+- Updated dependencies [262073e]
+- Updated dependencies [df34a68]
+- Updated dependencies [262073e]
+- Updated dependencies [af8e1f6]
+- Updated dependencies [cc4bdb6]
+- Updated dependencies [c7895b6]
+- Updated dependencies [262073e]
+- Updated dependencies [6e803be]
+- Updated dependencies [cb0c7c9]
+- Updated dependencies [a82c918]
+- Updated dependencies [262073e]
+- Updated dependencies [351cf01]
+- Updated dependencies [5122e71]
+- Updated dependencies [262073e]
+- Updated dependencies [262073e]
+- Updated dependencies [262073e]
+- Updated dependencies [31f8b51]
+- Updated dependencies [955281d]
+- Updated dependencies [9c8b435]
+  - @hyperlane-xyz/sdk@37.0.0
+  - @hyperlane-xyz/metrics@0.2.29
+  - @hyperlane-xyz/utils@37.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.35
+
+### Patch Changes
+
+- Updated dependencies [d288e7b]
+- Updated dependencies [d288e7b]
+- Updated dependencies [d288e7b]
+- Updated dependencies [019201a]
+- Updated dependencies [cc722b8]
+- Updated dependencies [9cd7606]
+- Updated dependencies [2821252]
+- Updated dependencies [a6a3a33]
+- Updated dependencies [2821252]
+- Updated dependencies [d288e7b]
+- Updated dependencies [d288e7b]
+- Updated dependencies [aa41ce4]
+- Updated dependencies [2f9d783]
+- Updated dependencies [9bdab1d]
+- Updated dependencies [d288e7b]
+- Updated dependencies [cf6857e]
+- Updated dependencies [5527cd0]
+- Updated dependencies [32b87ad]
+- Updated dependencies [cf6857e]
+  - @hyperlane-xyz/sdk@36.0.0
+  - @hyperlane-xyz/utils@36.0.0
+  - @hyperlane-xyz/metrics@0.2.28
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.34
+
+### Patch Changes
+
+- Updated dependencies [88e51ed]
+- Updated dependencies [fb63f5f]
+- Updated dependencies [889c68a]
+- Updated dependencies [fb63f5f]
+- Updated dependencies [92ef474]
+- Updated dependencies [f0b325a]
+- Updated dependencies [6db4aee]
+- Updated dependencies [babb3d0]
+- Updated dependencies [867ce3c]
+- Updated dependencies [b77faf4]
+- Updated dependencies [fb63f5f]
+- Updated dependencies [fb63f5f]
+  - @hyperlane-xyz/sdk@35.2.0
+  - @hyperlane-xyz/metrics@0.2.27
+  - @hyperlane-xyz/utils@35.2.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.33
+
+### Patch Changes
+
+- Updated dependencies [830ce1d]
+- Updated dependencies [9cdf9eb]
+  - @hyperlane-xyz/sdk@35.1.0
+  - @hyperlane-xyz/metrics@0.2.26
+  - @hyperlane-xyz/utils@35.1.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.32
+
+### Patch Changes
+
+- Updated dependencies [06a5b6b]
+- Updated dependencies [da1cfb1]
+- Updated dependencies [4bb1c3e]
+- Updated dependencies [93c2290]
+  - @hyperlane-xyz/sdk@35.0.1
+  - @hyperlane-xyz/utils@35.0.1
+  - @hyperlane-xyz/metrics@0.2.25
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.31
+
+### Patch Changes
+
+- Updated dependencies [38479d0]
+- Updated dependencies [4adf279]
+- Updated dependencies [7089676]
+- Updated dependencies [44aa432]
+- Updated dependencies [631d7e7]
+- Updated dependencies [6c687ee]
+- Updated dependencies [a8c9430]
+  - @hyperlane-xyz/sdk@35.0.0
+  - @hyperlane-xyz/metrics@0.2.24
+  - @hyperlane-xyz/utils@35.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.30
+
+### Patch Changes
+
+- Updated dependencies [9a1ce26]
+- Updated dependencies [f758a70]
+- Updated dependencies [2151352]
+- Updated dependencies [b8a600c]
+  - @hyperlane-xyz/sdk@34.0.0
+  - @hyperlane-xyz/metrics@0.2.23
+  - @hyperlane-xyz/utils@34.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.29
+
+### Patch Changes
+
+- Updated dependencies [9ad1bd0]
+- Updated dependencies [530f02e]
+- Updated dependencies [9670e43]
+- Updated dependencies [cc90a8f]
+  - @hyperlane-xyz/sdk@33.1.1
+  - @hyperlane-xyz/metrics@0.2.22
+  - @hyperlane-xyz/utils@33.1.1
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.28
+
+### Patch Changes
+
+- bfe4d2e: Import cycles flagged by oxlint were resolved by extracting shared code into dedicated leaf modules, performing a hard cutover (no backcompat re-exports), and using dependency injection for submitter factories and aggregation metadata decoding. The `import/no-cycle` lint rule is now enforced as an error.
+- Updated dependencies [6f4b790]
+- Updated dependencies [bfe4d2e]
+- Updated dependencies [6929388]
+- Updated dependencies [47649b7]
+- Updated dependencies [0b1c1d1]
+- Updated dependencies [d9dec53]
+  - @hyperlane-xyz/sdk@33.1.0
+  - @hyperlane-xyz/metrics@0.2.21
+  - @hyperlane-xyz/utils@33.1.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.27
+
+### Patch Changes
+
+- Updated dependencies [1f918d0]
+- Updated dependencies [78199f4]
+  - @hyperlane-xyz/sdk@33.0.2
+  - @hyperlane-xyz/utils@33.0.2
+  - @hyperlane-xyz/metrics@0.2.20
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.26
+
+### Patch Changes
+
+- Updated dependencies [a2081df]
+- Updated dependencies [4c91737]
+  - @hyperlane-xyz/sdk@33.0.1
+  - @hyperlane-xyz/metrics@0.2.19
+  - @hyperlane-xyz/utils@33.0.1
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.25
+
+### Patch Changes
+
+- Updated dependencies [dc8e560]
+  - @hyperlane-xyz/sdk@33.0.0
+  - @hyperlane-xyz/metrics@0.2.18
+  - @hyperlane-xyz/utils@33.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.24
+
+### Patch Changes
+
+- Updated dependencies [611b911]
+- Updated dependencies [c6de4c9]
+  - @hyperlane-xyz/sdk@32.0.1
+  - @hyperlane-xyz/metrics@0.2.17
+  - @hyperlane-xyz/utils@32.0.1
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.23
+
+### Patch Changes
+
+- b9e744b: Re-exported metadata build result types from the relayer public API and added a
+  `@hyperlane-xyz/relayer/metadata` subpath export for metadata-only imports.
+- Updated dependencies [e4da110]
+- Updated dependencies [d588eb5]
+- Updated dependencies [ab17263]
+- Updated dependencies [ebde778]
+  - @hyperlane-xyz/sdk@32.0.0
+  - @hyperlane-xyz/metrics@0.2.16
+  - @hyperlane-xyz/utils@32.0.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.22
+
+### Patch Changes
+
+- Updated dependencies [f9c8f83]
+  - @hyperlane-xyz/sdk@31.2.1
+  - @hyperlane-xyz/metrics@0.2.15
+  - @hyperlane-xyz/utils@31.2.1
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.21
+
+### Patch Changes
+
+- Updated dependencies [35fb5c8]
+  - @hyperlane-xyz/sdk@31.2.0
+  - @hyperlane-xyz/metrics@0.2.14
+  - @hyperlane-xyz/utils@31.2.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.20
+
+### Patch Changes
+
+- Updated dependencies [8a082af]
+- Updated dependencies [c8fe242]
+- Updated dependencies [8a082af]
+  - @hyperlane-xyz/sdk@31.1.0
+  - @hyperlane-xyz/metrics@0.2.13
+  - @hyperlane-xyz/utils@31.1.0
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.19
+
+### Patch Changes
+
+- Updated dependencies [d5168fc]
+  - @hyperlane-xyz/utils@31.0.1
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/metrics@0.2.12
+  - @hyperlane-xyz/sdk@31.0.1
+
+## 1.1.18
+
+### Patch Changes
+
+- Updated dependencies [44626fb]
+- Updated dependencies [df33d41]
+- Updated dependencies [4963b32]
+- Updated dependencies [9003721]
+- Updated dependencies [7ad1f9e]
+- Updated dependencies [69e6b3f]
+- Updated dependencies [fc0a1cf]
+  - @hyperlane-xyz/sdk@31.0.0
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/metrics@0.2.11
+  - @hyperlane-xyz/utils@31.0.0
+
+## 1.1.17
+
+### Patch Changes
+
+- Updated dependencies [26d682b]
+  - @hyperlane-xyz/sdk@30.1.1
+  - @hyperlane-xyz/metrics@0.2.10
+  - @hyperlane-xyz/utils@30.1.1
+  - @hyperlane-xyz/core@11.3.0
+
+## 1.1.16
+
+### Patch Changes
+
+- Updated dependencies [9ac480a]
+- Updated dependencies [9eefa2d]
+- Updated dependencies [4c4462f]
+- Updated dependencies [696da11]
+- Updated dependencies [71f0ca4]
+- Updated dependencies [46dda6c]
+- Updated dependencies [ac1acbb]
+- Updated dependencies [d38fad1]
+- Updated dependencies [cfed1d2]
+- Updated dependencies [9061916]
+- Updated dependencies [2057d1a]
+- Updated dependencies [d41d088]
+- Updated dependencies [e1f35a7]
+- Updated dependencies [b691b87]
+- Updated dependencies [7018cc6]
+- Updated dependencies [ef4399b]
+- Updated dependencies [3fef31c]
+- Updated dependencies [d98726f]
+- Updated dependencies [40356c6]
+- Updated dependencies [6f8c503]
+- Updated dependencies [f2749a6]
+- Updated dependencies [5eae48e]
+- Updated dependencies [6bd4fd1]
+- Updated dependencies [57e46b1]
+- Updated dependencies [993de2b]
+- Updated dependencies [b5f897c]
+- Updated dependencies [9515191]
+  - @hyperlane-xyz/core@11.3.0
+  - @hyperlane-xyz/sdk@30.1.0
+  - @hyperlane-xyz/metrics@0.2.9
+  - @hyperlane-xyz/utils@30.1.0
+
+## 1.1.15
+
+### Patch Changes
+
+- Updated dependencies [ac297da]
+- Updated dependencies [77db719]
+- Updated dependencies [e1ed158]
+- Updated dependencies [d0dbf1a]
+- Updated dependencies [7646819]
+- Updated dependencies [95c2891]
+- Updated dependencies [7646819]
+  - @hyperlane-xyz/core@11.2.0
+  - @hyperlane-xyz/sdk@30.0.0
+  - @hyperlane-xyz/metrics@0.2.8
+  - @hyperlane-xyz/utils@30.0.0
+
+## 1.1.14
+
+### Patch Changes
+
+- Updated dependencies [a8192d7]
+- Updated dependencies [a891402]
+  - @hyperlane-xyz/sdk@29.1.0
+  - @hyperlane-xyz/metrics@0.2.7
+  - @hyperlane-xyz/utils@29.1.0
+  - @hyperlane-xyz/core@11.1.0
+
+## 1.1.13
+
+### Patch Changes
+
+- Updated dependencies [96508ed]
+  - @hyperlane-xyz/sdk@29.0.1
+  - @hyperlane-xyz/metrics@0.2.6
+  - @hyperlane-xyz/utils@29.0.1
+  - @hyperlane-xyz/core@11.1.0
+
+## 1.1.12
+
+### Patch Changes
+
+- 084c6b6: The TypeScript packages were updated to support TypeScript 6.0 and to make ambient type loading explicit so the future TypeScript 7.0 upgrade is smoother.
+- Updated dependencies [cc6d57b]
+- Updated dependencies [3c6b1ad]
+- Updated dependencies [084c6b6]
+  - @hyperlane-xyz/sdk@29.0.0
+  - @hyperlane-xyz/utils@29.0.0
+  - @hyperlane-xyz/metrics@0.2.5
+  - @hyperlane-xyz/core@11.1.0
+
+## 1.1.11
+
+### Patch Changes
+
+- Updated dependencies [6c715a7]
+- Updated dependencies [6c715a7]
+- Updated dependencies [2e622e8]
+- Updated dependencies [e93a4c8]
+  - @hyperlane-xyz/core@11.1.0
+  - @hyperlane-xyz/sdk@28.1.0
+  - @hyperlane-xyz/metrics@0.2.4
+  - @hyperlane-xyz/utils@28.1.0
+
+## 1.1.10
+
+### Patch Changes
+
+- Updated dependencies [b9c6844]
+- Updated dependencies [5a5d172]
+- Updated dependencies [a4a74d8]
+  - @hyperlane-xyz/sdk@28.0.0
+  - @hyperlane-xyz/core@11.0.3
+  - @hyperlane-xyz/metrics@0.2.3
+  - @hyperlane-xyz/utils@28.0.0
+
+## 1.1.9
+
+### Patch Changes
+
+- Updated dependencies [de5f6b5]
+- Updated dependencies [a1f9e41]
+- Updated dependencies [b892e61]
+- Updated dependencies [7af7728]
+  - @hyperlane-xyz/sdk@27.1.0
+  - @hyperlane-xyz/utils@27.1.0
+  - @hyperlane-xyz/metrics@0.2.2
+  - @hyperlane-xyz/core@11.0.2
+
+## 1.1.8
+
+### Patch Changes
+
+- 5d69cc8: ccipread revert data extraction was hardened with BFS traversal, isRecord type guard, minimum 64-byte hex threshold, and iteration guard. Relay catch block now logs the error object. Governor SAFE retry was moved to per-batch level to prevent duplicate proposals, and errors are now re-thrown after logging.
+- Updated dependencies [f2620a1]
+- Updated dependencies [f7ebf6c]
+- Updated dependencies [8a6f742]
+- Updated dependencies [b05e242]
+- Updated dependencies [aee625c]
+  - @hyperlane-xyz/sdk@27.0.0
+  - @hyperlane-xyz/core@11.0.2
+  - @hyperlane-xyz/metrics@0.2.1
+  - @hyperlane-xyz/utils@27.0.0
+
+## 1.1.7
+
+### Patch Changes
+
+- Updated dependencies [43255a9]
+- Updated dependencies [06aacac]
+- Updated dependencies [763a264]
+- Updated dependencies [1d116d8]
+  - @hyperlane-xyz/sdk@26.0.0
+  - @hyperlane-xyz/utils@26.0.0
+  - @hyperlane-xyz/metrics@0.2.0
+  - @hyperlane-xyz/core@11.0.1
+
+## 1.1.6
+
+### Patch Changes
+
+- Updated dependencies [c2304d3]
+- Updated dependencies [cd1c28a]
+- Updated dependencies [69b48fa]
+- Updated dependencies [048df98]
+- Updated dependencies [840fb33]
+  - @hyperlane-xyz/sdk@25.5.0
+  - @hyperlane-xyz/metrics@0.1.11
+  - @hyperlane-xyz/utils@25.5.0
+  - @hyperlane-xyz/core@11.0.1
+
+## 1.1.5
+
+### Patch Changes
+
+- Updated dependencies [5a7efbb]
+  - @hyperlane-xyz/sdk@25.4.1
+  - @hyperlane-xyz/metrics@0.1.10
+  - @hyperlane-xyz/utils@25.4.1
+  - @hyperlane-xyz/core@11.0.1
+
+## 1.1.4
+
+### Patch Changes
+
+- Updated dependencies [1f021bf]
+- Updated dependencies [d4a5026]
+- Updated dependencies [934d857]
+- Updated dependencies [1f3a0e6]
+- Updated dependencies [027eeac]
+- Updated dependencies [942bbfb]
+- Updated dependencies [a3f7fd3]
+- Updated dependencies [2a6bd61]
+  - @hyperlane-xyz/utils@25.4.0
+  - @hyperlane-xyz/sdk@25.4.0
+  - @hyperlane-xyz/core@11.0.1
+  - @hyperlane-xyz/metrics@0.1.9
+
+## 1.1.3
+
+### Patch Changes
+
+- Updated dependencies [521d42b]
+  - @hyperlane-xyz/core@10.2.0
+  - @hyperlane-xyz/metrics@0.1.8
+  - @hyperlane-xyz/sdk@25.3.2
+  - @hyperlane-xyz/utils@25.3.2
+
+## 1.1.2
+
+### Patch Changes
+
+- @hyperlane-xyz/sdk@25.3.1
+- @hyperlane-xyz/metrics@0.1.7
+- @hyperlane-xyz/utils@25.3.1
+- @hyperlane-xyz/core@10.1.5
+
+## 1.1.1
+
+### Patch Changes
+
+- Updated dependencies [aea767c]
+  - @hyperlane-xyz/sdk@25.3.0
+  - @hyperlane-xyz/metrics@0.1.6
+  - @hyperlane-xyz/utils@25.3.0
+  - @hyperlane-xyz/core@10.1.5
+
+## 1.1.0
+
+### Minor Changes
+
+- ccd638d: Improved shared RPC override handling across TypeScript services.
+
+### Patch Changes
+
+- Updated dependencies [215dff0]
+- Updated dependencies [d2f75a1]
+- Updated dependencies [360db52]
+- Updated dependencies [18ec479]
+- Updated dependencies [795d93e]
+- Updated dependencies [e143956]
+- Updated dependencies [ccd638d]
+- Updated dependencies [c61d612]
+- Updated dependencies [c2affe2]
+  - @hyperlane-xyz/sdk@25.2.0
+  - @hyperlane-xyz/utils@25.2.0
+  - @hyperlane-xyz/metrics@0.1.5
+  - @hyperlane-xyz/core@10.1.5
+
+## 1.0.2
+
+### Patch Changes
+
+- Updated dependencies [b930534]
+- Updated dependencies [a18d0e6]
+  - @hyperlane-xyz/sdk@25.1.0
+  - @hyperlane-xyz/utils@25.1.0
+  - @hyperlane-xyz/metrics@0.1.4
+  - @hyperlane-xyz/core@10.1.5
+
+## 1.0.1
+
+### Patch Changes
+
+- 52ce778: A `LazyAsync` helper was added to `@hyperlane-xyz/utils` for safe, deduplicated async initialization. It replaces the scattered pattern of `if (!cached) { cached = await init(); } return cached` with an approach that deduplicates concurrent callers, clears state on errors to allow retries, and supports reset capability. Consumer packages were migrated to use this utility.
+- Updated dependencies [52ce778]
+- Updated dependencies [aaabbad]
+  - @hyperlane-xyz/utils@25.0.0
+  - @hyperlane-xyz/sdk@25.0.0
+  - @hyperlane-xyz/core@10.1.5
+  - @hyperlane-xyz/metrics@0.1.3
+
+## 1.0.0
+
+### Major Changes
+
+- 4de5071: **BREAKING**: `MetadataBuilder.build()` return type changed from `string` to `MetadataBuildResult`. Access `.metadata` on the result to get the encoded bytes.
+
+  Added real-time validator signature status to MetadataBuilder. The builder returns detailed `ValidatorInfo` for each validator including signing status ('signed' | 'pending' | 'error'), checkpoint indices, and actual signatures. Aggregation and routing ISMs return nested results for sub-modules. Added helper functions: `isMetadataBuildable()`, `getSignedValidatorCount()`, `isQuorumMet()`.
+
+### Patch Changes
+
+- Updated dependencies [57461b2]
+- Updated dependencies [d580bb6]
+- Updated dependencies [50868ce]
+- Updated dependencies [b05e9f8]
+- Updated dependencies [f44c2b4]
+- Updated dependencies [9dc71fe]
+- Updated dependencies [bde05e9]
+- Updated dependencies [d0b8c24]
+- Updated dependencies [4de5071]
+  - @hyperlane-xyz/utils@24.0.0
+  - @hyperlane-xyz/sdk@24.0.0
+  - @hyperlane-xyz/core@10.1.5
+  - @hyperlane-xyz/metrics@0.1.2
+
+## 0.1.0
+
+### Minor Changes
+
+- 42b72c3: Extracted relayer into dedicated `@hyperlane-xyz/relayer` package
+  - Moved `HyperlaneRelayer` class from SDK to new package
+  - Moved ISM metadata builders from SDK to relayer package
+  - New package supports both manual CLI execution and continuous daemon mode for K8s deployments
+  - Added Prometheus metrics support with `/metrics` endpoint (enabled by default on port 9090)
+  - CLI and infra now import from new package
+  - **Breaking**: The following exports were removed from `@hyperlane-xyz/sdk` and are now available from `@hyperlane-xyz/relayer`:
+    - `HyperlaneRelayer`, `RelayerCacheSchema`, `messageMatchesWhitelist`
+    - `BaseMetadataBuilder`, `decodeIsmMetadata`
+    - All metadata builder classes (`AggregationMetadataBuilder`, `MultisigMetadataBuilder`, etc.)
+  - `offchainLookupRequestMessageHash` remains exported from SDK for ccip-server compatibility
+  - Added `randomDeployableIsmConfig` test utility to SDK for generating deployable ISM configs with custom validators
+
+### Patch Changes
+
+- Updated dependencies [d1d90d2]
+- Updated dependencies [52fd0f8]
+- Updated dependencies [7c22cff]
+- Updated dependencies [52fd0f8]
+- Updated dependencies [52fd0f8]
+- Updated dependencies [a10cfc8]
+- Updated dependencies [6ddef74]
+- Updated dependencies [80f3635]
+- Updated dependencies [576cd95]
+- Updated dependencies [9aa93f4]
+- Updated dependencies [42b72c3]
+- Updated dependencies [a5d6cae]
+  - @hyperlane-xyz/sdk@23.0.0
+  - @hyperlane-xyz/utils@23.0.0
+  - @hyperlane-xyz/metrics@0.1.1
+  - @hyperlane-xyz/core@10.1.5

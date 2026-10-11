@@ -44,7 +44,7 @@ export class TokenMetadataMap {
     return undefined;
   }
 
-  getScale(chain: string): number | undefined {
+  getScale(chain: string): TokenMetadata['scale'] {
     return this.tokenMetadataMap.get(chain)?.scale;
   }
 
@@ -62,15 +62,17 @@ export class TokenMetadataMap {
     throw new Error('No symbol found in token metadata map.');
   }
 
-  finalize(): void {
+  finalize(validateScale = true): void {
     assert(
       [...this.tokenMetadataMap.values()].every((config) => !!config.decimals),
       'All decimals must be defined',
     );
 
-    assert(
-      verifyScale(this.tokenMetadataMap),
-      `Found invalid or missing scale for inconsistent decimals`,
-    );
+    if (validateScale) {
+      assert(
+        verifyScale(this.tokenMetadataMap),
+        `Found invalid or missing scale for inconsistent decimals`,
+      );
+    }
   }
 }

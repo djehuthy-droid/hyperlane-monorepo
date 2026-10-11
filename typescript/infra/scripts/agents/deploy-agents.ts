@@ -4,11 +4,15 @@ import { execSync } from 'child_process';
 
 import { createAgentKeysIfNotExistsWithPrompt } from '../../src/agents/key-utils.js';
 import { RootAgentConfig } from '../../src/config/agent/agent.js';
+import { Role } from '../../src/roles.js';
 import {
   checkAgentImageExists,
   checkMonorepoImageExists,
+  checkNodeServicesImageExists,
+  warnIfPrTag,
 } from '../../src/utils/gcloud.js';
 import { HelmCommand } from '../../src/utils/helm.js';
+import { getArgs, withAgentRolesRequired, withYes } from '../agent-utils.js';
 import { getConfigsBasedOnArgs } from '../core-utils.js';
 
 import { AgentCli } from './utils.js';
@@ -52,43 +56,74 @@ async function getCommitsBehindMain(): Promise<number> {
   }
 }
 
-async function checkDockerTagsExist(agentConfig: RootAgentConfig) {
-  const imagesToCheck: { agent: string; tag?: string }[] = [
-    { agent: 'scraper', tag: agentConfig.scraper?.docker.tag },
-    { agent: 'validators', tag: agentConfig.validators?.docker.tag },
-    { agent: 'relayer', tag: agentConfig.relayer?.docker.tag },
+async function checkDockerTagsExist(
+  agentConfig: RootAgentConfig,
+  roles: Role[],
+) {
+  const imagesToCheck: { agent: string; role: Role; tag?: string }[] = [
+    {
+      agent: 'scraper',
+      role: Role.Scraper,
+      tag: agentConfig.scraper?.docker.tag,
+    },
+    {
+      agent: 'validators',
+      role: Role.Validator,
+      tag: agentConfig.validators?.docker.tag,
+    },
+    {
+      agent: 'relayer',
+      role: Role.Relayer,
+      tag: agentConfig.relayer?.docker.tag,
+    },
   ];
 
   let errors = false;
-  for (const { agent, tag } of imagesToCheck) {
-    if (tag) {
-      const agentExists = await checkAgentImageExists(tag);
-      if (!agentExists) {
-        errors = true;
+  for (const { agent, role, tag } of imagesToCheck) {
+    if (!roles.includes(role) || !tag) continue;
 
+    warnIfPrTag(agent, tag);
+
+    const agentExists = await checkAgentImageExists(tag);
+    if (!agentExists) {
+      errors = true;
+
+      console.log(
+        chalk.red(
+          `Agent ${chalk.bold(agent)} is configured with an invalid Docker image tag: ${chalk.bold(tag)}.`,
+        ),
+      );
+
+      const monorepoExists = await checkMonorepoImageExists(tag);
+      if (monorepoExists) {
         console.log(
           chalk.red(
-            `Agent ${chalk.bold(agent)} is configured with an invalid Docker image tag: ${chalk.bold(tag)}.`,
-          ),
-        );
-
-        const monorepoExists = await checkMonorepoImageExists(tag);
-        if (monorepoExists) {
-          console.log(
-            chalk.red(
-              `You have accidentally configured ${chalk.bold(
-                agent,
-              )} with a monorepo image tag.`,
-            ),
-          );
-        }
-      } else {
-        console.log(
-          chalk.green(
-            `Agent ${chalk.bold(agent)} is configured with a valid Docker image tag: ${chalk.bold(tag)}.`,
+            `You have accidentally configured ${chalk.bold(
+              agent,
+            )} with a monorepo image tag.`,
           ),
         );
       }
+    } else {
+      console.log(
+        chalk.green(
+          `Agent ${chalk.bold(agent)} is configured with a valid Docker image tag: ${chalk.bold(tag)}.`,
+        ),
+      );
+    }
+  }
+
+  const proxy = agentConfig.scraperProxy;
+  if (roles.includes(Role.ScraperProxy) && proxy?.enabled) {
+    const tag = proxy.docker.tag;
+    warnIfPrTag('scraper-proxy', tag);
+    if (!(await checkNodeServicesImageExists(tag))) {
+      errors = true;
+      console.log(
+        chalk.red(
+          `Scraper proxy is configured with an invalid node-services image tag: ${chalk.bold(tag)}.`,
+        ),
+      );
     }
   }
 
@@ -101,28 +136,46 @@ async function main() {
   // Note the create-keys script should be ran prior to running this script.
   // At the moment, `runAgentHelmCommand` has the side effect of creating keys / users
   // if they do not exist. It's possible for a race condition to occur where creation of
-  // a key / user that is used by multiple deployments (like Kathy),
+  // a key / user that is used by multiple deployments,
   // whose keys / users are not chain-specific) will be attempted multiple times.
   // While this function still has these side effects, the workaround is to just
   // run the create-keys script first.
-  const { agentConfig } = await getConfigsBasedOnArgs();
-  await checkDockerTagsExist(agentConfig);
+  const { yes: skipConfirmation, roles } = await withYes(
+    withAgentRolesRequired(getArgs()),
+  ).argv;
 
-  await createAgentKeysIfNotExistsWithPrompt(agentConfig);
+  const { agentConfig } = await getConfigsBasedOnArgs();
+  await checkDockerTagsExist(agentConfig, roles);
+
+  // Roles without managed keys must not trigger unrelated key reconciliation.
+  const keyRoles = roles.filter((role) =>
+    agentConfig.rolesWithKeys.includes(role),
+  );
+  if (keyRoles.length > 0) {
+    await createAgentKeysIfNotExistsWithPrompt(agentConfig, keyRoles);
+  }
 
   // Check if current branch is up-to-date with the main branch
   const commitsBehind = await getCommitsBehindMain();
 
   // If the current branch is not up-to-date with origin/main, prompt the user to continue
   if (commitsBehind > 0) {
-    const shouldContinue = await confirm({
-      message: chalk.yellow.bold(
-        `Warning: Current branch is ${commitsBehind} commit${
-          commitsBehind === 1 ? '' : 's'
-        } behind origin/main. Are you sure you want to continue?`,
-      ),
-      default: false,
-    });
+    const behindMessage = `Current branch is ${commitsBehind} commit${
+      commitsBehind === 1 ? '' : 's'
+    } behind origin/main.`;
+    const shouldContinue = skipConfirmation
+      ? true
+      : await confirm({
+          message: chalk.yellow.bold(
+            `Warning: ${behindMessage} Are you sure you want to continue?`,
+          ),
+          default: false,
+        });
+    if (skipConfirmation) {
+      console.log(
+        chalk.yellow.bold(`Warning: ${behindMessage} --yes set; continuing.`),
+      );
+    }
     if (!shouldContinue) {
       console.log(chalk.red.bold('Exiting...'));
       process.exit(1);

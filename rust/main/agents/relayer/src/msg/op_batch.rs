@@ -325,6 +325,7 @@ mod tests {
             domain: HyperlaneDomain::Known(hyperlane_core::KnownHyperlaneDomain::Arbitrum),
             // TODO
             signer: None,
+            identity: None,
             submitter: SubmitterType::Classic,
             estimated_block_time: Duration::from_secs(1),
             reorg_period: ReorgPeriod::from_blocks(10),
@@ -354,10 +355,14 @@ mod tests {
                     ..Default::default()
                 },
                 consider_null_transaction_receipt: false,
+                fallback_hedge: None,
             }),
             metrics_conf: Default::default(),
             index: Default::default(),
+            confirmations: Default::default(),
+            chain_id: Default::default(),
             ignore_reorg_reports: false,
+            native_token: Default::default(),
         };
 
         // https://explorer.hyperlane.xyz/message/0x29160a18c6e27c2f14ebe021207ac3f90664507b9c5aacffd802b2afcc15788a
@@ -394,8 +399,9 @@ mod tests {
             false,
             core_metrics.clone(),
             cache.clone(),
+            Default::default(),
             base_db.clone(),
-            IsmAwareAppContextClassifier::new(default_ism_getter.clone(), vec![]),
+            IsmAwareAppContextClassifier::new(default_ism_getter.clone(), vec![].into()),
             IsmCachePolicyClassifier::new(default_ism_getter, Default::default()),
             None,
             false,

@@ -9,28 +9,17 @@
  */
 import { validateIsmConfig } from '@hyperlane-xyz/deploy-sdk';
 import { type CoreConfig as ProviderCoreConfig } from '@hyperlane-xyz/provider-sdk/core';
+import { type HookConfig as ProviderHookConfig } from '@hyperlane-xyz/provider-sdk/hook';
 import { type IsmConfig as ProviderIsmConfig } from '@hyperlane-xyz/provider-sdk/ism';
-import {
-  type CollateralWarpConfig,
-  type NativeWarpConfig,
-  TokenType as ProviderTokenType,
-  type WarpConfig as ProviderWarpConfig,
-  type SyntheticWarpConfig,
-} from '@hyperlane-xyz/provider-sdk/warp';
-import {
-  type CoreConfig,
-  TokenType,
-  type WarpRouteDeployConfigMailboxRequired,
-} from '@hyperlane-xyz/sdk';
+import { type CoreConfig, type HookConfig } from '@hyperlane-xyz/sdk';
+import { type ProtocolType } from '@hyperlane-xyz/utils';
+export { validateWarpConfigForAltVM } from '@hyperlane-xyz/sdk';
 
-/**
- * Supported token types in provider-sdk.
- * Alt-VM chains currently support collateral, synthetic, and native tokens.
- */
-const SUPPORTED_TOKEN_TYPES = new Set<TokenType>([
-  TokenType.synthetic,
-  TokenType.collateral,
-  TokenType.native,
+const ALT_VM_SUPPORTED_HOOK_TYPES: ReadonlySet<string> = new Set([
+  'interchainGasPaymaster',
+  'merkleTreeHook',
+  'protocolFee',
+  'unknownHook',
 ]);
 
 /**
@@ -44,6 +33,7 @@ const SUPPORTED_TOKEN_TYPES = new Set<TokenType>([
 export function validateCoreConfigForAltVM(
   config: CoreConfig,
   chain: string,
+  protocol?: ProtocolType,
 ): ProviderCoreConfig {
   // Validate ISM configuration (handles recursion for routing ISMs)
   if (config.defaultIsm) {
@@ -51,6 +41,7 @@ export function validateCoreConfigForAltVM(
       config.defaultIsm as ProviderIsmConfig | string,
       chain,
       'core config',
+      protocol,
     );
   }
 
@@ -64,75 +55,29 @@ export function validateCoreConfigForAltVM(
 }
 
 /**
- * Validates that a WarpRouteDeployConfig is compatible with provider-sdk requirements.
+ * Validates that a HookConfig is compatible with provider-sdk requirements.
  *
- * @param config - WarpRouteDeployConfig from the main SDK
+ * @param config - HookConfig from the main SDK
  * @param chain - Chain name for error messages
- * @returns a provider-sdk WarpConfig derived from the given config
- * @throws Error if config contains unsupported token types
+ * @returns The same config, typed as ProviderHookConfig
+ * @throws Error if config is an address string or an unsupported hook type
  */
-export function validateWarpConfigForAltVM(
-  config: WarpRouteDeployConfigMailboxRequired[string],
+export function validateHookConfigForAltVM(
+  config: HookConfig,
   chain: string,
-): ProviderWarpConfig {
-  // Check if token type is supported
-  if (!SUPPORTED_TOKEN_TYPES.has(config.type)) {
-    const supportedTypes = Array.from(SUPPORTED_TOKEN_TYPES).join(', ');
-    const errorMsg =
-      `Unsupported token type '${config.type}' for Alt-VM chain '${chain}'.\n` +
-      `Supported token types: ${supportedTypes}.`;
-    throw new Error(errorMsg);
-  }
-
-  // Validate the token conforms to basic collateral or synthetic structure
-  if (config.type === TokenType.collateral) {
-    if (!config.token) {
-      const errorMsg = `Collateral token config for chain '${chain}' must specify 'token' address`;
-      throw new Error(errorMsg);
-    }
-  }
-
-  // Validate ISM if present (handles recursion for routing ISMs)
-  if (config.interchainSecurityModule) {
-    validateIsmConfig(
-      config.interchainSecurityModule as ProviderIsmConfig | string,
-      chain,
-      'warp config',
-    );
-  }
-
-  // Construct the provider-sdk config
-  const baseConfig = {
-    owner: config.owner,
-    mailbox: config.mailbox,
-    interchainSecurityModule: config.interchainSecurityModule,
-    hook: config.hook,
-    remoteRouters: config.remoteRouters,
-    destinationGas: config.destinationGas,
-  };
-
-  if (config.type === TokenType.collateral) {
-    return {
-      ...baseConfig,
-      type: ProviderTokenType.collateral,
-      token: config.token,
-    } as CollateralWarpConfig;
-  } else if (config.type === TokenType.synthetic) {
-    return {
-      ...baseConfig,
-      type: ProviderTokenType.synthetic,
-      name: config.name,
-      symbol: config.symbol,
-      decimals: config.decimals,
-    } as SyntheticWarpConfig;
-  } else if (config.type === TokenType.native) {
-    return {
-      ...baseConfig,
-      type: ProviderTokenType.native,
-    } as NativeWarpConfig;
-  } else {
+): ProviderHookConfig {
+  if (typeof config === 'string') {
     throw new Error(
-      `Unsupported token type '${config.type}' for Alt-VM chain '${chain}'.`,
+      `Hook config for chain ${chain} must be an object on Alt-VM chains, not an address string`,
     );
   }
+  if (!ALT_VM_SUPPORTED_HOOK_TYPES.has(config.type)) {
+    throw new Error(
+      `Hook type ${config.type} is not supported on Alt-VM chain ${chain}. ` +
+        `Supported types: ${[...ALT_VM_SUPPORTED_HOOK_TYPES].join(', ')}`,
+    );
+  }
+  // CAST: safe because the type discriminator was validated above and
+  // provider-sdk hook types are a subset of SDK hook types.
+  return config as ProviderHookConfig;
 }

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hyperlane_core::{
     ChainCommunicationError, ChainResult, FixedPointNumber, HyperlaneChain, HyperlaneContract,
-    HyperlaneDomain, HyperlaneMessage, HyperlaneProvider, Mailbox, Metadata,
-    ReorgPeriod, TxCostEstimate, TxOutcome, H256, H512, U256,
+    HyperlaneDomain, HyperlaneMessage, HyperlaneProvider, Mailbox, Metadata, ReorgPeriod,
+    TxCostEstimate, TxOutcome, H256, H512, U256,
 };
 use tracing::{debug, info, instrument};
 
@@ -34,11 +34,7 @@ pub struct KaspaMailbox {
 
 impl KaspaMailbox {
     /// Create a new Kaspa Mailbox.
-    pub fn new(
-        domain: HyperlaneDomain,
-        address: H256,
-        conf: &ConnectionConf,
-    ) -> ChainResult<Self> {
+    pub fn new(domain: HyperlaneDomain, address: H256, conf: &ConnectionConf) -> ChainResult<Self> {
         let client = Arc::new(KaspaRpcClient::new(conf)?);
         let provider = KaspaProvider::from_client(domain.clone(), client.clone());
 
@@ -188,7 +184,10 @@ impl Mailbox for KaspaMailbox {
         message: &HyperlaneMessage,
         metadata: &Metadata,
     ) -> ChainResult<TxCostEstimate> {
-        let estimate = self.client.estimate_process_costs(message, metadata).await?;
+        let estimate = self
+            .client
+            .estimate_process_costs(message, metadata)
+            .await?;
 
         let gas_limit = estimate
             .gas_limit

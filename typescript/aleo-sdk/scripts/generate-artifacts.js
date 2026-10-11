@@ -8,17 +8,34 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const outputFile = path.join(__dirname, '../src/artifacts.ts');
+const programsOutputFile = path.join(__dirname, '../src/programs.ts');
 
 const VERSION = 'v1.0.0';
 
+async function fetchWithRetry(url, options, attempts = 3, timeoutMs = 30000) {
+  for (let i = 0; i < attempts; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
+      return res;
+    } catch (e) {
+      if (i === attempts - 1) throw e;
+      const delay = 1000 * 2 ** i;
+      console.log(`Fetch attempt ${i + 1} failed, retrying in ${delay}ms...`);
+      await new Promise((r) => setTimeout(r, delay));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
 const main = async () => {
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `https://github.com/hyperlane-xyz/hyperlane-aleo/releases/download/${VERSION}/programs.zip`,
-    {
-      cache: 'no-store',
-    },
+    { cache: 'no-store' },
   );
-  if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
 
   const buffer = Buffer.from(await res.arrayBuffer());
 
@@ -40,7 +57,7 @@ const main = async () => {
     }
   }
 
-  let output = '';
+  let output = `import type { AleoProgram } from './programs.js';\n\nexport type { AleoProgram } from './programs.js';\n\n`;
 
   for (const file of files) {
     output +=
@@ -51,15 +68,16 @@ const main = async () => {
       '`;\n';
   }
 
-  output += `\nexport type AleoProgram =`;
+  let programsOutput = `// CAST: Preserve literal program names for the AleoProgram union.\nexport const ALEO_PROGRAMS = [`;
 
   for (const file of files) {
-    output += `\n  | '${file.filename}'`;
+    programsOutput += `\n  '${file.filename}',`;
   }
 
-  output += `;`;
+  programsOutput += `\n] as const;`;
+  programsOutput += `\n\nexport type AleoProgram = (typeof ALEO_PROGRAMS)[number];\n`;
 
-  output += `\n\nexport const programRegistry: Record<AleoProgram, string> = {`;
+  output += `\nexport const programRegistry: Record<AleoProgram, string> = {`;
 
   for (const file of files) {
     output += `\n  ${file.filename},`;
@@ -68,7 +86,8 @@ const main = async () => {
   output += `\n};\n`;
 
   fs.writeFileSync(outputFile, output, 'utf8');
-  console.log('artifacts.ts generated successfully!');
+  fs.writeFileSync(programsOutputFile, programsOutput, 'utf8');
+  console.log('artifacts.ts and programs.ts generated successfully!');
 };
 
 main();

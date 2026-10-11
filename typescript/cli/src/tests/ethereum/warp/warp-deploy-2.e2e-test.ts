@@ -3,6 +3,8 @@ import * as chai from 'chai';
 import chaiAsPromised from 'chai-as-promised';
 import { Wallet } from 'ethers';
 
+import { TronJsonRpcProvider } from '@hyperlane-xyz/tron-sdk';
+
 import {
   type ERC20Test,
   EverclearTokenBridge__factory,
@@ -11,8 +13,10 @@ import {
 } from '@hyperlane-xyz/core';
 import {
   type ChainMetadata,
+  IsmType,
   type LinearFeeConfig,
-  type TokenFeeConfig,
+  type RateLimitedIsmConfig,
+  RateLimitedIsmConfigSchema,
   type TokenFeeConfigInput,
   TokenFeeType,
   TokenType,
@@ -49,7 +53,10 @@ import {
   CHAIN_NAME_4,
   CORE_CONFIG_PATH,
   DEFAULT_E2E_TEST_TIMEOUT,
+  IS_TRON_TEST,
   REGISTRY_PATH,
+  TRON_KEY_1,
+  TRON_KEY_2,
   WARP_DEPLOY_OUTPUT_PATH,
 } from '../consts.js';
 
@@ -62,6 +69,7 @@ function extractInputOnlyFields(config: TokenFeeConfigInput): any {
 
   switch (config.type) {
     case TokenFeeType.LinearFee:
+      assert(config.bps !== undefined, 'LinearFee config must define bps');
       return {
         type: config.type,
         bps: config.bps.toString(), // Convert to string for consistent comparison
@@ -96,7 +104,9 @@ describe('hyperlane warp deploy e2e tests', async function () {
 
   before(async function () {
     chain2Metadata = readYamlOrJson(CHAIN_2_METADATA_PATH);
-    providerChain2 = new JsonRpcProvider(chain2Metadata.rpcUrls[0].http);
+    providerChain2 = IS_TRON_TEST
+      ? new TronJsonRpcProvider(chain2Metadata.rpcUrls[0].http)
+      : new JsonRpcProvider(chain2Metadata.rpcUrls[0].http);
     walletChain2 = new Wallet(ANVIL_KEY).connect(providerChain2);
     ownerAddress = walletChain2.address;
 
@@ -106,15 +116,18 @@ describe('hyperlane warp deploy e2e tests', async function () {
     const chain4Metadata: ChainMetadata = readYamlOrJson(CHAIN_4_METADATA_PATH);
     chain4DomainId = chain4Metadata.domainId;
 
-    // Deploy core contracts to populate the registry
+    // Use different deployer keys on Tron to avoid "Dup transaction" errors
+    // when deploying identical core bytecodes in parallel to the same node.
+    const chain3Key = IS_TRON_TEST ? TRON_KEY_1 : ANVIL_KEY;
+    const chain4Key = IS_TRON_TEST ? TRON_KEY_2 : ANVIL_KEY;
     await Promise.all([
       deployOrUseExistingCore(CHAIN_NAME_2, CORE_CONFIG_PATH, ANVIL_KEY),
-      deployOrUseExistingCore(CHAIN_NAME_3, CORE_CONFIG_PATH, ANVIL_KEY),
-      deployOrUseExistingCore(CHAIN_NAME_4, CORE_CONFIG_PATH, ANVIL_KEY),
+      deployOrUseExistingCore(CHAIN_NAME_3, CORE_CONFIG_PATH, chain3Key),
+      deployOrUseExistingCore(CHAIN_NAME_4, CORE_CONFIG_PATH, chain4Key),
     ]);
   });
 
-  describe(`hyperlane warp deploy --config ... --yes --key ...`, () => {
+  describe(`hyperlane warp deploy --yes --key ...`, () => {
     let tokenChain2: ERC20Test;
     let everclearBridgeAdapterMock: MockEverclearAdapter;
 
@@ -127,10 +140,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
       );
     });
 
-    const MAX_UINT256 =
-      115792089237316195423570985008687907853269984665640564039457584007913129639935n;
-
-    it('should set the allowed bridges and the related token approvals', async function () {
+    it('should set the allowed bridges without creating token approvals', async function () {
       const bridges = [randomAddress(), randomAddress()];
       const warpConfig: WarpRouteDeployConfig = {
         [CHAIN_NAME_2]: {
@@ -167,6 +177,13 @@ describe('hyperlane warp deploy e2e tests', async function () {
         (config) => config.chainName === CHAIN_NAME_2,
       );
       expect(chain2TokenConfig).to.exist;
+      expect(chain2TokenConfig.tokenType).to.equal(TokenType.collateral);
+
+      const [chain3TokenConfig] = coreConfig.tokens.filter(
+        (config) => config.chainName === CHAIN_NAME_3,
+      );
+      expect(chain3TokenConfig).to.exist;
+      expect(chain3TokenConfig.tokenType).to.equal(TokenType.synthetic);
 
       const movableToken = MovableCollateralRouter__factory.connect(
         chain2TokenConfig.addressOrDenom!,
@@ -178,7 +195,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
           chain2TokenConfig.addressOrDenom!,
           bridge,
         );
-        expect(allowance.toBigInt() === MAX_UINT256).to.be.true;
+        expect(allowance.toBigInt() === 0n).to.be.true;
 
         const allowedBridgesOnDomain =
           await movableToken.callStatic.allowedBridges(chain3DomainId);
@@ -251,7 +268,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
           chain2TokenConfig.addressOrDenom!,
           allowedBridge,
         );
-        expect(allowance.toBigInt() === MAX_UINT256).to.be.true;
+        expect(allowance.toBigInt() === 0n).to.be.true;
 
         const allowedBridgesOnDomain =
           await movableToken.callStatic.allowedBridges(domain);
@@ -268,7 +285,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
       const tokenFee = {
         type: TokenFeeType.LinearFee,
         token: tokenChain2.address,
-        bps: 1n,
+        bps: 1,
       };
 
       const warpConfig = WarpRouteDeployConfigSchema.parse({
@@ -306,7 +323,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
       const tokenFee = {
         type: TokenFeeType.LinearFee,
         owner: ownerAddress,
-        bps: 1n,
+        bps: 1,
       };
 
       const warpConfig = WarpRouteDeployConfigSchema.parse({
@@ -339,8 +356,11 @@ describe('hyperlane warp deploy e2e tests', async function () {
         )
       )[CHAIN_NAME_2];
 
+      expect(collateralConfig.tokenFee?.type).to.equal(TokenFeeType.LinearFee);
       expect(
-        (collateralConfig.tokenFee as TokenFeeConfig | undefined)?.token,
+        collateralConfig.tokenFee && 'token' in collateralConfig.tokenFee
+          ? collateralConfig.tokenFee.token
+          : undefined,
       ).to.equal(tokenChain2.address);
     });
 
@@ -409,7 +429,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
           owner: ownerAddress,
           tokenFee: {
             type: TokenFeeType.LinearFee,
-            bps: 100n,
+            bps: 100,
           },
         },
       });
@@ -442,7 +462,9 @@ describe('hyperlane warp deploy e2e tests', async function () {
       expect(syntheticConfig.tokenFee?.type).to.equal(TokenFeeType.LinearFee);
       // For synthetic tokens, fee token should be resolved to the router address
       expect(
-        (syntheticConfig.tokenFee as TokenFeeConfig | undefined)?.token,
+        syntheticConfig.tokenFee && 'token' in syntheticConfig.tokenFee
+          ? syntheticConfig.tokenFee.token
+          : undefined,
       ).to.equal(syntheticTokenConfig.addressOrDenom);
     });
 
@@ -612,7 +634,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
     });
 
     it('should deploy a synthetic token with LinearFee using only bps (computed path)', async () => {
-      const providedBps = 100n;
+      const providedBps = 100;
 
       const warpConfig = WarpRouteDeployConfigSchema.parse({
         [CHAIN_NAME_2]: {
@@ -651,11 +673,84 @@ describe('hyperlane warp deploy e2e tests', async function () {
       expect(syntheticConfig.tokenFee?.type).to.equal(TokenFeeType.LinearFee);
 
       const tokenFee = syntheticConfig.tokenFee as LinearFeeConfig;
-      expect(BigInt(tokenFee.bps)).to.equal(providedBps);
+      expect(tokenFee.bps).to.equal(providedBps);
       expect(tokenFee.maxFee).to.exist;
       expect(tokenFee.halfAmount).to.exist;
       expect(BigInt(tokenFee.maxFee) > 0n).to.be.true;
       expect(BigInt(tokenFee.halfAmount) > 0n).to.be.true;
+    });
+
+    it('should deploy a RateLimitedIsm on a synthetic token and auto-populate recipient', async () => {
+      const maxCapacity = (BigInt(86400) * 10n ** 18n).toString();
+
+      const warpConfig: WarpRouteDeployConfig = {
+        [CHAIN_NAME_2]: {
+          type: TokenType.collateral,
+          token: tokenChain2.address,
+          owner: ownerAddress,
+        },
+        [CHAIN_NAME_3]: {
+          type: TokenType.synthetic,
+          owner: ownerAddress,
+          interchainSecurityModule: {
+            type: IsmType.RATE_LIMITED,
+            maxCapacity,
+            duration: 86400n,
+          },
+        },
+      };
+
+      writeYamlOrJson(WARP_DEPLOY_OUTPUT_PATH, warpConfig);
+      await hyperlaneWarpDeploy(WARP_DEPLOY_OUTPUT_PATH);
+
+      const COMBINED_WARP_CORE_CONFIG_PATH =
+        GET_WARP_DEPLOY_CORE_CONFIG_OUTPUT_PATH(
+          WARP_DEPLOY_OUTPUT_PATH,
+          await tokenChain2.symbol(),
+        );
+
+      const coreConfig: WarpCoreConfig = readYamlOrJson(
+        COMBINED_WARP_CORE_CONFIG_PATH,
+      );
+      const syntheticTokenConfig = coreConfig.tokens.find(
+        (t) => t.chainName === CHAIN_NAME_3,
+      );
+      expect(syntheticTokenConfig).to.exist;
+
+      const syntheticDeployConfig = (
+        await readWarpConfig(
+          CHAIN_NAME_3,
+          COMBINED_WARP_CORE_CONFIG_PATH,
+          WARP_DEPLOY_OUTPUT_PATH,
+        )
+      )[CHAIN_NAME_3];
+
+      const ism =
+        syntheticDeployConfig.interchainSecurityModule as RateLimitedIsmConfig;
+      expect(ism).to.exist;
+      expect(ism.type).to.equal(IsmType.RATE_LIMITED);
+      expect(ism.maxCapacity).to.equal(maxCapacity);
+    });
+
+    it('should round down RateLimitedIsm maxCapacity to nearest multiple of duration', () => {
+      const result = RateLimitedIsmConfigSchema.safeParse({
+        type: IsmType.RATE_LIMITED,
+        maxCapacity: '100000',
+        duration: 86400n,
+      });
+      expect(result.success).to.be.true;
+      expect(result.data?.maxCapacity).to.equal(
+        ((100000n / 86400n) * 86400n).toString(), // '86400'
+      );
+    });
+
+    it('should reject a RateLimitedIsm config with maxCapacity below duration', () => {
+      const result = RateLimitedIsmConfigSchema.safeParse({
+        type: IsmType.RATE_LIMITED,
+        maxCapacity: '1000',
+        duration: 86400n,
+      });
+      expect(result.success).to.be.false;
     });
   });
 });

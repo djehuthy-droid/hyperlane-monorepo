@@ -13,23 +13,30 @@ use solana_program::{
     rent::Rent,
     sysvar::Sysvar,
 };
+use solana_system_interface::program as system_program;
+
+use multisig_ism::MultisigIsmMessageIdMetadata;
 
 use crate::{
     accounts::{AccessControlAccount, AccessControlData, DomainData, DomainDataAccount},
     error::Error,
     instruction::{Domained, Instruction, ValidatorsAndThreshold},
-    metadata::MultisigIsmMessageIdMetadata,
 };
 
-use hyperlane_sealevel_interchain_security_module_interface::InterchainSecurityModuleInstruction;
+use hyperlane_sealevel_interchain_security_module_interface::{
+    InterchainSecurityModuleInstruction, MetadataSpec, MetadataSpecResult,
+    VERIFY_ACCOUNT_METAS_PDA_SEEDS,
+};
 use multisig_ism::{interface::MultisigIsmInstruction, multisig::MultisigIsm};
-
-use borsh::BorshSerialize;
 
 const ISM_TYPE: ModuleType = ModuleType::MessageIdMultisig;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
+
+/// Marker type for PackageVersioned trait implementation.
+pub struct MultisigIsmMessageIdProgram;
+impl package_versioned::PackageVersioned for MultisigIsmMessageIdProgram {}
 
 /// PDA seeds relating to the access control PDA account.
 #[macro_export]
@@ -79,15 +86,19 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    // Universal version query — discriminator-based, independent of instruction enum.
+    if package_versioned::is_get_program_version(instruction_data) {
+        return package_versioned::process_get_program_version::<MultisigIsmMessageIdProgram>();
+    }
+
     // First, try to decode the instruction as an interchain security module
     // interface supported function based off the discriminator.
     if let Ok(ism_instruction) = InterchainSecurityModuleInstruction::decode(instruction_data) {
         return match ism_instruction {
             InterchainSecurityModuleInstruction::Type => {
                 set_return_data(
-                    &SimulationReturnData::new(ISM_TYPE as u32)
-                        .try_to_vec()
-                        .map_err(|err| ProgramError::BorshIoError(err.to_string()))?[..],
+                    &borsh::to_vec(&SimulationReturnData::new(ISM_TYPE as u32))
+                        .map_err(|_| ProgramError::BorshIoError)?[..],
                 );
                 return Ok(());
             }
@@ -108,11 +119,15 @@ pub fn process_instruction(
                 // may end with zero byte(s), which are incorrectly truncated as
                 // simulated transaction return data.
                 // See `SimulationReturnData` for details.
-                let bytes = SimulationReturnData::new(account_metas)
-                    .try_to_vec()
-                    .map_err(|err| ProgramError::BorshIoError(err.to_string()))?;
+                let bytes = borsh::to_vec(&SimulationReturnData::new(account_metas))
+                    .map_err(|_| ProgramError::BorshIoError)?;
                 set_return_data(&bytes[..]);
                 Ok(())
+            }
+            InterchainSecurityModuleInstruction::VerifyMetadataSpec(data) => {
+                let message = HyperlaneMessage::read_from(&mut &data.message[..])
+                    .map_err(|_| ProgramError::InvalidArgument)?;
+                get_metadata_spec(program_id, accounts, message.origin)
             }
         };
     }
@@ -143,9 +158,8 @@ pub fn process_instruction(
                 // may end with zero byte(s), which are incorrectly truncated as
                 // simulated transaction return data.
                 // See `SimulationReturnData` for details.
-                let bytes = SimulationReturnData::new(account_metas)
-                    .try_to_vec()
-                    .map_err(|err| ProgramError::BorshIoError(err.to_string()))?;
+                let bytes = borsh::to_vec(&SimulationReturnData::new(account_metas))
+                    .map_err(|_| ProgramError::BorshIoError)?;
                 set_return_data(&bytes[..]);
                 Ok(())
             }
@@ -200,7 +214,7 @@ fn initialize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 
     // Account 2: The system program account.
     let system_program_account = next_account_info(accounts_iter)?;
-    if !solana_program::system_program::check_id(system_program_account.key) {
+    if system_program_account.key != &system_program::ID {
         return Err(Error::AccountOutOfOrder.into());
     }
 
@@ -237,7 +251,8 @@ fn verify(
     metadata_bytes: Vec<u8>,
     message_bytes: Vec<u8>,
 ) -> ProgramResult {
-    let metadata = MultisigIsmMessageIdMetadata::try_from(metadata_bytes)?;
+    let metadata = MultisigIsmMessageIdMetadata::try_from(metadata_bytes)
+        .map_err(|_| Error::InvalidMetadata)?;
     let message = HyperlaneMessage::read_from(&mut &message_bytes[..])
         .map_err(|_| ProgramError::InvalidArgument)?;
 
@@ -297,9 +312,8 @@ fn get_validators_and_threshold(
     // may end with zero byte(s), which are incorrectly truncated as
     // simulated transaction return data.
     // See `SimulationReturnData` for details.
-    let bytes = SimulationReturnData::new(validators_and_threshold)
-        .try_to_vec()
-        .map_err(|err| ProgramError::BorshIoError(err.to_string()))?;
+    let bytes = borsh::to_vec(&SimulationReturnData::new(validators_and_threshold))
+        .map_err(|_| ProgramError::BorshIoError)?;
     set_return_data(&bytes[..]);
     Ok(())
 }
@@ -319,6 +333,49 @@ fn get_validators_and_threshold_account_metas(
         Pubkey::find_program_address(domain_data_pda_seeds!(domain), program_id);
 
     Ok(vec![AccountMeta::new_readonly(domain_pda_key, false).into()])
+}
+
+/// Returns a [`MetadataSpecResult`] for a given message as return data.
+///
+/// Accounts:
+/// 0. `[]` This program's VAM PDA (derived from `VERIFY_ACCOUNT_METAS_PDA_SEEDS`).
+/// 1. `[]` (optional) The domain data PDA for the given domain.
+///
+/// If account 1 is absent or does not match the expected domain PDA, returns
+/// `spec: None` with `accounts: [vam_pda, domain_pda]` so the caller can
+/// re-simulate with the correct accounts.
+fn get_metadata_spec(program_id: &Pubkey, accounts: &[AccountInfo], domain: u32) -> ProgramResult {
+    let (vam_pda_key, _) = Pubkey::find_program_address(VERIFY_ACCOUNT_METAS_PDA_SEEDS, program_id);
+    let (domain_pda_key, _) =
+        Pubkey::find_program_address(domain_data_pda_seeds!(domain), program_id);
+
+    let has_domain_pda = accounts.len() >= 2 && *accounts[1].key == domain_pda_key;
+
+    if !has_domain_pda {
+        let result = MetadataSpecResult {
+            spec: None,
+            accounts: vec![vam_pda_key, domain_pda_key],
+        };
+        let bytes = borsh::to_vec(&SimulationReturnData::new(result))
+            .map_err(|_| ProgramError::BorshIoError)?;
+        set_return_data(&bytes[..]);
+        return Ok(());
+    }
+
+    // Read validators from account 1 (domain data PDA).
+    // Re-use validators_and_threshold by passing accounts[1..] as a slice.
+    let vat = validators_and_threshold(program_id, &accounts[1..], domain)?;
+    let result = MetadataSpecResult {
+        spec: Some(MetadataSpec::MultisigMessageId {
+            validators: vat.validators,
+            threshold: vat.threshold,
+        }),
+        accounts: vec![],
+    };
+    let bytes = borsh::to_vec(&SimulationReturnData::new(result))
+        .map_err(|_| ProgramError::BorshIoError)?;
+    set_return_data(&bytes[..]);
+    Ok(())
 }
 
 /// Gets the validators and threshold for a given domain.
@@ -422,7 +479,7 @@ fn set_validators_and_threshold(
 
             // Account 3: The system program account.
             let system_program_account = next_account_info(accounts_iter)?;
-            if !solana_program::system_program::check_id(system_program_account.key) {
+            if system_program_account.key != &system_program::ID {
                 return Err(Error::AccountOutOfOrder.into());
             }
 
@@ -468,9 +525,8 @@ fn get_owner(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // may end with zero byte(s), which are incorrectly truncated as
     // simulated transaction return data.
     // See `SimulationReturnData` for details.
-    let bytes = SimulationReturnData::new(access_control_data.owner)
-        .try_to_vec()
-        .map_err(|err| ProgramError::BorshIoError(err.to_string()))?;
+    let bytes = borsh::to_vec(&SimulationReturnData::new(access_control_data.owner))
+        .map_err(|_| ProgramError::BorshIoError)?;
     set_return_data(&bytes[..]);
     Ok(())
 }
@@ -542,7 +598,6 @@ pub mod test {
         InterchainSecurityModuleInstruction, VerifyInstruction,
     };
     use multisig_ism::test_data::{get_multisig_ism_test_data, MultisigIsmTestData};
-    use solana_program::stake_history::Epoch;
     use std::str::FromStr;
 
     const ORIGIN_DOMAIN: u32 = 1234u32;
@@ -575,7 +630,6 @@ pub mod test {
             &mut domain_account_data,
             &program_id,
             false,
-            Epoch::default(),
         );
         let init_domain_data = DomainData {
             bump_seed: domain_pda_bump_seed,
@@ -709,7 +763,7 @@ pub mod test {
         let owner_key = Pubkey::new_unique();
         let mut owner_account_lamports = 0;
         let mut owner_account_data = vec![];
-        let system_program_id = solana_program::system_program::id();
+        let system_program_id = system_program::ID;
         let owner_account = AccountInfo::new(
             &owner_key,
             true,
@@ -718,7 +772,6 @@ pub mod test {
             &mut owner_account_data,
             &system_program_id,
             false,
-            Epoch::default(),
         );
 
         let (access_control_pda_key, access_control_pda_bump_seed) =
@@ -734,7 +787,6 @@ pub mod test {
             &mut access_control_account_data,
             &program_id,
             false,
-            Epoch::default(),
         );
         let init_access_control_data = AccessControlData {
             bump_seed: access_control_pda_bump_seed,
@@ -820,7 +872,6 @@ pub mod test {
             &mut domain_account_data,
             &program_id,
             false,
-            Epoch::default(),
         );
         let init_domain_data = DomainData {
             bump_seed: domain_pda_bump_seed,
@@ -836,7 +887,7 @@ pub mod test {
         let owner_key = Pubkey::new_unique();
         let mut owner_account_lamports = 0;
         let mut owner_account_data = vec![];
-        let system_program_id = solana_program::system_program::id();
+        let system_program_id = system_program::ID;
         let owner_account = AccountInfo::new(
             &owner_key,
             true,
@@ -845,7 +896,6 @@ pub mod test {
             &mut owner_account_data,
             &system_program_id,
             false,
-            Epoch::default(),
         );
 
         let (access_control_pda_key, access_control_pda_bump_seed) =
@@ -861,7 +911,6 @@ pub mod test {
             &mut access_control_account_data,
             &program_id,
             false,
-            Epoch::default(),
         );
         let init_access_control_data = AccessControlData {
             bump_seed: access_control_pda_bump_seed,

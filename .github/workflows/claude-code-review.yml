@@ -12,87 +12,35 @@ on:
   issue_comment:
     types: [created]
 
+env:
+  CLAUDE_OPUS_MODEL: claude-opus-5-5
+
 concurrency:
   group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: false
 
 jobs:
-  # On-demand code review triggered by @claude review comment or 'claude-review' label
+  # On-demand code review triggered by @claude + review comment or 'claude-review' label
   code-review:
     if: |
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        contains(github.event.comment.body, '@claude review')
+        contains(github.event.comment.body, '@claude') &&
+        contains(github.event.comment.body, ' review') &&
+        !contains(github.event.comment.body, 'security') &&
+        (
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
       ) ||
       (
         github.event_name == 'pull_request' &&
-        contains(join(github.event.pull_request.labels.*.name, ','), 'claude-review')
+        contains(join(github.event.pull_request.labels.*.name, ','), 'claude-review') &&
+        github.event.pull_request.head.repo.full_name == github.repository
       )
-    runs-on: depot-ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-      id-token: write
-    steps:
-      - name: Get PR SHA
-        id: pr-sha
-        uses: actions/github-script@v7
-        with:
-          script: |
-            if (context.eventName === 'issue_comment') {
-              const { data: pr } = await github.rest.pulls.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: context.issue.number
-              });
-              core.setOutput('head_sha', pr.head.sha);
-            } else {
-              core.setOutput('head_sha', context.payload.pull_request.head.sha);
-            }
-
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ steps.pr-sha.outputs.head_sha }}
-          fetch-depth: 0
-
-      - name: Read code review prompt
-        id: prompt
-        run: |
-          {
-            echo 'content<<EOF'
-            cat .github/prompts/code-review.md
-            echo 'EOF'
-          } >> $GITHUB_OUTPUT
-
-      - name: Run Claude Code Review
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: ${{ steps.prompt.outputs.content }}
-          track_progress: true
-          claude_args: |
-            --model claude-opus-4-5
-            --max-turns 30
-
-  # Security-focused review: auto on PR or manual via @claude security
-  security-review:
-    if: |
-      (
-        github.event_name == 'pull_request' &&
-        !github.event.pull_request.draft &&
-        !contains(github.event.pull_request.title, '[skip-review]') &&
-        !contains(join(github.event.pull_request.labels.*.name, ','), 'skip-review')
-      ) ||
-      (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        contains(github.event.comment.body, '@claude security')
-      )
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
@@ -117,38 +65,93 @@ jobs:
             }
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.pr-sha.outputs.head_sha }}
-          fetch-depth: 2
+          fetch-depth: 0
+
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: 'Use agent teams to run /claude-review, then use /inline-pr-comments to post findings as a consolidated PR review with inline comments'
+          track_progress: true
+          use_sticky_comment: false
+          claude_args: |
+            --model ${{ env.CLAUDE_OPUS_MODEL }}
+            --allowedTools "Bash(gh api:*)"
+
+  # Security-focused review: manual via @claude + security comment
+  security-review:
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude') &&
+      contains(github.event.comment.body, 'security') &&
+      (
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Get PR SHA
+        id: pr-sha
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.eventName === 'issue_comment') {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number
+              });
+              core.setOutput('head_sha', pr.head.sha);
+            } else {
+              core.setOutput('head_sha', context.payload.pull_request.head.sha);
+            }
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pr-sha.outputs.head_sha }}
+          fetch-depth: 0
 
       - name: Run Claude Security Review
-        uses: anthropics/claude-code-security-review@25e460eb0a12077f0c6a1934d5dbae2f50785dda
+        uses: anthropics/claude-code-action@v1
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
         with:
-          claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          comment-pr: true
-          upload-results: true
-          exclude-directories: 'node_modules,dist,coverage,artifacts,cache,typechain'
-          claudecode-timeout: '15'
-          claude-model: claude-opus-4-5
-          custom-security-scan-instructions: '.github/prompts/security-scan.md'
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: 'Use agent teams to run /claude-security-review, then use /inline-pr-comments to post findings as a consolidated PR review with inline comments'
+          track_progress: true
+          use_sticky_comment: false
+          claude_args: |
+            --model ${{ env.CLAUDE_OPUS_MODEL }}
+            --allowedTools "Bash(gh api:*)"
 
-  # Trail of Bits security skills: auto on PR or manual via @claude security
+  # Trail of Bits security skills: manual via @claude + security comment
   tob-security-skills:
     if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude') &&
+      contains(github.event.comment.body, 'security') &&
       (
-        github.event_name == 'pull_request' &&
-        !github.event.pull_request.draft &&
-        !contains(github.event.pull_request.title, '[skip-review]') &&
-        !contains(join(github.event.pull_request.labels.*.name, ','), 'skip-review')
-      ) ||
-      (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        contains(github.event.comment.body, '@claude security')
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
       )
-    runs-on: depot-ubuntu-latest
-    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: write
@@ -173,6 +176,12 @@ jobs:
               core.setOutput('base_sha', context.payload.pull_request.base.sha);
             }
 
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pr-sha.outputs.head_sha }}
+          fetch-depth: 0
+
       - name: Check for Solidity changes
         id: solidity-changes
         uses: dorny/paths-filter@v3
@@ -183,66 +192,85 @@ jobs:
             solidity:
               - 'solidity/**'
 
-      - name: Checkout repository
-        if: steps.solidity-changes.outputs.solidity == 'true'
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ steps.pr-sha.outputs.head_sha }}
-          fetch-depth: 0
-
-      - name: Read ToB security skills prompt
-        if: steps.solidity-changes.outputs.solidity == 'true'
-        id: tob-prompt
-        run: |
-          {
-            echo 'content<<EOF'
-            cat .github/prompts/tob-security-skills.md
-            echo 'EOF'
-          } >> $GITHUB_OUTPUT
-
       - name: Run ToB Security Skills
         if: steps.solidity-changes.outputs.solidity == 'true'
         uses: anthropics/claude-code-action@v1
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: ${{ steps.tob-prompt.outputs.content }}
+          prompt: 'Use agent teams to run /claude-tob-review, then use /inline-pr-comments to post findings as a consolidated PR review with inline comments'
           track_progress: true
+          use_sticky_comment: false
           claude_args: |
-            --model claude-opus-4-5
-            --max-turns 25
+            --model ${{ env.CLAUDE_OPUS_MODEL }}
+            --allowedTools "Bash(gh api:*)"
 
-  # Interactive @claude mentions in comments
+  # Interactive @claude mentions in comments (excludes review/security keywords)
   interactive:
     if: |
       (
         github.event_name == 'issue_comment' &&
         contains(github.event.comment.body, '@claude') &&
-        !contains(github.event.comment.body, '@claude review') &&
-        !contains(github.event.comment.body, '@claude security')
+        !contains(github.event.comment.body, ' review') &&
+        !contains(github.event.comment.body, 'security') &&
+        (
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
       ) ||
       (
         github.event_name == 'pull_request_review_comment' &&
         contains(github.event.comment.body, '@claude') &&
-        !contains(github.event.comment.body, '@claude security')
+        !contains(github.event.comment.body, '@claude security') &&
+        (
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
       )
-    runs-on: depot-ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: write
       issues: write
       id-token: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Get PR SHA
+        id: pr-sha
+        uses: actions/github-script@v7
         with:
+          script: |
+            let prNumber;
+            if (context.eventName === 'issue_comment') {
+              prNumber = context.issue.number;
+            } else if (context.eventName === 'pull_request_review_comment') {
+              prNumber = context.payload.pull_request.number;
+            }
+            if (prNumber) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              core.setOutput('head_sha', pr.head.sha);
+            }
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pr-sha.outputs.head_sha || github.sha }}
           fetch-depth: 0
 
       - name: Run Claude Code Assistant
         uses: anthropics/claude-code-action@v1
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: 'When you have specific code feedback on changed lines, use /inline-pr-comments to deliver it as a consolidated GitHub review with inline comments.'
           track_progress: true
-          claude_args: |
-            --model claude-sonnet-4-5
-            --max-turns 20
+          use_sticky_comment: false
+          claude_args: '--model ${{ env.CLAUDE_OPUS_MODEL }}'

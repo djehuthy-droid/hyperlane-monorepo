@@ -235,18 +235,32 @@ impl Program {
 
     #[allow(dead_code)]
     pub fn run(self) -> impl TaskHandle<Output = ()> {
-        MappingTaskHandle(self.run_full(true, false), |_| ())
+        MappingTaskHandle(self.run_full(true, false), |(_, _)| ())
     }
 
     #[allow(dead_code)]
     pub fn run_ignore_code(self) -> impl TaskHandle<Output = ()> {
-        MappingTaskHandle(self.run_full(false, false), |_| ())
+        MappingTaskHandle(self.run_full(false, false), |(_, _)| ())
     }
 
     #[allow(dead_code)]
     pub fn run_with_output(self) -> impl TaskHandle<Output = Vec<String>> {
-        MappingTaskHandle(self.run_full(false, true), |o| {
+        MappingTaskHandle(self.run_full(false, true), |(_, o)| {
             o.expect("Command did not return output")
+        })
+    }
+
+    /// Run and return whether the command exited successfully (exit code 0).
+    #[allow(dead_code)]
+    pub fn run_to_success(self) -> impl TaskHandle<Output = bool> {
+        MappingTaskHandle(self.run_full(false, false), |(success, _)| success)
+    }
+
+    /// Capture stdout while preserving the process exit status.
+    #[allow(dead_code)]
+    pub fn run_with_status_and_output(self) -> impl TaskHandle<Output = (bool, Vec<String>)> {
+        MappingTaskHandle(self.run_full(false, true), |(success, output)| {
+            (success, output.expect("Command did not return output"))
         })
     }
 
@@ -303,7 +317,7 @@ impl Program {
     }
 
     #[apply(as_task)]
-    fn run_full(self, assert_success: bool, capture_output: bool) -> Option<Vec<String>> {
+    fn run_full(self, assert_success: bool, capture_output: bool) -> (bool, Option<Vec<String>>) {
         let mut command = self.create_command();
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -329,8 +343,6 @@ impl Program {
         };
 
         let status = loop {
-            sleep(Duration::from_millis(500));
-
             if let Some(exit_status) = child.try_wait().expect("Failed to run command") {
                 break exit_status;
             } else if SHUTDOWN.load(Ordering::Relaxed) {
@@ -338,18 +350,21 @@ impl Program {
                 stop_child(&mut child);
                 break child.wait().expect("Failed to run command");
             }
+            // Observe short-lived commands promptly without busy-waiting.
+            sleep(Duration::from_millis(20));
         };
 
         running.store(false, Ordering::Relaxed);
         stdout.join().unwrap();
         stderr.join().unwrap();
+        let success = status.success();
         assert!(
-            !assert_success || !RUN_LOG_WATCHERS.load(Ordering::Relaxed) || status.success(),
+            !assert_success || !RUN_LOG_WATCHERS.load(Ordering::Relaxed) || success,
             "Command returned non-zero exit code: {:?}",
             &self
         );
 
-        stdout_ch_rx.map(|rx| rx.into_iter().collect())
+        (success, stdout_ch_rx.map(|rx| rx.into_iter().collect()))
     }
 }
 
@@ -392,5 +407,32 @@ fn prefix_log(
         } else {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captures_stdout_and_failed_exit_status() {
+        let (success, output) = Program::new("sh")
+            .raw_arg("-c")
+            .raw_arg("printf 'first\\nlast\\n'; exit 7")
+            .run_with_status_and_output()
+            .join();
+        assert!(!success);
+        assert_eq!(output, ["first", "last"]);
+    }
+
+    #[test]
+    fn captures_stdout_and_successful_exit_status() {
+        let (success, output) = Program::new("sh")
+            .raw_arg("-c")
+            .raw_arg("printf 'complete\\n'")
+            .run_with_status_and_output()
+            .join();
+        assert!(success);
+        assert_eq!(output, ["complete"]);
     }
 }

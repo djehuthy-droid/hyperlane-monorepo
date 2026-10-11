@@ -1,3 +1,5 @@
+import { BigNumber } from 'ethers';
+
 import { Ownable, Router } from '@hyperlane-xyz/core';
 import {
   Address,
@@ -88,24 +90,31 @@ export abstract class HyperlaneRouterDeployer<
             `Enrolling remote routers (${chains.join(', ')}) on ${chain}`,
           );
           const router = this.router(contracts);
-          const estimatedGas = await router.estimateGas.enrollRemoteRouters(
-            domains,
-            addresses,
-          );
-          // deploy with 10% buffer on gas limit
+          const txOverrides = this.multiProvider.getTransactionOverrides(chain);
+          const gasLimit =
+            txOverrides.gasLimit != null
+              ? BigNumber.from(txOverrides.gasLimit)
+              : addBufferToGasLimit(
+                  await router.estimateGas.enrollRemoteRouters(
+                    domains,
+                    addresses,
+                  ),
+                );
           const enrollTx = await router.enrollRemoteRouters(
             domains,
             addresses,
-            {
-              gasLimit: addBufferToGasLimit(estimatedGas),
-              ...this.multiProvider.getTransactionOverrides(chain),
-            },
+            { ...txOverrides, gasLimit },
           );
           await this.multiProvider.handleTx(chain, enrollTx);
         });
       }),
     );
   }
+
+  protected async beforeTransferOwnership(
+    _contractsMap: HyperlaneContractsMap<Factories>,
+    _configMap: ChainMap<Config>,
+  ): Promise<void> {}
 
   async transferOwnership(
     contractsMap: HyperlaneContractsMap<Factories>,
@@ -127,6 +136,7 @@ export abstract class HyperlaneRouterDeployer<
 
   async deploy(
     configMap: ChainMap<Config>,
+    options: { deferRouterEnrollment?: boolean } = {},
   ): Promise<HyperlaneContractsMap<Factories>> {
     // Only deploy on chains that don't have foreign deployments.
     const configMapToDeploy = objFilter(
@@ -143,13 +153,16 @@ export abstract class HyperlaneRouterDeployer<
 
     const deployedContractsMap = await super.deploy(configMapToDeploy);
 
-    await this.enrollRemoteRouters(
-      deployedContractsMap,
-      configMap,
-      foreignDeployments,
-    );
+    if (!options.deferRouterEnrollment) {
+      await this.enrollRemoteRouters(
+        deployedContractsMap,
+        configMap,
+        foreignDeployments,
+      );
+    }
     await this.deployAndConfigureTokenFees(deployedContractsMap, configMap);
     await this.configureClients(deployedContractsMap, configMap);
+    await this.beforeTransferOwnership(deployedContractsMap, configMap);
     await this.transferOwnership(deployedContractsMap, configMap);
     this.logger.debug(`Finished deploying router contracts for all chains.`);
 

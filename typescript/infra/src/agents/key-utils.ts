@@ -1,11 +1,12 @@
 import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
-import { join } from 'path';
+import { basename, dirname, join } from 'path';
 
 import { ChainMap, ChainName } from '@hyperlane-xyz/sdk';
 import {
   Address,
   ProtocolType,
+  assert,
   deepEquals,
   objMap,
   rootLogger,
@@ -13,14 +14,14 @@ import {
 import { readJsonFromDir } from '@hyperlane-xyz/utils/fs';
 
 import { Contexts } from '../../config/contexts.js';
-import { helloworld } from '../../config/environments/helloworld.js';
-import localKathyAddresses from '../../config/kathy.json' with { type: 'json' };
 import { getChain } from '../../config/registry.js';
 import localRelayerAddresses from '../../config/relayer.json' with { type: 'json' };
-import { getAWValidatorsPath } from '../../scripts/agent-utils.js';
-import { getJustHelloWorldConfig } from '../../scripts/helloworld/utils.js';
-import { AgentContextConfig, RootAgentConfig } from '../config/agent/agent.js';
-import { DeployEnvironment } from '../config/environment.js';
+import type {
+  AgentContextConfig,
+  RootAgentConfig,
+} from '../config/agent/agent.js';
+import type { DeployEnvironment } from '../config/deploy-environment.js';
+import { getAWValidatorsPath } from '../paths.js';
 import { Role } from '../roles.js';
 import { fetchGCPSecret, setGCPSecretUsingClient } from '../utils/gcloud.js';
 import {
@@ -32,6 +33,7 @@ import {
 
 import { AgentAwsKey } from './aws/key.js';
 import { AgentGCPKey } from './gcp.js';
+import { AgentGcpKmsKey } from './gcp-kms/kms-key.js';
 import { CloudAgentKey } from './keys.js';
 
 export type LocalRoleAddresses = Record<
@@ -40,14 +42,30 @@ export type LocalRoleAddresses = Record<
 >;
 export const relayerAddresses: LocalRoleAddresses =
   localRelayerAddresses as LocalRoleAddresses;
-export const kathyAddresses: LocalRoleAddresses =
-  localKathyAddresses as LocalRoleAddresses;
 
 const logger = rootLogger.child({ module: 'infra:agents:key-utils' });
 
 export interface KeyAsAddress {
   identifier: string;
   address: string;
+}
+
+function isKeyAsAddressArray(value: unknown): value is KeyAsAddress[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry) =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        typeof (entry as KeyAsAddress).identifier === 'string' &&
+        typeof (entry as KeyAsAddress).address === 'string',
+    )
+  );
+}
+
+function isSecretNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /not[_\s]?found/i.test(message);
 }
 
 const CONFIG_DIRECTORY_PATH = join(getInfraPath(), 'config');
@@ -87,9 +105,15 @@ export function getRoleKeysPerChain(
 // }
 function getRoleKeyMapPerChain(
   agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
 ): ChainMap<Record<Role, Record<string, CloudAgentKey>>> {
   const keysPerChain: ChainMap<Record<Role, Record<string, CloudAgentKey>>> =
     {};
+
+  // Validator keys are Cloud KMS keys whose read access is restricted; only
+  // reconcile them when validators are actually being deployed.
+  const includeValidatorKeys =
+    !deployedRoles || deployedRoles.includes(Role.Validator);
 
   const setValidatorKeys = () => {
     const validators = agentConfig.validators;
@@ -128,23 +152,6 @@ function getRoleKeyMapPerChain(
     }
   };
 
-  const setKathyKeys = () => {
-    const helloWorldConfig = getJustHelloWorldConfig(
-      helloworld[agentConfig.runEnv as 'mainnet3' | 'testnet4'], // test doesn't have hello world configs
-      agentConfig.context,
-    );
-    // Kathy is only needed on chains where the hello world contracts are deployed.
-    for (const chainName of Object.keys(helloWorldConfig.addresses)) {
-      const kathyKey = getKathyKeyForChain(agentConfig, chainName);
-      keysPerChain[chainName] = {
-        ...keysPerChain[chainName],
-        [Role.Kathy]: {
-          [kathyKey.identifier]: kathyKey,
-        },
-      };
-    }
-  };
-
   const setDeployerKeys = () => {
     const deployerKey = getDeployerKey(agentConfig);
     // Default to using the relayer keys for the deployer keys
@@ -171,22 +178,52 @@ function getRoleKeyMapPerChain(
     }
   };
 
+  const setInventoryRebalancerKeys = () => {
+    const inventoryKey = getInventoryRebalancerKey(agentConfig);
+    // Assign the single inventory rebalancer key to all chains that have a relayer configured
+    for (const chainName of agentConfig.contextChainNames.relayer) {
+      keysPerChain[chainName] = {
+        ...keysPerChain[chainName],
+        [Role.InventoryRebalancer]: {
+          [inventoryKey.identifier]: inventoryKey,
+        },
+      };
+    }
+  };
+
+  const setQuoteSignerKeys = () => {
+    const quoteSignerKey = getQuoteSignerKey(agentConfig);
+    for (const chainName of agentConfig.contextChainNames.relayer) {
+      keysPerChain[chainName] = {
+        ...keysPerChain[chainName],
+        [Role.QuoteSigner]: {
+          [quoteSignerKey.identifier]: quoteSignerKey,
+        },
+      };
+    }
+  };
+
   for (const role of agentConfig.rolesWithKeys) {
     switch (role) {
       case Role.Validator:
-        setValidatorKeys();
+        if (includeValidatorKeys) {
+          setValidatorKeys();
+        }
         break;
       case Role.Relayer:
         setRelayerKeys();
-        break;
-      case Role.Kathy:
-        setKathyKeys();
         break;
       case Role.Deployer:
         setDeployerKeys();
         break;
       case Role.Rebalancer:
         setRebalancerKeys();
+        break;
+      case Role.InventoryRebalancer:
+        setInventoryRebalancerKeys();
+        break;
+      case Role.QuoteSigner:
+        setQuoteSignerKeys();
         break;
       default:
         throw Error(`Unsupported role with keys ${role}`);
@@ -199,9 +236,10 @@ function getRoleKeyMapPerChain(
 // Gets a big array of all keys.
 export function getAllCloudAgentKeys(
   agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
 ): Array<CloudAgentKey> {
   logger.debug('Retrieving all cloud agent keys');
-  const keysPerChain = getRoleKeyMapPerChain(agentConfig);
+  const keysPerChain = getRoleKeyMapPerChain(agentConfig, deployedRoles);
 
   const keysByIdentifier = Object.keys(keysPerChain).reduce(
     (acc, chainName) => {
@@ -248,15 +286,14 @@ export function getCloudAgentKey(
         throw Error('Must provide chainName for relayer key');
       }
       return getRelayerKeyForChain(agentConfig, chainName);
-    case Role.Kathy:
-      if (chainName === undefined) {
-        throw Error('Must provide chainName for kathy key');
-      }
-      return getKathyKeyForChain(agentConfig, chainName);
     case Role.Deployer:
       return getDeployerKey(agentConfig);
     case Role.Rebalancer:
       return getRebalancerKey(agentConfig);
+    case Role.InventoryRebalancer:
+      return getInventoryRebalancerKey(agentConfig);
+    case Role.QuoteSigner:
+      return getQuoteSignerKey(agentConfig);
     default:
       throw Error(`Unsupported role ${role}`);
   }
@@ -284,24 +321,6 @@ export function getRelayerKeyForChain(
     Role.Relayer,
     chainName,
   );
-}
-
-// Gets the kathy key used for signing txs to the provided chain.
-// Note this is basically a dupe of getRelayerKeyForChain, but to encourage
-// consumers to be aware of what role they're using, and to keep the door open
-// for future per-role deviations, we have separate functions.
-export function getKathyKeyForChain(
-  agentConfig: AgentContextConfig,
-  chainName: ChainName,
-): CloudAgentKey {
-  logger.debug(`Retrieving kathy key for ${chainName}`);
-  // If AWS is enabled and the chain is an Ethereum-based chain, we want to use
-  // an AWS key.
-  if (agentConfig.aws && isEthereumProtocolChain(chainName)) {
-    return new AgentAwsKey(agentConfig, Role.Kathy);
-  }
-
-  return new AgentGCPKey(agentConfig.runEnv, agentConfig.context, Role.Kathy);
 }
 
 // Returns the deployer key for the specified chain or EVM by default in the provided context.
@@ -332,6 +351,30 @@ export function getRebalancerKey(
   );
 }
 
+// Returns the inventory rebalancer key. This is always a GCP key, not chain specific
+// and in the Hyperlane context
+export function getInventoryRebalancerKey(
+  agentConfig: AgentContextConfig,
+): CloudAgentKey {
+  logger.debug('Retrieving inventory rebalancer key');
+  return new AgentGCPKey(
+    agentConfig.runEnv,
+    Contexts.Hyperlane,
+    Role.InventoryRebalancer,
+  );
+}
+
+export function getQuoteSignerKey(
+  agentConfig: AgentContextConfig,
+): CloudAgentKey {
+  logger.debug('Retrieving quote signer key');
+  return new AgentGCPKey(
+    agentConfig.runEnv,
+    Contexts.Hyperlane,
+    Role.QuoteSigner,
+  );
+}
+
 // Helper function to determine if a chain is Starknet
 function isStarknetChain(chainName: ChainName): boolean {
   const metadata = getChain(chainName);
@@ -351,15 +394,18 @@ export function getValidatorKeysForChain(
   chainSigner: CloudAgentKey;
 } {
   logger.debug(`Retrieving validator keys for ${chainName}`);
-  const validator = agentConfig.aws
-    ? new AgentAwsKey(agentConfig, Role.Validator, chainName, index)
-    : new AgentGCPKey(
-        agentConfig.runEnv,
-        agentConfig.context,
-        Role.Validator,
-        chainName,
-        index,
-      );
+  // GCP-KMS key is per index, not per chain (see AgentGcpKmsKey).
+  const validator = agentConfig.gcp
+    ? new AgentGcpKmsKey(agentConfig, Role.Validator, index)
+    : agentConfig.aws
+      ? new AgentAwsKey(agentConfig, Role.Validator, chainName, index)
+      : new AgentGCPKey(
+          agentConfig.runEnv,
+          agentConfig.context,
+          Role.Validator,
+          chainName,
+          index,
+        );
 
   // If the chain is Ethereum-based, we can just use the validator key (even if it's AWS-based)
   // as the chain signer. Otherwise, we need to use a GCP key.
@@ -388,9 +434,13 @@ export function getValidatorKeysForChain(
 // ==================
 
 export async function createAgentKeysIfNotExistsWithPrompt(
-  agentConfig: AgentContextConfig,
+  agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
 ) {
-  const agentKeysToCreate = await agentKeysToBeCreated(agentConfig);
+  const agentKeysToCreate = await agentKeysToBeCreated(
+    agentConfig,
+    deployedRoles,
+  );
   const shouldCreateKeys = agentKeysToCreate.length > 0;
 
   if (shouldCreateKeys) {
@@ -406,18 +456,21 @@ export async function createAgentKeysIfNotExistsWithPrompt(
     }
 
     console.log(chalk.blue.bold('Creating new agent keys if needed.'));
-    await createAgentKeys(agentConfig, agentKeysToCreate);
+    await createAgentKeys(agentConfig, agentKeysToCreate, deployedRoles);
   } else {
     console.log(chalk.gray.bold('No new agent keys will be created.'));
     // Persist all keys, even if no new ones were created
-    await persistAddresses(agentConfig);
+    await persistAddresses(agentConfig, deployedRoles);
   }
   return shouldCreateKeys;
 }
 
 // We can create or delete keys if they are not Starknet keys.
-function getModifiableKeys(agentConfig: AgentContextConfig): CloudAgentKey[] {
-  const keys = getAllCloudAgentKeys(agentConfig);
+function getModifiableKeys(
+  agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
+): CloudAgentKey[] {
+  const keys = getAllCloudAgentKeys(agentConfig, deployedRoles);
   // if the key has a chainName and it is a Starknet chain, filter it out
   return keys.filter(
     (key) => !(key.chainName && isStarknetChain(key.chainName)),
@@ -425,12 +478,13 @@ function getModifiableKeys(agentConfig: AgentContextConfig): CloudAgentKey[] {
 }
 
 async function createAgentKeys(
-  agentConfig: AgentContextConfig,
+  agentConfig: RootAgentConfig,
   agentKeysToCreate: string[],
+  deployedRoles?: Role[],
 ) {
   logger.debug('Creating agent keys if none exist');
 
-  const keys = getAllCloudAgentKeys(agentConfig);
+  const keys = getAllCloudAgentKeys(agentConfig, deployedRoles);
 
   const keysToCreate = keys.filter((key) =>
     agentKeysToCreate.includes(key.identifier),
@@ -444,18 +498,21 @@ async function createAgentKeys(
     }),
   );
 
-  await persistAddresses(agentConfig);
+  await persistAddresses(agentConfig, deployedRoles);
 }
 
-async function persistAddresses(agentConfig: AgentContextConfig) {
-  const keys = getModifiableKeys(agentConfig);
+async function persistAddresses(
+  agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
+) {
+  const keys = getModifiableKeys(agentConfig, deployedRoles);
   const addresses = await Promise.all(
     keys.map(async (key) => {
       await key.fetch();
       return key.serializeAsAddress();
     }),
   );
-  await persistAddressesLocally(agentConfig, keys);
+  await persistAddressesLocally(agentConfig, keys, deployedRoles);
   await persistAddressesInGcp(
     agentConfig.runEnv,
     agentConfig.context,
@@ -465,9 +522,10 @@ async function persistAddresses(agentConfig: AgentContextConfig) {
 }
 
 async function agentKeysToBeCreated(
-  agentConfig: AgentContextConfig,
+  agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
 ): Promise<string[]> {
-  const keysToCreateIfNotExist = getModifiableKeys(agentConfig);
+  const keysToCreateIfNotExist = getModifiableKeys(agentConfig, deployedRoles);
   return (
     await Promise.all(
       keysToCreateIfNotExist.map(async (key) =>
@@ -477,7 +535,7 @@ async function agentKeysToBeCreated(
   ).filter((id): id is string => !!id);
 }
 
-export async function deleteAgentKeys(agentConfig: AgentContextConfig) {
+export async function deleteAgentKeys(agentConfig: RootAgentConfig) {
   logger.debug('Deleting agent keys');
 
   // Filter out Starknet keys - we don't want to delete them
@@ -496,11 +554,66 @@ export async function rotateKey(
   agentConfig: AgentContextConfig,
   role: Role,
   chainName: ChainName,
+  index?: number,
 ) {
   logger.debug(`Rotating key for ${role} on ${chainName}`);
-  const key = getCloudAgentKey(agentConfig, role, chainName);
-  await key.update();
-  await persistAddressesLocally(agentConfig, [key]);
+  const key = getCloudAgentKey(agentConfig, role, chainName, index);
+  const updatedAddress = await key.update();
+  await persistRotatedKeyAddressLocally(agentConfig, key, updatedAddress);
+}
+
+async function persistRotatedKeyAddressLocally(
+  agentConfig: AgentContextConfig,
+  key: CloudAgentKey,
+  updatedAddress: Address,
+) {
+  switch (key.role) {
+    case Role.Relayer:
+      await persistRoleAddressesToLocalArtifacts(
+        Role.Relayer,
+        agentConfig.runEnv,
+        agentConfig.context,
+        updatedAddress,
+        relayerAddresses,
+      );
+      break;
+    case Role.Validator: {
+      if (!key.chainName || key.index === undefined) {
+        throw new Error('Validator key rotation requires chain name and index');
+      }
+      const validatorsPath = getAWValidatorsPath(
+        agentConfig.runEnv,
+        agentConfig.context,
+      );
+      const validatorAddresses = readJsonFromDir<
+        ChainMap<{ validators: Address[] }>
+      >(dirname(validatorsPath), basename(validatorsPath));
+      const chainValidators = [
+        ...(validatorAddresses[key.chainName]?.validators ?? []),
+      ];
+      if (key.index >= chainValidators.length) {
+        throw new Error(
+          `No existing validator address at index ${key.index} for ${key.chainName}`,
+        );
+      }
+      chainValidators[key.index] = updatedAddress;
+      await persistValidatorAddressesToLocalArtifacts(
+        agentConfig.runEnv,
+        agentConfig.context,
+        {
+          ...validatorAddresses,
+          [key.chainName]: {
+            validators: chainValidators,
+          },
+        },
+      );
+      break;
+    }
+    default:
+      throw new Error(
+        `Local address persistence is not supported for rotated ${key.role} keys`,
+      );
+  }
 }
 
 async function persistAddressesInGcp(
@@ -508,22 +621,47 @@ async function persistAddressesInGcp(
   context: Contexts,
   keys: KeyAsAddress[],
 ) {
+  // Upsert by identifier into the existing secret rather than overwriting it.
+  // Key reconciliation may be scoped to a subset of roles (e.g. a relayer-only
+  // deploy), so a wholesale overwrite would drop addresses for the roles that
+  // were not reconciled this run.
+  let existingKeys: KeyAsAddress[] = [];
   try {
-    const existingSecret = (await fetchGCPSecret(
+    const existingSecret = await fetchGCPSecret(
       addressesIdentifier(environment, context),
       true,
-    )) as KeyAsAddress[];
-    if (deepEquals(keys, existingSecret)) {
-      logger.debug(
-        `Addresses already persisted to GCP for ${context} context in ${environment} environment`,
-      );
-      return;
+    );
+    assert(
+      isKeyAsAddressArray(existingSecret),
+      `Unexpected shape for ${context} addresses secret in ${environment}`,
+    );
+    existingKeys = existingSecret;
+  } catch (error) {
+    // Only a confirmed missing secret is safe to treat as empty. Any other
+    // failure (transient, permission, malformed) must abort: proceeding would
+    // overwrite the secret with a reduced, role-scoped set and drop the
+    // addresses of roles that were not reconciled this run.
+    if (!isSecretNotFoundError(error)) {
+      throw error;
     }
-  } catch (e) {
-    // If the secret doesn't exist, we'll create it below.
     logger.debug(
       `No existing secret found for ${context} context in ${environment} environment`,
     );
+  }
+
+  const mergedByIdentifier = new Map<string, KeyAsAddress>(
+    existingKeys.map((key) => [key.identifier, key]),
+  );
+  for (const key of keys) {
+    mergedByIdentifier.set(key.identifier, key);
+  }
+  const mergedKeys = [...mergedByIdentifier.values()];
+
+  if (deepEquals(mergedKeys, existingKeys)) {
+    logger.debug(
+      `Addresses already persisted to GCP for ${context} context in ${environment} environment`,
+    );
+    return;
   }
 
   logger.debug(
@@ -531,7 +669,7 @@ async function persistAddressesInGcp(
   );
   await setGCPSecretUsingClient(
     addressesIdentifier(environment, context),
-    JSON.stringify(keys),
+    JSON.stringify(mergedKeys),
     {
       environment,
       context,
@@ -540,15 +678,20 @@ async function persistAddressesInGcp(
 }
 
 async function persistAddressesLocally(
-  agentConfig: AgentContextConfig,
+  agentConfig: RootAgentConfig,
   keys: CloudAgentKey[],
+  deployedRoles?: Role[],
 ) {
   logger.debug(
     `Persisting addresses locally for ${agentConfig.context} context in ${agentConfig.runEnv} environment`,
   );
   // recent keys fetched from aws saved to local artifacts
   const multisigValidatorKeys: ChainMap<{ validators: Address[] }> = {};
-  let relayer, kathy;
+  let relayer: Address | undefined;
+  const keysByIdentifier = Object.fromEntries(
+    keys.map((key) => [key.identifier, key]),
+  );
+
   for (const key of keys) {
     // Some types of keys come in an AWS and a GCP variant. We prefer
     // to persist the AWS version of the key if AWS is enabled.
@@ -565,34 +708,45 @@ async function persistAddressesLocally(
         throw new Error('More than one Relayer found in gcpCloudAgentKeys');
       relayer = key.address;
     }
-    if (key.role === Role.Kathy) {
-      if (kathy)
-        throw new Error('More than one Kathy found in gcpCloudAgentKeys');
-      kathy = key.address;
-    }
+  }
 
-    if (key.chainName) {
-      multisigValidatorKeys[key.chainName] ||= {
-        validators: [],
-      };
+  const validators = agentConfig.validators;
+  const includeValidatorKeys =
+    !deployedRoles || deployedRoles.includes(Role.Validator);
+  if (
+    validators &&
+    includeValidatorKeys &&
+    agentConfig.rolesWithKeys.includes(Role.Validator)
+  ) {
+    for (const chainName of agentConfig.contextChainNames.validator) {
+      const validatorCount =
+        validators.chains[chainName]?.validators.length ?? 1;
+      const validatorAddresses: Address[] = [];
 
-      // The validator role always has a chainName.
-      if (key.role === Role.Validator) {
-        multisigValidatorKeys[key.chainName].validators.push(key.address);
+      for (let index = 0; index < validatorCount; index++) {
+        const { validator } = getValidatorKeysForChain(
+          agentConfig,
+          chainName,
+          index,
+        );
+        const key = keysByIdentifier[validator.identifier];
+        if (!key) {
+          if (isStarknetChain(chainName)) {
+            continue;
+          }
+          throw new Error(`No fetched key found for ${validator.identifier}`);
+        }
+        validatorAddresses.push(key.address);
+      }
+
+      if (validatorAddresses.length > 0) {
+        multisigValidatorKeys[chainName] = {
+          validators: validatorAddresses,
+        };
       }
     }
   }
   if (!relayer) throw new Error('No Relayer found in awsCloudAgentKeys');
-  if (agentConfig.context === Contexts.Hyperlane) {
-    if (!kathy) throw new Error('No Kathy found in awsCloudAgentKeys');
-    await persistRoleAddressesToLocalArtifacts(
-      Role.Kathy,
-      agentConfig.runEnv,
-      agentConfig.context,
-      kathy,
-      kathyAddresses,
-    );
-  }
   await persistRoleAddressesToLocalArtifacts(
     Role.Relayer,
     agentConfig.runEnv,

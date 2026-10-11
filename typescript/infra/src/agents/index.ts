@@ -3,14 +3,15 @@ import { join } from 'path';
 import {
   AgentSealevelPriorityFeeOracle,
   AgentSealevelTransactionSubmitter,
+  AgentSealevelUrReveal,
   ChainName,
   RelayerConfig,
   RpcConsensusType,
 } from '@hyperlane-xyz/sdk';
-import { ProtocolType, objOmitKeys } from '@hyperlane-xyz/utils';
+import { ProtocolType, assert, objOmitKeys } from '@hyperlane-xyz/utils';
 
 import { Contexts } from '../../config/contexts.js';
-import { getChain } from '../../config/registry.js';
+import { getChain, getRegistry } from '../../config/registry.js';
 import {
   AgentConfigHelper,
   AgentContextConfig,
@@ -24,12 +25,15 @@ import {
   RelayerConfigMapConfig,
   RelayerDbBootstrapConfig,
   RelayerEnvConfig,
+  buildWarpRouteProcessAltOverrides,
 } from '../config/agent/relayer.js';
 import { ScraperConfigHelper } from '../config/agent/scraper.js';
+import type { ScraperProxyConfig } from '../config/agent/scraper-proxy.js';
 import { ValidatorConfigHelper } from '../config/agent/validator.js';
-import { DeployEnvironment } from '../config/environment.js';
+import { DeployEnvironment } from '../config/deploy-environment.js';
 import { AgentRole, Role } from '../roles.js';
 import {
+  bindWorkloadIdentityUserIfNotExists,
   createServiceAccountIfNotExists,
   createServiceAccountKey,
   fetchGCPSecret,
@@ -46,6 +50,7 @@ import {
 } from '../utils/utils.js';
 
 import { AgentGCPKey } from './gcp.js';
+import { gcpValidatorServiceAccountName } from './gcp-kms/validator-user.js';
 
 const HELM_CHART_PATH = join(
   getInfraPath(),
@@ -82,6 +87,18 @@ export abstract class AgentHelmManager extends HelmManager<HelmRootAgentValues> 
 
   async helmValues(): Promise<HelmRootAgentValues> {
     const dockerImage = this.dockerImage;
+    const { fallbackHedgeDelayMillis, fallbackHedgeTimeoutMillis } =
+      this.config.agentRoleConfig;
+    const hasFallbackHedgeDelay = fallbackHedgeDelayMillis !== undefined;
+    const hasFallbackHedgeTimeout = fallbackHedgeTimeoutMillis !== undefined;
+    assert(
+      hasFallbackHedgeDelay === hasFallbackHedgeTimeout,
+      'fallbackHedgeDelayMillis and fallbackHedgeTimeoutMillis must be configured together',
+    );
+    const fallbackHedgeConfig = hasFallbackHedgeDelay
+      ? { fallbackHedgeDelayMillis, fallbackHedgeTimeoutMillis }
+      : undefined;
+
     return {
       image: {
         repository: dockerImage.repo,
@@ -93,7 +110,9 @@ export abstract class AgentHelmManager extends HelmManager<HelmRootAgentValues> 
         aws: !!this.config.aws,
         chains: this.config.contextChainNames[this.role].map((chain) => {
           const metadata = getChain(chain);
-          const reorgPeriod = metadata.blocks?.reorgPeriod;
+          const reorgPeriod =
+            this.config.rawConfig.relayer?.reorgPeriodOverrides?.[chain] ??
+            metadata.blocks?.reorgPeriod;
           if (reorgPeriod === undefined) {
             throw new Error(`No reorg period found for chain ${chain}`);
           }
@@ -116,20 +135,48 @@ export abstract class AgentHelmManager extends HelmManager<HelmRootAgentValues> 
               );
           }
 
+          let urReveal: AgentSealevelUrReveal | undefined;
+          if (getChain(chain).protocol === ProtocolType.Sealevel) {
+            urReveal =
+              this.config.rawConfig.sealevel?.urRevealConfigGetter?.(chain);
+          }
+
           const batchConfig = this.batchConfig(chain);
+          const index = {
+            ...this.config.agentRoleConfig.index,
+            ...(this.config.rawConfig.relayer?.interval != null
+              ? { interval: this.config.rawConfig.relayer.interval }
+              : {}),
+          };
 
           return {
             name: chain,
             rpcConsensusType: this.rpcConsensusType(chain),
+            ...(metadata.protocol === ProtocolType.Ethereum &&
+            fallbackHedgeConfig
+              ? fallbackHedgeConfig
+              : {}),
+            ...(metadata.protocol === ProtocolType.Sealevel
+              ? {
+                  maxSupportedTransactionVersion:
+                    this.config.rawConfig.sealevel?.maxSupportedTransactionVersionGetter?.(
+                      chain,
+                    ) ?? 0,
+                }
+              : {}),
             protocol: metadata.protocol,
             blocks: { reorgPeriod },
             maxBatchSize: batchConfig.maxBatchSize,
             bypassBatchSimulation: batchConfig.bypassBatchSimulation,
             ...(batchConfig.maxSubmitQueueLength
-              ? { maxSubmitQueueLength: batchConfig.maxSubmitQueueLength }
+              ? {
+                  maxSubmitQueueLength: batchConfig.maxSubmitQueueLength,
+                }
               : {}),
+            ...(Object.keys(index).length > 0 ? { index } : {}),
             priorityFeeOracle,
             transactionSubmitter,
+            urReveal,
           };
         }),
       },
@@ -137,8 +184,8 @@ export abstract class AgentHelmManager extends HelmManager<HelmRootAgentValues> 
   }
 
   rpcConsensusType(chain: ChainName): RpcConsensusType {
-    // Non-Ethereum chains only support Single
-    if (!isEthereumProtocolChain(chain)) {
+    // Validators implement quorum/majority over checkpoint histories on every VM.
+    if (this.role !== Role.Validator && !isEthereumProtocolChain(chain)) {
       return RpcConsensusType.Single;
     }
 
@@ -201,6 +248,31 @@ export class RelayerHelmManager extends OmniscientAgentHelmManager {
   async helmValues(): Promise<HelmRootAgentValues> {
     const values = await super.helmValues();
 
+    // Known app contexts whose names resolve to registered warp routes get
+    // destination-process ALTs automatically. Explicit overrides retain
+    // precedence and are useful for non-registry applications.
+    const registry = getRegistry();
+    const registeredWarpRoutes = (
+      this.config.relayerConfig.metricAppContextsGetter?.() ?? []
+    ).flatMap(({ name }) => {
+      const route = registry.getWarpRoute(name);
+      return route ? [route] : [];
+    });
+    const generatedProcessAltOverrides =
+      buildWarpRouteProcessAltOverrides(registeredWarpRoutes);
+    const configuredProcessAltOverrides =
+      this.config.relayerConfig.processAltOverrides ?? {};
+    values.hyperlane.chains = values.hyperlane.chains.map((chain) => {
+      const overrides = [
+        ...(configuredProcessAltOverrides[chain.name] ?? []),
+        ...(generatedProcessAltOverrides[chain.name] ?? []),
+      ];
+      if (overrides.length > 0) {
+        return { ...chain, processAltOverrides: JSON.stringify(overrides) };
+      }
+      return chain;
+    });
+
     const config = await this.config.buildConfig();
 
     // Divide the keys between the configmap and the env config.
@@ -229,6 +301,7 @@ export class RelayerHelmManager extends OmniscientAgentHelmManager {
         this.config.relayerConfig.environmentVariableEndpointEnabled ?? true,
       cacheDefaultExpirationSeconds:
         this.config.relayerConfig.cache?.defaultExpirationSeconds,
+      relayApi: this.config.relayerConfig.relayApi ?? { enabled: false },
     };
 
     const signers = await this.config.signers();
@@ -249,6 +322,17 @@ export class RelayerHelmManager extends OmniscientAgentHelmManager {
       value: 'relayer',
       effect: 'NoSchedule',
     });
+
+    // The toleration above only permits relayers onto the tainted relayer pool;
+    // it does not force them there. Historically the oversized resource requests
+    // meant the pods only fit on the relayer pool, but with right-sized requests
+    // they can now land on other pools. Pin mainnet3 relayers to the relayer node
+    // pool explicitly so they schedule there deterministically at redeploy.
+    if (this.environment === 'mainnet3') {
+      values.nodeSelector = {
+        'cloud.google.com/gke-nodepool': 'relayer-pool-2',
+      };
+    }
 
     return values;
   }
@@ -342,6 +426,55 @@ export class ScraperHelmManager extends OmniscientAgentHelmManager {
   }
 }
 
+export class ScraperProxyHelmManager extends HelmManager<HelmRootAgentValues> {
+  readonly helmChartPath: string = HELM_CHART_PATH;
+  readonly helmReleaseName = 'scraper-proxy';
+  private readonly scraperProxy: ScraperProxyConfig;
+
+  constructor(private readonly config: RootAgentConfig) {
+    super();
+    const scraperProxy = config.scraperProxy;
+    if (!scraperProxy)
+      throw new Error('Scraper proxy is not defined for this context');
+    this.scraperProxy = scraperProxy;
+  }
+
+  get namespace(): string {
+    return this.config.namespace;
+  }
+
+  async helmValues(): Promise<HelmRootAgentValues> {
+    const { docker, ...scraperProxy } = this.scraperProxy;
+    return {
+      fullnameOverride: 'scraper-proxy',
+      image: {
+        repository: docker.repo,
+        tag: docker.tag,
+      },
+      hyperlane: {
+        runEnv: this.config.runEnv,
+        context: this.config.context,
+        aws: false,
+        chains: [],
+        scraperProxy,
+      },
+    };
+  }
+
+  async restartDeployment(): Promise<void> {
+    await this.runCommand(
+      `kubectl rollout restart deployment/${this.helmReleaseName} -n ${this.namespace}`,
+    );
+    await this.runCommand(
+      `kubectl rollout status deployment/${this.helmReleaseName} -n ${this.namespace} --timeout=180s`,
+    );
+  }
+
+  protected async runCommand(command: string): Promise<void> {
+    await execCmd(command);
+  }
+}
+
 export class ValidatorHelmManager extends MultichainAgentHelmManager {
   protected readonly config: ValidatorConfigHelper;
   readonly role: Role.Validator = Role.Validator;
@@ -353,6 +486,12 @@ export class ValidatorHelmManager extends MultichainAgentHelmManager {
       throw Error('Context does not support chain');
     if (!this.config.environmentChainNames.includes(chainName))
       throw Error('Environment does not support chain');
+  }
+
+  // Own namespace per environment (shared across contexts) — the k8s
+  // namespace is the trust boundary Workload Identity relies on.
+  override get namespace(): string {
+    return `validator-${this.environment}`;
   }
 
   get length(): number {
@@ -368,15 +507,27 @@ export class ValidatorHelmManager extends MultichainAgentHelmManager {
     helmValues.hyperlane.chains = helmValues.hyperlane.chains.filter(
       (chain) => chain.name === cfg.originChainName,
     );
-
+    const originChain = helmValues.hyperlane.chains[0];
+    if (!originChain) {
+      throw new Error(`Missing chain config for ${cfg.originChainName}`);
+    }
+    originChain.blocks = {
+      ...originChain.blocks,
+      reorgPeriod: cfg.reorgPeriod,
+    };
+    originChain.index = {
+      ...originChain.index,
+      interval: cfg.interval,
+    };
     helmValues.hyperlane.validator = {
       enabled: true,
       configs: cfg.validators.map((c) => ({
         ...c,
         originChainName: cfg.originChainName,
         interval: cfg.interval,
+        websocketUrl: cfg.websocketUrl,
       })),
-      resources: this.kubernetesResources(),
+      resources: this.config.resourcesForChain(this.chainName),
     };
 
     // The name of the helm release for agents is `hyperlane-agent`.
@@ -384,6 +535,26 @@ export class ValidatorHelmManager extends MultichainAgentHelmManager {
     // To work around this, we shorten the name of the helm release to `agent`
     if (this.config.context !== Contexts.Hyperlane) {
       helmValues.nameOverride = 'agent';
+    }
+
+    if (this.config.gcp) {
+      // GSA is release-scoped (see ValidatorAgentGcpUser), not per index.
+      const serviceAccountEmail = `${gcpValidatorServiceAccountName(this.context, this.environment, this.chainName)}@${this.config.gcp.project}.iam.gserviceaccount.com`;
+      // Pinned explicitly so it matches what the chart actually creates,
+      // rather than duplicating its `agent-common.fullname` derivation here.
+      const ksaName = this.helmReleaseName;
+      helmValues.serviceAccount = {
+        name: ksaName,
+        annotations: {
+          'iam.gke.io/gcp-service-account': serviceAccountEmail,
+        },
+      };
+      await bindWorkloadIdentityUserIfNotExists(
+        serviceAccountEmail,
+        this.config.gcp.project,
+        this.namespace,
+        ksaName,
+      );
     }
 
     return helmValues;

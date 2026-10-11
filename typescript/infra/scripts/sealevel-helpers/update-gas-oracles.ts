@@ -1,5 +1,5 @@
 import { confirm } from '@inquirer/prompts';
-import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { deserializeUnchecked } from 'borsh';
 import chalk from 'chalk';
 
@@ -24,9 +24,8 @@ import {
 import { Domain, ProtocolType, rootLogger } from '@hyperlane-xyz/utils';
 
 import { getChain } from '../../config/registry.js';
-import { getSecretRpcEndpoints } from '../../src/agents/index.js';
 import { chainsToSkip } from '../../src/config/chain.js';
-import { DeployEnvironment } from '../../src/config/environment.js';
+import { DeployEnvironment } from '../../src/config/deploy-environment.js';
 import {
   type GasOracleConfigWithOverhead,
   loadAndValidateGasOracleConfig,
@@ -216,16 +215,31 @@ async function manageGasOracles(
     // Always show example gas cost for this route
     const overheadForExample = config.overhead ?? 200_000;
     const exampleRemoteGas = overheadForExample + 50_000;
-    const exampleCostLamports =
+
+    const { decimals: localDecimals, symbol } =
+      mpp.getChainMetadata(chain).nativeToken!;
+    const remoteDecimals = remoteGasData.token_decimals;
+
+    // Calculate cost matching Rust IGP logic
+    let exampleCostLocalUnits =
       (remoteGasData.token_exchange_rate *
         remoteGasData.gas_price *
         BigInt(exampleRemoteGas)) /
       10n ** 19n; // TOKEN_EXCHANGE_RATE_SCALE
 
-    const { decimals, symbol } = mpp.getChainMetadata(chain).nativeToken!;
-    const exampleCost = (Number(exampleCostLamports) / 10 ** decimals).toFixed(
-      5,
-    );
+    // Convert decimals (mirrors Rust convert_decimals)
+    if (remoteDecimals > localDecimals) {
+      exampleCostLocalUnits =
+        exampleCostLocalUnits / 10n ** BigInt(remoteDecimals - localDecimals);
+    } else if (remoteDecimals < localDecimals) {
+      exampleCostLocalUnits =
+        exampleCostLocalUnits * 10n ** BigInt(localDecimals - remoteDecimals);
+    }
+
+    const exampleCost = (
+      Number(exampleCostLocalUnits) /
+      10 ** localDecimals
+    ).toFixed(5);
     rootLogger.info(
       `${chain} -> ${remoteChain}: ${exampleRemoteGas} remote gas cost: ${exampleCost} ${symbol}`,
     );
@@ -578,34 +592,34 @@ async function main() {
 
   // Process all chains in parallel
   const mpp = await envConfig.getMultiProtocolProvider();
-  const results = await Promise.all(
-    chains.map((chain) => {
-      // Wrap Turnkey signer in the adapter for this chain
-      const signerAdapter = new SvmMultiProtocolSignerAdapter(
-        chain,
-        turnkeySigner,
-        mpp,
-      );
+  const results = [];
+  for (const chain of chains) {
+    // Wrap Turnkey signer in the adapter for this chain
+    const signerAdapter = new SvmMultiProtocolSignerAdapter(
+      chain,
+      turnkeySigner,
+      mpp,
+    );
 
-      const chainGasOracleConfig = gasOracleConfig[chain];
-      if (!chainGasOracleConfig) {
-        // Guard against missing chain configuration
-        throw new Error(
-          `No gas oracle configuration found for chain '${chain}' in environment '${environment}'. ` +
-            `This would cause all existing gas oracles and overheads to be removed. ` +
-            `Please ensure the chain is configured in ${configPath}`,
-        );
-      }
-      return processChain(
-        environment,
-        mpp,
-        chain,
-        chainGasOracleConfig,
-        signerAdapter,
-        dryRun,
+    const chainGasOracleConfig = gasOracleConfig[chain];
+    if (!chainGasOracleConfig) {
+      // Guard against missing chain configuration
+      throw new Error(
+        `No gas oracle configuration found for chain '${chain}' in environment '${environment}'. ` +
+          `This would cause all existing gas oracles and overheads to be removed. ` +
+          `Please ensure the chain is configured in ${configPath}`,
       );
-    }),
-  );
+    }
+    const result = await processChain(
+      environment,
+      mpp,
+      chain,
+      chainGasOracleConfig,
+      signerAdapter,
+      dryRun,
+    );
+    results.push(result);
+  }
 
   // Print results in a table format
   console.table(results);

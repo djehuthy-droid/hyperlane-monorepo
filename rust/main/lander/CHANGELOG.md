@@ -1,3 +1,30 @@
+## [2.3.0] - 2026-07-20
+
+* feat(tron): migrate Tron agents from gRPC to HTTP API (#8370)
+* feat: mar 27 mainnets (#8482)
+* feat: sealevel metaswaps reveals (#8930)
+* fix(lander): tron tx ready for resubmission (#8394)
+* fix: Ethermint nonce detection and PostSubmitFailure retry latency (#8426)
+* refactor(evm): remove evm tron techstack (#8408)
+
+## [2.2.0] - 2026-03-09
+
+* chore: migrate spellchecker from codespell to typos (#8214)
+
+## [2.1.0] - 2026-03-04
+
+* feat(agents): add chain configuration metrics (#8185)
+* feat(tron): add ethereum compatibility & tron aws signer (#8222)
+* feat(tron): lander (#7846)
+* feat(tron): protocol type (#7827)
+* feat: Store Raw Message Dispatches (#7714)
+* fix(agents): Fix flaky CI tests in lander and relayer (#7949)
+* fix(agents): skip block gas limit cap when RPC returns zero (#8152)
+* fix(lander): Stackoverflow for Aleo (#7757)
+* fix(lander): add tolerance buffer to flaky timing test (#7983)
+* fix: Update upper nonce and finalised nonce when transaction is finalised (#7715)
+* fix: increase wait time for aleo tx resubmission (#7928)
+
 ## [2.0.0] - 2026-01-06
 
 * feat(rust): feature-gate Aleo chain support to reduce CI build times (#7569)

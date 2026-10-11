@@ -37,11 +37,12 @@ where
 #[cfg(test)]
 mod test {
     use hyperlane_core::{
-        HyperlaneDomain, HyperlaneLogStore, HyperlaneMessage, Indexed, LogMeta,
+        BackwardCursorProgress, HyperlaneBackwardCursorStore, HyperlaneDomain, HyperlaneLogStore,
+        HyperlaneMessage, Indexed, InterchainGasPayment, LogMeta, MerkleTreeInsertion,
         RawHyperlaneMessage, H256, H512, U256,
     };
 
-    use crate::db::HyperlaneRocksDB;
+    use crate::db::{HyperlaneDb, HyperlaneRocksDB};
 
     use super::*;
 
@@ -82,5 +83,139 @@ mod test {
             );
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn db_stores_and_retrieves_dispatched_tx_hash() {
+        run_test_db(|db| async move {
+            let db = HyperlaneRocksDB::new(
+                &HyperlaneDomain::new_test_domain("db_stores_and_retrieves_dispatched_tx_hash"),
+                db,
+            );
+
+            let m = HyperlaneMessage {
+                nonce: 42,
+                version: 3,
+                origin: 10,
+                sender: H256::from_low_u64_be(4),
+                destination: 12,
+                recipient: H256::from_low_u64_be(5),
+                body: vec![],
+            };
+            let tx_hash = H512::from_low_u64_be(0xdeadbeef);
+            let meta = LogMeta {
+                address: H256::from_low_u64_be(1),
+                block_number: 1,
+                block_hash: H256::from_low_u64_be(1),
+                transaction_id: tx_hash,
+                transaction_index: 0,
+                log_index: U256::from(0),
+            };
+
+            db.store_logs(&vec![(Indexed::new(m.clone()), meta)])
+                .await
+                .unwrap();
+
+            let retrieved = db
+                .retrieve_dispatched_tx_hash_by_message_id(&m.id())
+                .unwrap()
+                .unwrap();
+            assert_eq!(retrieved, tx_hash);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn backward_cursors_are_durable_and_event_specific() {
+        // Manage our own temporary path so the database can be dropped and
+        // genuinely reopened from disk, proving cursor durability. Wrapping
+        // the still-open handle would not exercise the reload path.
+        let db_tmp_dir = TempDir::new().expect("Failed to create tempdir");
+        let db_path = db_tmp_dir
+            .path()
+            .to_str()
+            .expect("Failed to create db")
+            .to_owned();
+        let domain = HyperlaneDomain::new_test_domain("backward_cursor_progress");
+        let message_progress = BackwardCursorProgress {
+            sequence: 12,
+            block: 34,
+        };
+        let newer_message_progress = BackwardCursorProgress {
+            sequence: 90,
+            block: 123,
+        };
+        let payment_progress = BackwardCursorProgress {
+            sequence: 56,
+            block: 78,
+        };
+
+        {
+            let store = HyperlaneRocksDB::new(&domain, setup_db(db_path.clone()));
+            HyperlaneBackwardCursorStore::<HyperlaneMessage>::store_backward_cursor(
+                &store,
+                message_progress,
+            )
+            .await
+            .unwrap();
+            HyperlaneBackwardCursorStore::<HyperlaneMessage>::store_backward_cursor(
+                &store,
+                newer_message_progress,
+            )
+            .await
+            .unwrap();
+            HyperlaneBackwardCursorStore::<InterchainGasPayment>::store_backward_cursor(
+                &store,
+                payment_progress,
+            )
+            .await
+            .unwrap();
+            // Drop all handles before reopening so the read below comes
+            // from disk, not the still-open instance.
+            drop(store);
+        }
+
+        {
+            let reopened = HyperlaneRocksDB::new(&domain, setup_db(db_path));
+            let message_cursors =
+                HyperlaneBackwardCursorStore::<HyperlaneMessage>::retrieve_backward_cursors(
+                    &reopened,
+                )
+                .await
+                .unwrap();
+            assert!(message_cursors.contains(&message_progress));
+            assert!(message_cursors.contains(&newer_message_progress));
+            assert_eq!(
+                HyperlaneBackwardCursorStore::<InterchainGasPayment>::retrieve_backward_cursors(
+                    &reopened
+                )
+                .await
+                .unwrap(),
+                vec![payment_progress]
+            );
+            assert_eq!(
+                HyperlaneBackwardCursorStore::<MerkleTreeInsertion>::retrieve_backward_cursors(
+                    &reopened
+                )
+                .await
+                .unwrap(),
+                Vec::new()
+            );
+            HyperlaneBackwardCursorStore::<HyperlaneMessage>::delete_backward_cursor(
+                &reopened,
+                message_progress.sequence,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                HyperlaneBackwardCursorStore::<HyperlaneMessage>::retrieve_backward_cursors(
+                    &reopened
+                )
+                .await
+                .unwrap(),
+                vec![newer_message_progress]
+            );
+        }
+        let _ = rocksdb::DB::destroy(&Options::default(), db_tmp_dir);
     }
 }

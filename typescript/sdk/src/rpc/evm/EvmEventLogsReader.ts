@@ -1,19 +1,23 @@
 import { Logger } from 'pino';
 import { z } from 'zod';
 
-import { Address, rootLogger } from '@hyperlane-xyz/utils';
+import {
+  Address,
+  assert,
+  isNullish,
+  retryAsync,
+  rootLogger,
+} from '@hyperlane-xyz/utils';
 
 import {
   getContractDeploymentTransaction,
   getLogsFromEtherscanLikeExplorerAPI,
 } from '../../block-explorer/etherscan.js';
 import { assertIsContractAddress } from '../../contracts/contracts.js';
-import {
-  ChainMetadataManager,
-  ChainNameOrId,
-  MultiProvider,
-} from '../../index.js';
+import type { ChainMetadataManager } from '../../metadata/ChainMetadataManager.js';
 import { ZBytes32String, ZHash, ZUint } from '../../metadata/customZodTypes.js';
+import { MultiProvider } from '../../providers/MultiProvider.js';
+import type { ChainNameOrId } from '../../types.js';
 
 import { GetEventLogsResponse } from './types.js';
 import { getContractCreationBlockFromRpc, getLogsFromRpc } from './utils.js';
@@ -25,6 +29,9 @@ export type EvmEventLogsReaderConfig = {
   useRPC?: boolean;
   // Specifies how many blocks can be retrieved to read the logs in a single batch
   paginationBlockRange?: number;
+  // Explorer-to-explorer fallback by strategy method. Missing options enable
+  // fallback; set a method to false to use only the primary explorer.
+  explorerFallback?: ExplorerFallbackConfig;
 };
 
 export const GetLogByTopicOptionsSchema = z.object({
@@ -42,6 +49,29 @@ type RequiredGetLogByTopicOptions = z.infer<
   typeof RequiredGetLogByTopicOptionsSchema
 >;
 
+function assertLogsMatchQuery(
+  logs: GetEventLogsResponse[],
+  query: RequiredGetLogByTopicOptions,
+): void {
+  const expectedAddress = query.contractAddress.toLowerCase();
+  const expectedTopic = query.eventTopic.toLowerCase();
+
+  for (const log of logs) {
+    assert(
+      log.address.toLowerCase() === expectedAddress,
+      `Log address ${log.address} does not match requested contract ${query.contractAddress}`,
+    );
+    assert(
+      log.topics[0]?.toLowerCase() === expectedTopic,
+      `Log topic does not match requested topic ${query.eventTopic}`,
+    );
+    assert(
+      log.blockNumber >= query.fromBlock && log.blockNumber <= query.toBlock,
+      `Log block ${log.blockNumber} is outside requested range ${query.fromBlock}-${query.toBlock}`,
+    );
+  }
+}
+
 interface IEvmEventLogsReaderStrategy {
   getContractDeploymentBlockNumber(address: Address): Promise<number>;
   getContractLogs(
@@ -49,9 +79,11 @@ interface IEvmEventLogsReaderStrategy {
   ): Promise<GetEventLogsResponse[]>;
 }
 
-export class EvmEtherscanLikeEventLogsReader
-  implements IEvmEventLogsReaderStrategy
-{
+export type ExplorerFallbackConfig = Partial<
+  Record<keyof IEvmEventLogsReaderStrategy, boolean>
+>;
+
+export class EvmEtherscanLikeEventLogsReader implements IEvmEventLogsReaderStrategy {
   constructor(
     protected readonly chain: ChainNameOrId,
     protected readonly config: Awaited<
@@ -66,9 +98,17 @@ export class EvmEtherscanLikeEventLogsReader
       { contractAddress: address },
     );
 
+    if (!isNullish(contractDeploymentTx.blockNumber)) {
+      return contractDeploymentTx.blockNumber;
+    }
+
     const deploymentTransactionReceipt = await this.multiProvider
       .getProvider(this.chain)
       .getTransactionReceipt(contractDeploymentTx.txHash);
+    assert(
+      deploymentTransactionReceipt?.blockNumber != null,
+      `No deployment receipt block number for contract ${address} on ${this.chain}`,
+    );
 
     return deploymentTransactionReceipt.blockNumber;
   }
@@ -125,7 +165,80 @@ export class EvmRpcEventLogsReader implements IEvmEventLogsReaderStrategy {
   }
 }
 
+class ExplorerFallbackError extends Error {
+  readonly isRecoverable: false | undefined;
+
+  constructor(
+    chain: ChainNameOrId,
+    readonly errors: readonly unknown[],
+  ) {
+    super(`All configured block explorers failed on chain "${chain}"`, {
+      cause: errors.at(-1),
+    });
+    this.isRecoverable = errors.every(
+      (error) =>
+        typeof error === 'object' &&
+        error !== null &&
+        Reflect.get(error, 'isRecoverable') === false,
+    )
+      ? false
+      : undefined;
+  }
+}
+
+export class FallbackEvmEventLogsReader implements IEvmEventLogsReaderStrategy {
+  constructor(
+    protected readonly chain: ChainNameOrId,
+    protected readonly readers: EvmEtherscanLikeEventLogsReader[],
+    protected readonly logger: Logger,
+    protected readonly config: ExplorerFallbackConfig = {},
+  ) {
+    assert(readers.length > 0, 'At least one explorer reader is required');
+  }
+
+  private async executeWithFallback<T>(
+    operation: (reader: EvmEtherscanLikeEventLogsReader) => Promise<T>,
+    fallbackEnabled: boolean,
+  ): Promise<T> {
+    if (!fallbackEnabled) return operation(this.readers[0]);
+
+    const errors: unknown[] = [];
+    for (const [explorerIndex, reader] of this.readers.entries()) {
+      try {
+        return await operation(reader);
+      } catch (error) {
+        errors.push(error);
+        this.logger.debug(
+          { err: error, explorerIndex },
+          `Block explorer request failed on chain "${this.chain}"`,
+        );
+      }
+    }
+
+    throw new ExplorerFallbackError(this.chain, errors);
+  }
+
+  getContractDeploymentBlockNumber(address: Address): Promise<number> {
+    return this.executeWithFallback(
+      (reader) => reader.getContractDeploymentBlockNumber(address),
+      this.config.getContractDeploymentBlockNumber ?? true,
+    );
+  }
+
+  getContractLogs(
+    options: RequiredGetLogByTopicOptions,
+  ): Promise<GetEventLogsResponse[]> {
+    return this.executeWithFallback(
+      (reader) => reader.getContractLogs(options),
+      this.config.getContractLogs ?? true,
+    );
+  }
+}
+
 export class EvmEventLogsReader {
+  private deploymentBlockCache: Map<string, number> = new Map();
+  private explorerDeploymentBlockCache: Map<string, number> = new Map();
+
   protected constructor(
     protected readonly config: EvmEventLogsReaderConfig,
     protected readonly multiProvider: MultiProvider,
@@ -141,15 +254,26 @@ export class EvmEventLogsReader {
       module: EvmEventLogsReader.name,
     }),
   ) {
-    const explorer = multiProvider.tryGetEvmExplorerMetadata(config.chain);
+    const explorers = config.useRPC
+      ? []
+      : multiProvider.tryGetEvmExplorerMetadataList(config.chain);
+    const explorerReaders = explorers.map(
+      (explorer) =>
+        new EvmEtherscanLikeEventLogsReader(
+          config.chain,
+          explorer,
+          multiProvider,
+        ),
+    );
 
     let logReaderStrategy: IEvmEventLogsReaderStrategy;
     let fallbackLogReaderSrategy: IEvmEventLogsReaderStrategy | undefined;
-    if (explorer && !config.useRPC) {
-      logReaderStrategy = new EvmEtherscanLikeEventLogsReader(
+    if (explorerReaders.length > 0) {
+      logReaderStrategy = new FallbackEvmEventLogsReader(
         config.chain,
-        explorer,
-        multiProvider,
+        explorerReaders,
+        logger,
+        config.explorerFallback,
       );
 
       fallbackLogReaderSrategy = new EvmRpcEventLogsReader(
@@ -174,28 +298,86 @@ export class EvmEventLogsReader {
     );
   }
 
+  async getContractDeploymentBlockFromExplorer(
+    contractAddress: Address,
+  ): Promise<number> {
+    const explorerReader = this.logReaderStrategy;
+    assert(
+      explorerReader instanceof FallbackEvmEventLogsReader,
+      `No block explorer is configured for chain ${this.config.chain}`,
+    );
+
+    const cached = this.explorerDeploymentBlockCache.get(contractAddress);
+    if (!isNullish(cached)) return cached;
+
+    // Do not use deploymentBlockCache here: an earlier read may have populated
+    // it from RPC bisection after an explorer failure.
+    const block = await retryAsync(() =>
+      explorerReader.getContractDeploymentBlockNumber(contractAddress),
+    );
+    this.explorerDeploymentBlockCache.set(contractAddress, block);
+    this.deploymentBlockCache.set(contractAddress, block);
+    return block;
+  }
+
+  /**
+   * The block the contract was deployed in, which is where a scan of its whole
+   * history starts. Read over the block explorer where the chain has a usable
+   * one and over the RPC otherwise, the same way `getLogsByTopic` resolves it
+   * when a caller does not supply `fromBlock`, and cached per instance.
+   *
+   * Exposed for callers that read the same range more than once: resolving it
+   * here and passing it as `fromBlock` keeps a later read from deriving it
+   * again over the RPC, which bisects `eth_getCode` through historical blocks
+   * that a chain serving no archive state cannot answer.
+   */
+  async getContractDeploymentBlock(contractAddress: Address): Promise<number> {
+    try {
+      return await retryAsync(() =>
+        this.getDeploymentBlock(contractAddress, this.logReaderStrategy),
+      );
+    } catch (err) {
+      if (!this.fallbackLogReaderStrategy) {
+        throw err;
+      }
+
+      this.logger.debug(
+        `Failed to read the deployment block of ${contractAddress} on chain "${this.config.chain}": ${err}. Falling back to using the RPC`,
+      );
+
+      return this.getDeploymentBlock(
+        contractAddress,
+        this.fallbackLogReaderStrategy,
+      );
+    }
+  }
+
   async getLogsByTopic(
     options: GetLogByTopicOptions,
   ): Promise<GetEventLogsResponse[]> {
+    const parsedOptions = GetLogByTopicOptionsSchema.parse(options);
     const provider = this.multiProvider.getProvider(this.config.chain);
     await assertIsContractAddress(
       this.multiProvider,
       this.config.chain,
-      options.contractAddress,
+      parsedOptions.contractAddress,
     );
 
-    try {
-      // do NOT remove the await here it is on purpose to catch any error
-      // here to fallback to the rpc if any is set.
-      // Removing the await will cause the caller to handle the error if any
-      // and the fallback logic won't run
-      const res = await this.getLogsByTopicWithStrategy(
-        options,
-        provider,
-        this.logReaderStrategy,
-      );
+    // Every retry and fallback must answer the same block range.
+    const resolvedOptions = {
+      ...parsedOptions,
+      toBlock: parsedOptions.toBlock ?? (await provider.getBlockNumber()),
+    };
 
-      return res;
+    try {
+      // Retry the primary strategy with exponential backoff to handle
+      // transient failures like explorer rate limits
+      return await retryAsync(() =>
+        this.getLogsByTopicWithStrategy(
+          resolvedOptions,
+          this.logReaderStrategy,
+        ),
+      );
     } catch (err) {
       if (!this.fallbackLogReaderStrategy) {
         throw err;
@@ -206,32 +388,54 @@ export class EvmEventLogsReader {
       );
 
       return this.getLogsByTopicWithStrategy(
-        options,
-        provider,
+        resolvedOptions,
         this.fallbackLogReaderStrategy,
       );
     }
   }
 
+  private async getDeploymentBlock(
+    contractAddress: string,
+    logReaderStrategy: IEvmEventLogsReaderStrategy,
+  ): Promise<number> {
+    const cached = this.deploymentBlockCache.get(contractAddress);
+    if (!isNullish(cached)) return cached;
+
+    const block =
+      await logReaderStrategy.getContractDeploymentBlockNumber(contractAddress);
+    this.deploymentBlockCache.set(contractAddress, block);
+    return block;
+  }
+
   private async getLogsByTopicWithStrategy(
     options: GetLogByTopicOptions,
-    provider: ReturnType<MultiProvider['getProvider']>,
     logReaderStrategy: IEvmEventLogsReaderStrategy,
   ): Promise<GetEventLogsResponse[]> {
     const parsedOptions = GetLogByTopicOptionsSchema.parse(options);
 
     const fromBlock =
       parsedOptions.fromBlock ??
-      (await logReaderStrategy.getContractDeploymentBlockNumber(
+      (await this.getDeploymentBlock(
         parsedOptions.contractAddress,
+        logReaderStrategy,
       ));
-    const toBlock = parsedOptions.toBlock ?? (await provider.getBlockNumber());
+    assert(
+      !isNullish(parsedOptions.toBlock),
+      'Expected the log range end to be resolved',
+    );
+    assert(
+      fromBlock <= parsedOptions.toBlock,
+      `Log range start ${fromBlock} exceeds end ${parsedOptions.toBlock}`,
+    );
 
-    return logReaderStrategy.getContractLogs({
+    const resolvedOptions = {
       contractAddress: parsedOptions.contractAddress,
       eventTopic: parsedOptions.eventTopic,
       fromBlock,
-      toBlock,
-    });
+      toBlock: parsedOptions.toBlock,
+    };
+    const logs = await logReaderStrategy.getContractLogs(resolvedOptions);
+    assertLogsMatchQuery(logs, resolvedOptions);
+    return logs;
   }
 }

@@ -6,7 +6,9 @@ import type { Address, ParsedMessage } from '@hyperlane-xyz/utils';
 import type { UpgradeConfig } from '../deploy/proxy.js';
 import type { CheckerViolation } from '../deploy/types.js';
 import { ProxyFactoryFactoriesSchema } from '../deploy/types.js';
-import { DerivedHookConfig, HookConfigSchema } from '../hook/types.js';
+import type { DerivedHookConfig, HookConfig } from '../hook/types.js';
+import { HookConfigSchema } from '../hook/types.js';
+import { hookTreeContainsLegacyIgp } from '../hook/utils.js';
 import {
   DerivedIcaRouterConfigSchema,
   IcaRouterConfigSchema,
@@ -15,8 +17,13 @@ import type { DerivedIsmConfig, IsmConfig } from '../ism/types.js';
 import { IsmConfigSchema } from '../ism/types.js';
 import type { ChainName } from '../types.js';
 import { DeployedOwnableSchema, OwnableSchema } from '../types.js';
+import {
+  ismTreeContainsCompositeRateLimited,
+  ismTreeContainsMailboxDefaultOrHybrid,
+  ismTreeContainsRateLimited,
+} from '../utils/ism.js';
 
-export const CoreConfigSchema = OwnableSchema.extend({
+const CoreConfigBaseSchema = OwnableSchema.extend({
   defaultIsm: IsmConfigSchema,
   defaultHook: HookConfigSchema,
   requiredHook: HookConfigSchema,
@@ -24,13 +31,100 @@ export const CoreConfigSchema = OwnableSchema.extend({
   // did not have them and we want to maintain backward compatibility
   proxyAdmin: DeployedOwnableSchema.optional(),
   interchainAccountRouter: IcaRouterConfigSchema.optional(),
+  // Override canonical Permit2 address for QuotedCalls deployment
+  permit2: z.string().optional(),
+  // Set false for chains that should keep legacy core artifacts only.
+  deployQuotedCalls: z.boolean().optional(),
+  contractVersion: z.string().optional(),
 });
 
-export const DerivedCoreConfigSchema = CoreConfigSchema.merge(
-  z.object({
-    interchainAccountRouter: DerivedIcaRouterConfigSchema.optional(),
-  }),
-);
+/**
+ * DefaultIsm routes to `mailbox.defaultIsm()`. Installed AS the mailbox's
+ * default ISM it routes to itself, so verification recurses until it runs out
+ * of gas and no inbound message can be delivered. The warp-route hybrid
+ * hook/ISMs are equally invalid here: they are bound to a specific warp router
+ * and meter its flow, which is meaningless for chain-wide default verification.
+ */
+const rejectWarpOnlyDefaultIsm = (
+  val: { defaultIsm: IsmConfig },
+  ctx: z.RefinementCtx,
+) => {
+  if (ismTreeContainsMailboxDefaultOrHybrid(val.defaultIsm)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        'DefaultIsm, NetFlowRateLimitedHookIsm and DelayedFlowRouterHookIsm cannot be used as (or nested inside) a core default ISM',
+      path: ['defaultIsm'],
+    });
+  }
+};
+
+/**
+ * Rate limiting meters an amount read from a fixed offset of the message
+ * body, which only holds for warp-route traffic, whereas a default ISM sees
+ * every message. Both spellings are rejected: the EVM `rateLimitedIsm` and a
+ * `rateLimited` node inside a Sealevel `compositeIsm` tree.
+ */
+const rejectRateLimitedDefaultIsm = (
+  val: { defaultIsm: IsmConfig },
+  ctx: z.RefinementCtx,
+) => {
+  if (ismTreeContainsRateLimited(val.defaultIsm)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'RateLimitedIsm cannot be used as a core default ISM',
+      path: ['defaultIsm'],
+    });
+  }
+  if (ismTreeContainsCompositeRateLimited(val.defaultIsm)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "A compositeIsm 'rateLimited' node cannot be used in a core default ISM",
+      path: ['defaultIsm'],
+    });
+  }
+};
+
+// QuotedCalls and the offchain-quoting IGP both require EIP-1153 transient
+// storage, so they ship together on the same (non-legacy) chains. Reject the
+// mismatch where a legacy IGP is configured but QuotedCalls is still set to
+// deploy (deployQuotedCalls !== false).
+const rejectQuotedCallsWithLegacyIgp = (
+  val: {
+    defaultHook: HookConfig;
+    requiredHook: HookConfig;
+    deployQuotedCalls?: boolean;
+  },
+  ctx: z.RefinementCtx,
+) => {
+  if (val.deployQuotedCalls === false) return;
+  if (
+    hookTreeContainsLegacyIgp(val.defaultHook) ||
+    hookTreeContainsLegacyIgp(val.requiredHook)
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        'deployQuotedCalls must be false when a legacy IGP (igpVersion: legacy) is configured: QuotedCalls requires EIP-1153 transient storage and pairs with the new offchain-quoting IGP.',
+      path: ['deployQuotedCalls'],
+    });
+  }
+};
+
+export const CoreConfigSchema = CoreConfigBaseSchema.superRefine((val, ctx) => {
+  rejectRateLimitedDefaultIsm(val, ctx);
+  rejectWarpOnlyDefaultIsm(val, ctx);
+  rejectQuotedCallsWithLegacyIgp(val, ctx);
+});
+
+export const DerivedCoreConfigSchema = CoreConfigBaseSchema.extend({
+  interchainAccountRouter: DerivedIcaRouterConfigSchema.optional(),
+}).superRefine((val, ctx) => {
+  rejectRateLimitedDefaultIsm(val, ctx);
+  rejectWarpOnlyDefaultIsm(val, ctx);
+  rejectQuotedCallsWithLegacyIgp(val, ctx);
+});
 
 export const DeployedCoreAddressesSchema = ProxyFactoryFactoriesSchema.extend({
   mailbox: z.string(),
@@ -39,6 +133,8 @@ export const DeployedCoreAddressesSchema = ProxyFactoryFactoriesSchema.extend({
   testRecipient: z.string(),
   timelockController: z.string().optional(),
   interchainAccountRouter: z.string(),
+  quotedCalls: z.string().optional(),
+  batchContractAddress: z.string().optional(),
   merkleTreeHook: z.string().optional(),
   interchainGasPaymaster: z.string().optional(),
 });
@@ -49,6 +145,16 @@ export type CoreConfig = z.infer<typeof CoreConfigSchema> & {
   remove?: boolean;
   upgrade?: UpgradeConfig;
 };
+
+export function getConfiguredMailboxOwner(config: CoreConfig): Address {
+  return config.ownerOverrides?.mailbox ?? config.owner;
+}
+
+export function shouldDeployQuotedCalls(
+  config: Pick<CoreConfig, 'deployQuotedCalls'>,
+): boolean {
+  return config.deployQuotedCalls !== false;
+}
 
 export type CoreConfigHookFieldKey = keyof Pick<
   CoreConfig,

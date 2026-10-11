@@ -14,6 +14,7 @@ import {
 } from '@hyperlane-xyz/sdk';
 
 import { type CommandContext } from '../context/types.js';
+import { tryResolveSignerAddress } from '../context/strategies/signer/resolveSignerAddress.js';
 import {
   errorRed,
   log,
@@ -27,7 +28,7 @@ import { detectAndConfirmOrPrompt } from '../utils/input.js';
 
 import { callWithConfigCreationLogs } from './utils.js';
 
-const IsmConfigMapSchema = z.record(IsmConfigSchema).refine(
+const IsmConfigMapSchema = z.record(z.string(), IsmConfigSchema).refine(
   (ismConfigMap) => {
     // check if any key in IsmConfigMap is found in its own RoutingIsmConfigSchema.domains
     for (const [key, config] of Object.entries(ismConfigMap)) {
@@ -86,6 +87,10 @@ const ISM_TYPE_DESCRIPTIONS: Record<string, string> = {
   [IsmType.TRUSTED_RELAYER]: 'Deliver messages from an authorized address',
   [IsmType.AMOUNT_ROUTING]:
     'Route messages based on the token amount to transfer',
+  // COMPOSITE and ROUTING_MESSAGE_ID_MULTISIG intentionally excluded: they're
+  // Sealevel-only, config-file input only — createAdvancedIsmConfig()'s switch
+  // has no branch for them, so listing them here would let them be selected
+  // into a dead end.
 };
 
 export async function createAdvancedIsmConfig(
@@ -168,11 +173,12 @@ export const createTrustedRelayerConfig = callWithConfigCreationLogs(
     context: CommandContext,
     advanced: boolean = false,
   ): Promise<TrustedRelayerIsmConfig> => {
+    const signerAddress = await tryResolveSignerAddress(context);
     const relayer =
-      !advanced && context.signerAddress
-        ? context.signerAddress
+      !advanced && signerAddress
+        ? signerAddress
         : await detectAndConfirmOrPrompt(
-            async () => context.signerAddress,
+            async () => signerAddress,
             'For trusted relayer ISM, enter',
             'relayer address',
             'signer',

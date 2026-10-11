@@ -1,14 +1,12 @@
 import { stringify as yamlStringify } from 'yaml';
 
 import { GasAction } from '@hyperlane-xyz/provider-sdk';
-import {
-  type ChainName,
-  HyperlaneCore,
-  HyperlaneRelayer,
-} from '@hyperlane-xyz/sdk';
-import { ProtocolType, addressToBytes32, timeout } from '@hyperlane-xyz/utils';
+import { HyperlaneRelayer } from '@hyperlane-xyz/relayer';
+import { type ChainName, HyperlaneCore } from '@hyperlane-xyz/sdk';
+import { addressToBytes32, isEVMLike, timeout } from '@hyperlane-xyz/utils';
 
 import { EXPLORER_URL } from '../consts.js';
+import { ensureEvmSignersForChains } from '../context/context.js';
 import {
   type CommandContext,
   type WriteCommandContext,
@@ -16,11 +14,11 @@ import {
 import { runPreflightChecksForChains } from '../deploy/utils.js';
 import { errorRed, log, logBlue, logGreen } from '../logger.js';
 import {
-  filterChainMetadataByProtocol,
+  filterOutDisabledChains,
   runSingleChainSelectionStep,
 } from '../utils/chains.js';
 import { indentYamlOrJson } from '../utils/files.js';
-import { stubMerkleTreeConfig } from '../utils/relay.js';
+import { logDeliveryTime, stubMerkleTreeConfig } from '../utils/relay.js';
 
 export async function sendTestMessage({
   context,
@@ -41,44 +39,49 @@ export async function sendTestMessage({
 }) {
   const { chainMetadata, multiProvider } = context;
 
-  // TODO: Add multi-protocol support when HyperlaneCore is extended for other VMs.
-  // Currently, sendMessage only works with EVM chains as it uses ethers.js and Solidity contracts.
-  const evmChainMetadata = filterChainMetadataByProtocol(
-    chainMetadata,
-    multiProvider,
-    ProtocolType.Ethereum,
+  // sendMessage works with EVM-like chains (Ethereum + Tron) as they share
+  // the same Solidity contracts and ethers.js-compatible providers.
+  const evmLikeChainMetadata = Object.fromEntries(
+    Object.entries(chainMetadata).filter(([chain]) =>
+      isEVMLike(multiProvider.getProtocol(chain)),
+    ),
   );
+  const activeEvmChainMetadata = filterOutDisabledChains(evmLikeChainMetadata);
 
-  if (Object.keys(evmChainMetadata).length === 0) {
+  if (Object.keys(activeEvmChainMetadata).length === 0) {
     throw new Error(
-      `No EVM chains found in registry. 'hyperlane send message' only supports EVM chains.`,
+      `No EVM-compatible chains found in registry. 'hyperlane send message' only supports EVM-like chains.`,
     );
   }
 
   if (!origin) {
     origin = await runSingleChainSelectionStep(
-      evmChainMetadata,
+      activeEvmChainMetadata,
       'Select the origin chain:',
     );
   }
 
   if (!destination) {
     destination = await runSingleChainSelectionStep(
-      evmChainMetadata,
+      activeEvmChainMetadata,
       'Select the destination chain:',
     );
   }
 
+  // Ensure signers are created for the selected chains (handles case where
+  // chains were interactively selected after initial signer middleware ran)
+  await ensureEvmSignersForChains(context, [origin, destination]);
+
   // Validate that origin and destination are EVM chains (in case passed via CLI flags)
   const originProtocol = multiProvider.getProtocol(origin);
-  if (originProtocol !== ProtocolType.Ethereum) {
+  if (!isEVMLike(originProtocol)) {
     throw new Error(
       `Origin chain '${origin}' uses protocol '${originProtocol}'. 'hyperlane send message' only supports EVM chains.`,
     );
   }
 
   const destProtocol = multiProvider.getProtocol(destination);
-  if (destProtocol !== ProtocolType.Ethereum) {
+  if (!isEVMLike(destProtocol)) {
     throw new Error(
       `Destination chain '${destination}' uses protocol '${destProtocol}'. 'hyperlane send message' only supports EVM chains.`,
     );
@@ -142,6 +145,7 @@ async function executeDelivery({
     );
     logBlue(`Sent message from ${origin} to ${recipient} on ${destination}.`);
     logBlue(`Message ID: ${message.id}`);
+    logBlue(`Dispatch TX: ${dispatchTx.transactionHash}`);
     logBlue(`Explorer Link: ${EXPLORER_URL}/message/${message.id}`);
     log(`Message:\n${indentYamlOrJson(yamlStringify(message, null, 2), 4)}`);
 
@@ -155,6 +159,14 @@ async function executeDelivery({
       log('Attempting self-relay of message');
       await relayer.relayMessage(dispatchTx);
       logGreen('Message was self-relayed!');
+      await logDeliveryTime(
+        origin,
+        destination,
+        dispatchTx.blockNumber,
+        message.id,
+        chainAddresses,
+        multiProvider,
+      );
     } else {
       if (skipWaitForDelivery) {
         return;
@@ -164,6 +176,14 @@ async function executeDelivery({
       // Max wait 10 minutes
       await core.waitForMessageProcessed(dispatchTx, 10000, 60);
       logGreen('Message was delivered!');
+      await logDeliveryTime(
+        origin,
+        destination,
+        dispatchTx.blockNumber,
+        message.id,
+        chainAddresses,
+        multiProvider,
+      );
     }
   } catch (e) {
     errorRed(

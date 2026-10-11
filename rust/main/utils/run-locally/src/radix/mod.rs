@@ -11,6 +11,7 @@ use hyperlane_core::{ReorgPeriod, SubmitterType};
 use hyperlane_radix::{ConnectionConf, RadixProvider, RadixSigner};
 
 use macro_rules_attribute::apply;
+use maplit::hashmap;
 use scrypto::network::NetworkDefinition;
 use tempfile::tempdir;
 use url::Url;
@@ -33,13 +34,13 @@ use crate::radix::cli::RadixCli;
 use crate::radix::radix_termination_invariants::radix_termination_invariants_met;
 use crate::radix::types::{AgentConfig, AgentConfigOut, Deployment};
 
-use crate::utils::download;
+use crate::utils::{download, poll_until};
 use crate::AGENT_LOGGING_DIR;
 use crate::{
     log,
     metrics::agent_balance_sum,
     program::Program,
-    utils::{as_task, concat_path, stop_child, AgentHandles, TaskHandle},
+    utils::{as_task, concat_path, start_postgres, stop_child, AgentHandles, TaskHandle},
     wait_for_condition, AGENT_BIN_PATH, RELAYER_METRICS_PORT, SCRAPER_METRICS_PORT,
 };
 
@@ -103,6 +104,26 @@ pub fn download_radix_contracts() -> (PathBuf, PathBuf) {
     let rpd_path = concat_path(dir_path, "hyperlane_radix.rpd");
 
     (wasm_path, rpd_path)
+}
+
+fn wait_for_radix_localnet() {
+    use ureq::post;
+
+    const MAX_ATTEMPTS: u32 = 60;
+    let url = "http://localhost:3333/core/status/network-configuration";
+    for attempt in 1..=MAX_ATTEMPTS {
+        if let Ok(resp) = post(url)
+            .set("Content-Type", "application/json")
+            .send_string("{}")
+        {
+            if resp.status() == 200 {
+                log!("Radix localnet ready after {} attempts", attempt);
+                return;
+            }
+        }
+        sleep(Duration::from_secs(1));
+    }
+    panic!("Radix localnet not ready after {MAX_ATTEMPTS} attempts");
 }
 
 fn start_localnet() {
@@ -254,8 +275,7 @@ fn launch_radix_scraper(agent_config_path: String, chains: Vec<String>) -> Agent
 pub async fn run_locally() {
     log!("Staring local net");
     start_localnet();
-    // Give some time for the localnet to startup
-    sleep(Duration::from_secs(20));
+    wait_for_radix_localnet();
 
     log!("Building rust...");
     Program::new("cargo")
@@ -342,8 +362,6 @@ pub async fn run_locally() {
 
     // count all the dispatched messages
     let mut dispatched_messages = 0;
-    // dispatch the first batch of messages (before agents start)
-    dispatched_messages += dispatch(&deployments, dispatched_messages).await;
     let config_dir = tempdir().expect("Failed to create temporary directory for agent config");
     // export agent config
     let agent_config_out = AgentConfigOut {
@@ -363,21 +381,32 @@ pub async fn run_locally() {
 
     log!("Config path: {:#?}", agent_config_path);
     log!("Running postgres db...");
-    let postgres = Program::new("docker")
-        .cmd("run")
-        .flag("rm")
-        .arg("name", "scraper-testnet-postgres")
-        .arg("env", "POSTGRES_PASSWORD=47221c18c610")
-        .arg("publish", "5432:5432")
-        .cmd("postgres:14")
-        .spawn("SQL", None);
+    let postgres = start_postgres();
 
-    sleep(Duration::from_secs(15));
+    crate::utils::wait_for_postgres();
 
     log!("Init postgres db...");
     Program::new(concat_path(format!("../../{AGENT_BIN_PATH}"), "init-db"))
         .run()
         .join();
+
+    let chains = agent_config_out.chains.keys().cloned().collect::<Vec<_>>();
+    let path = agent_config_path
+        .to_str()
+        .expect("Failed to convert agent config path to string");
+
+    // Start the scraper against empty contracts so it can persist a verified
+    // Radix cutover before the pre-relayer backfill batch is dispatched.
+    let hpl_scr = launch_radix_scraper(path.to_owned(), chains.clone());
+    poll_until("Radix scraper cutovers", Duration::from_secs(60), || {
+        crate::fetch_metric::<u32, _>(
+            SCRAPER_METRICS_PORT,
+            "hyperlane_critical_error",
+            &hashmap! {},
+        )
+        .is_ok_and(|values| values.len() == chains.len() && values.iter().all(|value| *value == 0))
+    });
+    dispatched_messages += dispatch(&deployments, dispatched_messages).await;
 
     let hpl_val = agent_config_out
         .chains
@@ -386,13 +415,7 @@ pub async fn run_locally() {
         .map(|agent_config| launch_radix_validator(agent_config, agent_config_path.clone()))
         .collect::<Vec<_>>();
 
-    let chains = agent_config_out.chains.into_keys().collect::<Vec<_>>();
-    let path = agent_config_path
-        .to_str()
-        .expect("Failed to convert agent config path to string");
-
     let hpl_rly = launch_radix_relayer(path.to_owned(), chains.clone());
-    let hpl_scr = launch_radix_scraper(path.to_owned(), chains.clone());
 
     // give things a chance to fully start.
     sleep(Duration::from_secs(20));

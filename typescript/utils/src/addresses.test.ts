@@ -2,10 +2,13 @@ import { expect } from 'chai';
 
 import {
   addressToBytes,
+  addressToBytes32,
   bytesToProtocolAddress,
   isAddressStarknet,
   isValidAddressStarknet,
   isZeroishAddress,
+  isZeroishAddressEvm,
+  normalizeAddressEvm,
   padBytesToLength,
 } from './addresses.js';
 import { ProtocolType } from './types.js';
@@ -57,6 +60,20 @@ describe('Address utilities', () => {
     });
   });
 
+  describe('isZeroishAddressEvm', () => {
+    it('Identifies EVM 0-ish addresses', () => {
+      expect(isZeroishAddressEvm('0x')).to.be.true;
+      expect(isZeroishAddressEvm(ETH_ZERO_ADDR)).to.be.true;
+      expect(isZeroishAddressEvm(COSMOS_NATIVE_ZERO_ADDR)).to.be.true;
+    });
+
+    it('Rejects non-hex 0-ish addresses', () => {
+      expect(isZeroishAddressEvm(COS_ZERO_ADDR)).to.be.false;
+      expect(isZeroishAddressEvm(SOL_ZERO_ADDR)).to.be.false;
+      expect(isZeroishAddressEvm(STARKNET_ZERO_ADDR)).to.be.true;
+    });
+  });
+
   describe('addressToBytes', () => {
     it('Converts addresses to bytes', () => {
       expect(addressToBytes(ETH_NON_ZERO_ADDR).length).to.equal(32);
@@ -73,11 +90,13 @@ describe('Address utilities', () => {
 
   describe('padBytesToLength', () => {
     it('Pads bytes to a given length', () => {
-      const bytes = Buffer.from([1, 2, 3]);
-      expect(padBytesToLength(bytes, 5).equals(Buffer.from([0, 0, 1, 2, 3])));
+      const bytes = new Uint8Array([1, 2, 3]);
+      expect(Array.from(padBytesToLength(bytes, 5))).to.deep.equal([
+        0, 0, 1, 2, 3,
+      ]);
     });
     it('Rejects bytes that exceed the target length', () => {
-      const bytes = Buffer.from([1, 2, 3]);
+      const bytes = new Uint8Array([1, 2, 3]);
       expect(() => padBytesToLength(bytes, 2)).to.throw(Error);
     });
   });
@@ -133,6 +152,28 @@ describe('Address utilities', () => {
     });
   });
 
+  describe('addressToBytes32', () => {
+    it('Converts a base58 Solana address to bytes32 hex', () => {
+      // mZhPGteS36G7FhMTcRofLQU8ocBNAsGq7u8SKSHfL2X
+      const solAddress = 'mZhPGteS36G7FhMTcRofLQU8ocBNAsGq7u8SKSHfL2X';
+      const result = addressToBytes32(solAddress);
+      expect(result).to.equal(
+        '0x0b6a86806a0354c82b8f049eb75d9c97e370a6f0c0cfa15f47909c3fe1c8f794',
+      );
+    });
+    it('Converts an EVM address to bytes32 hex', () => {
+      const result = addressToBytes32(ETH_NON_ZERO_ADDR);
+      expect(result).to.equal(
+        '0x0000000000000000000000000000000000000000000000000000000000000001',
+      );
+    });
+    it('Returns an already-bytes32 hex address unchanged', () => {
+      const bytes32 =
+        '0x0b6a86806a0354c82b8f049eb75d9c97e370a6f0c0cfa15f47909c3fe1c8f794';
+      expect(addressToBytes32(bytes32)).to.equal(bytes32);
+    });
+  });
+
   describe('isValidAddressStarknet', () => {
     it('Validates correct Starknet addresses', () => {
       for (const address of STARKNET_ADDRESSES) {
@@ -149,6 +190,34 @@ describe('Address utilities', () => {
       const outOfBoundsAddress =
         '0x5ab3ac43afd012da5037f72691f9791a9fd610900c0a1d6c18d41367aee9a530';
       expect(isValidAddressStarknet(outOfBoundsAddress)).to.be.false;
+    });
+  });
+
+  describe('normalizeAddressEvm', () => {
+    // Run-1 ICA strategy incident: correct hex digits, bad EIP-55 casing.
+    const BAD_CHECKSUM = '0x3f13C1351aC66CA0f4827c607A94C93C82AD0913';
+    const CANONICAL = '0x3f13C1351AC66ca0f4827c607a94c93c82AD0913';
+
+    it('Canonicalizes an address with a bad EIP-55 checksum', () => {
+      expect(normalizeAddressEvm(BAD_CHECKSUM)).to.equal(CANONICAL);
+    });
+
+    it('Canonicalizes an all-lowercase address', () => {
+      expect(normalizeAddressEvm(CANONICAL.toLowerCase())).to.equal(CANONICAL);
+    });
+
+    it('Leaves an already-canonical address unchanged', () => {
+      expect(normalizeAddressEvm(CANONICAL)).to.equal(CANONICAL);
+    });
+
+    it('Returns zeroish addresses unchanged', () => {
+      expect(normalizeAddressEvm(ETH_ZERO_ADDR)).to.equal(ETH_ZERO_ADDR);
+    });
+
+    it('Returns non-EVM input unchanged', () => {
+      expect(normalizeAddressEvm(SOL_NON_ZERO_ADDR)).to.equal(
+        SOL_NON_ZERO_ADDR,
+      );
     });
   });
 });

@@ -1,0 +1,292 @@
+// Clients
+export { SvmProvider as SealevelProvider } from './clients/provider.js';
+export { SvmSigner as SealevelSigner } from './clients/signer.js';
+export { SvmImpersonatingSigner as SealevelImpersonatingSigner } from './clients/impersonating-signer.js';
+export { SvmProtocolProvider as SealevelProtocolProvider } from './clients/protocol.js';
+
+// Types
+export type {
+  SvmInstruction as SealevelInstruction,
+  SvmRpc as SealevelRpc,
+  SvmTransaction as SealevelTransaction,
+  SvmReceipt as SealevelReceipt,
+  AnnotatedSvmTransaction as AnnotatedSealevelTransaction,
+  SvmProgramTarget as SealevelProgramTarget,
+  SvmDeployedIsm as SealevelDeployedIsm,
+  SvmDeployedHook as SealevelDeployedHook,
+  SvmDeployedIgpHook as SealevelDeployedIgpHook,
+} from './types.js';
+export type { SolanaRpcClient } from './rpc.js';
+
+// RPC + Signer
+export { createRpc } from './rpc.js';
+export { FALLBACK_SIMULATION_PAYER } from './version/version-query.js';
+
+// Artifact managers
+export { SvmMailboxArtifactManager as SealevelMailboxArtifactManager } from './core/mailbox-artifact-manager.js';
+export { SvmValidatorAnnounceArtifactManager as SealevelValidatorAnnounceArtifactManager } from './core/validator-announce-artifact-manager.js';
+export { SvmIsmArtifactManager as SealevelIsmArtifactManager } from './ism/ism-artifact-manager.js';
+export { SvmHookArtifactManager as SealevelHookArtifactManager } from './hook/hook-artifact-manager.js';
+
+// ISM readers/writers
+export {
+  SvmRoutingMessageIdMultisigIsmReader as SealevelRoutingMessageIdMultisigIsmReader,
+  SvmRoutingMessageIdMultisigIsmWriter as SealevelRoutingMessageIdMultisigIsmWriter,
+} from './ism/multisig-ism.js';
+export type { SvmRoutingMessageIdMultisigIsmWriterConfig as SealevelRoutingMessageIdMultisigIsmWriterConfig } from './ism/multisig-ism.js';
+
+// Program bytes (auto-generated from compiled .so binaries)
+export { HYPERLANE_SVM_PROGRAM_BYTES } from './hyperlane/program-bytes.js';
+
+// Low-level instruction builders
+export {
+  getCloseIgpStandingQuoteInstruction,
+  getCloseIgpTransientQuoteInstruction,
+  getGetIgpQuoteAccountMetasInstruction,
+  getSetIgpMinIssuedAtInstruction,
+  getSetIgpQuoteConfigInstruction,
+  getSetIgpQuoteSignerInstruction,
+  getSubmitIgpQuoteInstruction,
+  simulateIgpQuoteAccountMetas,
+} from './instructions/igp.js';
+export {
+  getGetQuoteAccountMetasInstruction,
+  getGetSubmitQuoteAccountMetasInstruction,
+  getSubmitQuoteInstruction,
+  simulateFeeQuoteAccountMetas,
+  simulateSubmitQuoteAccountMetas,
+} from './instructions/fee.js';
+export type {
+  GetQuoteAccountMetasInput,
+  GetSubmitQuoteAccountMetasInput,
+} from './instructions/fee.js';
+
+// Offchain quote signing primitives (secp256k1 / keccak256). Shared by the
+// fee program and IGP — both verify quotes via the same `SvmSignedQuote`
+// scheme. Mirrors the on-chain `quote-verifier` Rust library.
+export {
+  buildSvmQuoteMessageHash,
+  computeScopedSalt,
+  ethAddressFromPrivateKey,
+  ethAddressHexFromPrivateKey,
+  signSvmQuote,
+} from './quote-signing.js';
+export type { SignSvmQuoteArgs } from './quote-signing.js';
+
+export { SvmPrivateKeyQuoteSigner } from './quote/SvmPrivateKeyQuoteSigner.js';
+export { SvmQuoteArtifactManager } from './quote/SvmQuoteArtifactManager.js';
+export { SvmQuoteReader } from './quote/SvmQuoteReader.js';
+export {
+  isSvmQuoteSignable,
+  parseSvmQuoteSignable,
+  type SvmQuoteSignable,
+} from './quote/SvmQuoteSignable.js';
+export {
+  SvmQuoteWriter,
+  type SvmQuoteWriterConfig,
+} from './quote/SvmQuoteWriter.js';
+
+export { decodeSimulatedAccountMetas } from './codecs/simulated-account-meta.js';
+export {
+  simulateInstructionAccountMetas,
+  simulateInstructionForReturnData,
+} from './simulation.js';
+export { getTransferOwnershipInstruction as getMultisigIsmTransferOwnershipInstruction } from './instructions/multisig-ism-message-id.js';
+export { getSetUpgradeAuthorityInstruction } from './instructions/loader.js';
+export {
+  buildClaimProtocolFeesInstruction,
+  buildSetDefaultIsmInstruction,
+} from './core/mailbox-tx.js';
+export { fetchMultisigIsmAccessControl } from './ism/ism-query.js';
+export { getProgramUpgradeAuthority } from './deploy/program-deployer.js';
+export {
+  SvmTestIsmReader as SealevelTestIsmReader,
+  SvmTestIsmWriter as SealevelTestIsmWriter,
+} from './ism/test-ism.js';
+
+// Core readers/writers
+export {
+  SvmMailboxReader as SealevelMailboxReader,
+  SvmMailboxWriter as SealevelMailboxWriter,
+} from './core/mailbox.js';
+export {
+  SvmValidatorAnnounceReader as SealevelValidatorAnnounceReader,
+  SvmValidatorAnnounceWriter as SealevelValidatorAnnounceWriter,
+} from './core/validator-announce.js';
+export type {
+  SvmMailboxConfig as SealevelMailboxConfig,
+  SvmValidatorAnnounceConfig as SealevelValidatorAnnounceConfig,
+} from './core/types.js';
+
+// Hook readers/writers
+export {
+  SvmIgpHookReader as SealevelIgpHookReader,
+  SvmIgpHookWriter as SealevelIgpHookWriter,
+} from './hook/igp-hook.js';
+export {
+  SvmMerkleTreeHookReader as SealevelMerkleTreeHookReader,
+  SvmMerkleTreeHookWriter as SealevelMerkleTreeHookWriter,
+} from './hook/merkle-tree-hook.js';
+
+// Deploy
+export {
+  createDeployProgramPlan,
+  createUpgradeProgramPlan,
+  executeDeployPlan,
+  DeployStageKind,
+} from './deploy/program-deployer.js';
+export type {
+  DeployProgramPlan,
+  DeployStage,
+  DeployProgramPlanArgs,
+  UpgradeProgramPlanArgs,
+} from './deploy/program-deployer.js';
+export { resolveProgram } from './deploy/resolve-program.js';
+
+// Transaction utilities
+export {
+  getComputeBudgetInstructions,
+  buildTransactionMessage,
+  serializeUnsignedTransaction,
+} from './tx.js';
+
+// Legacy @solana/web3.js compatibility
+export {
+  convertLegacySolanaTransaction,
+  isLegacySolanaTransaction,
+} from './legacy-compat.js';
+export type { LegacyTransaction } from './legacy-compat.js';
+export type { LegacyKeypair } from './types.js';
+
+// PDA derivation
+export {
+  deriveMultisigIsmAccessControlPda,
+  deriveMultisigIsmDomainDataPda,
+  deriveTestIsmStoragePda,
+  deriveHyperlaneTokenPda,
+  deriveMailboxInboxPda,
+  deriveMailboxOutboxPda,
+  deriveAtaPayerPda,
+  deriveIgpProgramDataPda,
+  deriveIgpAccountPda,
+  deriveIgpQuoteAuthorityPda,
+  deriveIgpStandingQuotePda,
+  deriveIgpTransientQuotePda,
+  deriveOverheadIgpAccountPda,
+  deriveValidatorAnnouncePda,
+  deriveValidatorStorageLocationsPda,
+  deriveReplayProtectionPda,
+  deriveCrossCollateralStatePda,
+  deriveCrossCollateralDispatchAuthorityPda,
+  deriveMailboxDispatchedMessagePda,
+  deriveIgpGasPaymentPda,
+  deriveFeeTransientQuotePda,
+} from './pda.js';
+
+// Warp token transfer-remote instruction builders
+export {
+  buildFeeTransferRemoteSectionAccounts,
+  buildIgpTransferRemoteSectionAccounts,
+  getTokenTransferRemoteInstruction,
+} from './instructions/token.js';
+export type {
+  FeeTransferRemoteSection,
+  IgpQuotedExtension,
+  IgpTransferRemoteSection,
+  TransferRemoteInstructionData,
+} from './instructions/token.js';
+export { getCrossCollateralTransferRemoteToInstruction } from './instructions/cross-collateral-token.js';
+export type { TransferRemoteToInstructionData } from './instructions/cross-collateral-token.js';
+
+// Address Lookup Table reader / writer pair. Wraps the on-chain ALT
+// program account behind the same ArtifactReader / ArtifactWriter
+// contract used by other SVM artifacts.
+export {
+  SvmAddressLookupTableReader as SealevelAddressLookupTableReader,
+  SvmAddressLookupTableWriter as SealevelAddressLookupTableWriter,
+} from './alt/address-lookup-table.js';
+export type {
+  SvmAltConfig as SealevelAltConfig,
+  SvmDeployedAlt as SealevelDeployedAlt,
+} from './alt/address-lookup-table.js';
+
+// Account decoders
+export {
+  decodeHyperlaneTokenAccount,
+  decodeIgpProgramDataAccount,
+  decodeIgpAccount,
+  decodeOverheadIgpAccount,
+} from './accounts/token.js';
+export {
+  encodeSvmIgpQuoteContext,
+  encodeSvmIgpQuoteData,
+  decodeIgpStandingQuoteAccount,
+  decodeIgpTransientQuoteAccount,
+  WILDCARD_DOMAIN,
+  WILDCARD_SENDER,
+} from './codecs/igp.js';
+export type { SvmFeeQuoteContextInput, SvmSignedQuote } from './codecs/fee.js';
+export {
+  encodeSvmFeeQuoteContext,
+  WILDCARD_AMOUNT,
+  wildcardRecipient,
+} from './codecs/fee.js';
+export type {
+  SvmIgpQuoteContextInput,
+  SvmIgpQuoteDataInput,
+} from './codecs/igp.js';
+export type {
+  GetIgpQuoteAccountMetasInput,
+  IgpFeeConfig,
+  IgpStandingQuoteData,
+  IgpTransientQuoteData,
+} from './codecs/igp.js';
+export {
+  decodeMultisigIsmAccessControlAccount,
+  decodeMultisigIsmDomainDataAccount,
+} from './accounts/multisig-ism-message-id.js';
+export { decodeTestIsmStorageAccount } from './accounts/test-ism.js';
+export {
+  decodeMailboxInboxAccount,
+  decodeMailboxOutboxAccount,
+  fetchMailboxInboxAccount,
+} from './core/mailbox-query.js';
+export {
+  decodeValidatorAnnounceAccount,
+  decodeValidatorStorageLocationsAccount,
+} from './core/validator-announce-query.js';
+export { decodeCrossCollateralStateAccount } from './accounts/cross-collateral-token.js';
+
+// Cross-collateral warp token reader/writer
+export {
+  SvmCrossCollateralTokenReader,
+  SvmCrossCollateralTokenWriter,
+} from './warp/cross-collateral-token.js';
+export { SvmWarpArtifactManager } from './warp/warp-artifact-manager.js';
+export { isSvmDeployedWarpAddress as isSealevelDeployedWarpAddress } from './warp/types.js';
+export { isSvmDeployedIgpHook as isSealevelDeployedIgpHook } from './types.js';
+
+// Fee data codec — Borsh encoding of the on-chain `FeeDataStrategy` enum
+// (Linear / Regressive / Progressive). Offchain quote signers use this to
+// produce the `data` bytes the SVM fee program verifies against.
+export {
+  encodeFeeDataStrategy,
+  type SvmFeeDataStrategy,
+  type SvmFeeParams,
+} from './codecs/fee.js';
+export { FeeStrategyKind } from './fee/types.js';
+
+// Warp Address Lookup Table support
+export {
+  createWarpAltManager,
+  createWarpAltReader,
+} from './alt/warp-alt-manager.js';
+
+// Fee program
+export { SvmFeeArtifactManager } from './fee/fee-artifact-manager.js';
+export {
+  DEFAULT_FEE_SALT,
+  deriveFeeSalt,
+  resolveFeeSalt,
+} from './fee/types.js';
+export type { SvmDeployedFee } from './fee/types.js';

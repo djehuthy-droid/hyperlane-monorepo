@@ -1,0 +1,662 @@
+import {
+  Address,
+  Domain,
+  addressToBytes,
+  assert,
+  padBytesToLength,
+} from '@hyperlane-xyz/utils';
+import {
+  AccountMeta,
+  ComputeBudgetProgram,
+  Keypair,
+  Message,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  TransactionInstruction,
+  MessageV0,
+  VersionedTransaction,
+} from '@solana/web3.js';
+import { serialize } from 'borsh';
+
+import { SEALEVEL_SPL_NOOP_ADDRESS } from '../../consts/sealevel.js';
+import {
+  IgpPaymentKeys,
+  SealevelOverheadIgpAdapter,
+} from '../../gas/adapters/SealevelIgpAdapter.js';
+
+import { SealevelInstructionWrapper } from '../../utils/sealevelSerialization.js';
+import type {
+  IHypCrossCollateralAdapter,
+  InterchainGasQuote,
+  QuoteTransferRemoteParams,
+  TransferRemoteToParams,
+} from './ITokenAdapter.js';
+import { parseSimulationAccountMetas } from './sealevelFee.js';
+import {
+  SealevelHypCollateralAdapter,
+  type SealevelTransferBundle,
+  TRANSFER_REMOTE_COMPUTE_LIMIT,
+} from './SealevelTokenAdapter.js';
+import {
+  SealevelCCHandleLocalInstruction,
+  SealevelCCHandleLocalSchema,
+  SealevelCCInstructionKind,
+  SealevelCCTransferRemoteToInstruction,
+  SealevelCCTransferRemoteToSchema,
+  encodeTokenMessage,
+} from './serialization.js';
+
+// CC program discriminator (8 bytes of 2s)
+const CC_DISCRIMINATOR = Buffer.from([2, 2, 2, 2, 2, 2, 2, 2]);
+
+export class SealevelHypCrossCollateralAdapter
+  extends SealevelHypCollateralAdapter
+  implements IHypCrossCollateralAdapter<Transaction | VersionedTransaction>
+{
+  deriveCrossCollateralStatePda(): PublicKey {
+    return this.derivePda(
+      ['hyperlane_token', '-', 'cross_collateral'],
+      this.warpProgramPubKey,
+    );
+  }
+
+  deriveCrossCollateralDispatchAuthorityPda(): PublicKey {
+    return this.derivePda(
+      ['hyperlane_cc', '-', 'dispatch_authority'],
+      this.warpProgramPubKey,
+    );
+  }
+
+  async quoteTransferRemoteToGas(
+    params: Parameters<
+      IHypCrossCollateralAdapter<Transaction>['quoteTransferRemoteToGas']
+    >[0],
+  ) {
+    const localDomain = this.multiProvider.getDomainId(this.chainName);
+    if (params.destination === localDomain) {
+      return this.quoteLocalTransferGas({
+        sender: params.sender,
+        recipient: params.recipient,
+        amount: BigInt(params.amount),
+        destination: params.destination,
+        targetRouter: padBytesToLength(addressToBytes(params.targetRouter), 32),
+      });
+    }
+
+    return this.quoteTransferGas({
+      destination: params.destination,
+      sender: params.sender,
+      recipient: params.recipient,
+      amount: BigInt(params.amount),
+      // CC fee account uses the destination warp router H256 in its
+      // standing-quote PDA seeds.
+      targetRouter: padBytesToLength(addressToBytes(params.targetRouter), 32),
+    });
+  }
+
+  /**
+   * Quote a same-domain (local) CrossCollateral transfer. Local transfers make
+   * no IGP payment, but `transfer_remote_to_local` still debits the warp fee
+   * on-chain when fee_config is set (quoted against the destination router), so
+   * surface it as `tokenFeeQuote` to keep cost display and balance validation
+   * consistent with what the transaction actually charges.
+   */
+  private async quoteLocalTransferGas({
+    sender,
+    recipient,
+    amount,
+    destination,
+    targetRouter,
+  }: {
+    sender?: Address;
+    recipient?: Address;
+    amount?: bigint;
+    destination: Domain;
+    targetRouter: Uint8Array;
+  }): Promise<InterchainGasQuote> {
+    const tokenData = await this.getTokenAccountData();
+    if (!tokenData.fee_config) {
+      return { igpQuote: { amount: 0n } };
+    }
+    assert(
+      sender && recipient && amount !== undefined,
+      'sender, recipient, and amount required for Sealevel warp-fee quote',
+    );
+    const tokenFeeQuote = await this.quoteWarpFee({
+      feeConfig: tokenData.fee_config,
+      payer: new PublicKey(sender),
+      destination,
+      recipient,
+      amount,
+      targetRouter,
+    });
+    return { igpQuote: { amount: 0n }, tokenFeeQuote };
+  }
+
+  // Override base impl which seeds the standing-quote PDA with H256::zero();
+  // CC fee accounts seed with the destination warp router pulled from the
+  // on-chain remote_routers map.
+  override async quoteTransferRemoteGas(
+    params: QuoteTransferRemoteParams,
+  ): Promise<InterchainGasQuote> {
+    const localDomain = this.multiProvider.getDomainId(this.chainName);
+    const tokenData = await this.getTokenAccountData();
+    const remoteRouterBytes = tokenData.remote_routers?.get(params.destination);
+    assert(
+      remoteRouterBytes,
+      `No remote router registered for destination domain ${params.destination}`,
+    );
+    if (params.destination === localDomain) {
+      return this.quoteLocalTransferGas({
+        sender: params.sender,
+        recipient: params.recipient,
+        amount: params.amount,
+        destination: params.destination,
+        targetRouter: remoteRouterBytes,
+      });
+    }
+
+    return this.quoteTransferGas({
+      destination: params.destination,
+      sender: params.sender,
+      recipient: params.recipient,
+      amount: params.amount,
+      targetRouter: remoteRouterBytes,
+    });
+  }
+
+  // Should match rust/sealevel/programs/hyperlane-sealevel-token-cross-collateral/src/processor.rs transfer_remote_to_remote
+  //
+  // 0.   [executable] The system program.
+  // 1.   []           The token PDA account.
+  // 2.   []           The cross-collateral state PDA account.
+  // 3.   [executable] The spl_noop program.
+  // 4.   [executable] The mailbox program.
+  // 5.   [writeable]  The mailbox outbox account.
+  // 6.   []           Message dispatch authority.
+  // 7.   [signer]     The token sender and mailbox payer.
+  // 8.   [signer]     Unique message account.
+  // 9.   [writeable]  Message storage PDA.
+  // 10+. (optional)   IGP accounts.
+  // N.   [executable] The SPL token program for the mint.
+  // N+1. [writeable]  The mint.
+  // N+2. [writeable]  The token sender's associated token account.
+  // N+3. [writeable]  The escrow PDA account.
+  async getTransferRemoteToRemoteKeyList({
+    sender,
+    mailbox,
+    randomWallet,
+    igp,
+    feeSection,
+    igpQuotedSection,
+  }: {
+    sender: PublicKey;
+    mailbox: PublicKey;
+    randomWallet: PublicKey;
+    igp?: IgpPaymentKeys;
+    /** Spliced after slot 9 (dispatched message PDA) when token.fee_config is Some. */
+    feeSection?: AccountMeta[];
+    /** Spliced between the gas-payment PDA and the configured IGP account when inner Igp.fee_config is Some. */
+    igpQuotedSection?: AccountMeta[];
+  }): Promise<Array<AccountMeta>> {
+    let keys: Array<AccountMeta> = [
+      // 0.   [executable] The system program.
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      // 1.   [] The token PDA account.
+      {
+        pubkey: this.deriveHypTokenAccount(),
+        isSigner: false,
+        isWritable: false,
+      },
+      // 2.   [] The cross-collateral state PDA account.
+      {
+        pubkey: this.deriveCrossCollateralStatePda(),
+        isSigner: false,
+        isWritable: false,
+      },
+      // 3.   [executable] The spl_noop program.
+      {
+        pubkey: new PublicKey(SEALEVEL_SPL_NOOP_ADDRESS),
+        isSigner: false,
+        isWritable: false,
+      },
+      // 4.   [executable] The mailbox program.
+      { pubkey: mailbox, isSigner: false, isWritable: false },
+      // 5.   [writeable] The mailbox outbox account.
+      {
+        pubkey: this.deriveMailboxOutboxAccount(mailbox),
+        isSigner: false,
+        isWritable: true,
+      },
+      // 6.   [] Message dispatch authority.
+      {
+        pubkey: this.deriveMessageDispatchAuthorityAccount(),
+        isSigner: false,
+        isWritable: false,
+      },
+      // 7.   [signer] The token sender and mailbox payer.
+      { pubkey: sender, isSigner: true, isWritable: false },
+      // 8.   [signer] Unique message account.
+      { pubkey: randomWallet, isSigner: true, isWritable: false },
+      // 9.   [writeable] Message storage PDA.
+      {
+        pubkey: this.deriveMsgStorageAccount(mailbox, randomWallet),
+        isSigner: false,
+        isWritable: true,
+      },
+    ];
+
+    // Fee section — spliced when token.fee_config is Some on chain.
+    if (feeSection) {
+      keys = [...keys, ...feeSection];
+    }
+
+    if (igp) {
+      keys = [
+        ...keys,
+        // [executable] The IGP program.
+        { pubkey: igp.programId, isSigner: false, isWritable: false },
+        // [writeable] The IGP program data.
+        {
+          pubkey: SealevelOverheadIgpAdapter.deriveIgpProgramPda(igp.programId),
+          isSigner: false,
+          isWritable: true,
+        },
+        // [writeable] Gas payment PDA.
+        {
+          pubkey: SealevelOverheadIgpAdapter.deriveGasPaymentPda(
+            igp.programId,
+            randomWallet,
+          ),
+          isSigner: false,
+          isWritable: true,
+        },
+      ];
+      // Quoted-mode extension — spliced when inner Igp.fee_config is Some.
+      if (igpQuotedSection) {
+        keys = [...keys, ...igpQuotedSection];
+      }
+      if (igp.overheadIgpAccount) {
+        keys = [
+          ...keys,
+          // [] OPTIONAL - The Overhead IGP account, if the configured IGP is an Overhead IGP.
+          {
+            pubkey: igp.overheadIgpAccount,
+            isSigner: false,
+            isWritable: false,
+          },
+        ];
+      }
+      keys = [
+        ...keys,
+        // [writeable] The Overhead's inner IGP account (or the normal IGP account if there's no Overhead IGP).
+        { pubkey: igp.igpAccount, isSigner: false, isWritable: true },
+      ];
+    }
+
+    keys = [
+      ...keys,
+      // N.   [executable] The SPL token program for the mint.
+      {
+        pubkey: await this.getTokenProgramId(),
+        isSigner: false,
+        isWritable: false,
+      },
+      // N+1. [writeable] The mint.
+      { pubkey: this.tokenMintPubKey, isSigner: false, isWritable: true },
+      // N+2. [writeable] The token sender's associated token account.
+      {
+        pubkey: await this.deriveAssociatedTokenAccount(sender),
+        isSigner: false,
+        isWritable: true,
+      },
+      // N+3. [writeable] The escrow PDA account.
+      { pubkey: this.deriveEscrowAccount(), isSigner: false, isWritable: true },
+    ];
+
+    return keys;
+  }
+
+  // Simulates the HandleLocalAccountMetas instruction on the target program
+  // to discover accounts needed for the HandleLocal CPI call.
+  // Same simulation pattern as SealevelIgpAdapter.quoteGasPayment.
+  //
+  // Should match handle_local_account_metas in processor.rs:
+  // Account 0: [] The target program's account metas PDA.
+  async simulateHandleLocalAccountMetas({
+    targetProgram,
+    senderProgram,
+    amount,
+    recipient,
+    payer,
+  }: {
+    targetProgram: PublicKey;
+    senderProgram: PublicKey;
+    amount: bigint;
+    recipient: Uint8Array;
+    payer: PublicKey;
+  }): Promise<Array<AccountMeta>> {
+    const tokenMessage = encodeTokenMessage(recipient, amount);
+
+    const value = new SealevelInstructionWrapper({
+      instruction: SealevelCCInstructionKind.HandleLocalAccountMetas,
+      data: new SealevelCCHandleLocalInstruction({
+        sender_program_id: senderProgram.toBytes(),
+        message: tokenMessage,
+      }),
+    });
+    const serializedData = serialize(SealevelCCHandleLocalSchema, value);
+
+    // Derive the target program's account metas PDA
+    const targetTokenPda = this.derivePda(
+      ['hyperlane_message_recipient', '-', 'handle', '-', 'account_metas'],
+      targetProgram,
+    );
+
+    const instruction = new TransactionInstruction({
+      keys: [
+        // Account 0: The target program's account metas PDA.
+        { pubkey: targetTokenPda, isSigner: false, isWritable: false },
+      ],
+      programId: targetProgram,
+      data: Buffer.concat([CC_DISCRIMINATOR, Buffer.from(serializedData)]),
+    });
+
+    const message = Message.compile({
+      recentBlockhash: PublicKey.default.toBase58(),
+      instructions: [instruction],
+      payerKey: payer,
+    });
+
+    const tx = new VersionedTransaction(message);
+    const connection = this.getProvider();
+    const simulationResponse = await connection.simulateTransaction(tx, {
+      replaceRecentBlockhash: true,
+      sigVerify: false,
+    });
+
+    const { returnData, err, logs } = simulationResponse.value;
+    assert(
+      !err,
+      `HandleLocalAccountMetas simulation failed: ${JSON.stringify(err)}\nLogs: ${logs?.join('\n')}`,
+    );
+    const base64Data = returnData?.data?.[0];
+    assert(
+      base64Data,
+      `HandleLocalAccountMetas simulation returned no data. The target program may not implement HandleLocalAccountMetas.\nLogs: ${logs?.join('\n')}`,
+    );
+
+    return parseSimulationAccountMetas(Buffer.from(base64Data, 'base64'));
+  }
+
+  // Should match rust/sealevel/programs/hyperlane-sealevel-token-cross-collateral/src/processor.rs transfer_remote_to_local
+  //
+  // 0.   [executable]         The system program.
+  // 1.   []                   The token PDA account.
+  // 2.   []                   The cross-collateral state PDA account.
+  // 3.   [signer]             The token sender and payer.
+  // 4.   []                   The cross-collateral dispatch authority PDA.
+  // 5.   [executable]         The target program.
+  // 6.   [executable]         The SPL token program for the mint.
+  // 7.   [writeable]          The mint.
+  // 8.   [writeable]          The token sender's associated token account.
+  // 9.   [writeable]          The escrow PDA account.
+  // 10+. (variable)           Target HandleLocal accounts (from simulation).
+  async getTransferRemoteToLocalKeyList({
+    sender,
+    targetProgram,
+    senderProgram,
+    amount,
+    recipient,
+    feeSection,
+  }: {
+    sender: PublicKey;
+    targetProgram: PublicKey;
+    senderProgram: PublicKey;
+    amount: bigint;
+    recipient: Uint8Array;
+    /** Spliced after the target program when token.fee_config is Some. */
+    feeSection?: AccountMeta[];
+  }): Promise<Array<AccountMeta>> {
+    const handleLocalAccountMetas = await this.simulateHandleLocalAccountMetas({
+      targetProgram,
+      senderProgram,
+      amount,
+      recipient,
+      payer: sender,
+    });
+    assert(
+      handleLocalAccountMetas[0]?.pubkey.equals(
+        this.deriveCrossCollateralDispatchAuthorityPda(),
+      ),
+      'Expected first HandleLocal account to be the CC dispatch authority PDA',
+    );
+
+    const keys: Array<AccountMeta> = [
+      // 0.   [executable] The system program.
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      // 1.   [] The token PDA account.
+      {
+        pubkey: this.deriveHypTokenAccount(),
+        isSigner: false,
+        isWritable: false,
+      },
+      // 2.   [] The cross-collateral state PDA account.
+      {
+        pubkey: this.deriveCrossCollateralStatePda(),
+        isSigner: false,
+        isWritable: false,
+      },
+      // 3.   [signer] The token sender and payer.
+      { pubkey: sender, isSigner: true, isWritable: true },
+      // 4.   [] The cross-collateral dispatch authority PDA.
+      {
+        pubkey: this.deriveCrossCollateralDispatchAuthorityPda(),
+        isSigner: false,
+        isWritable: false,
+      },
+      // 5.   [executable] The target program.
+      { pubkey: targetProgram, isSigner: false, isWritable: false },
+      // Fee section — spliced when token.fee_config is Some on chain.
+      ...(feeSection ?? []),
+      // [executable] The SPL token program for the mint.
+      {
+        pubkey: await this.getTokenProgramId(),
+        isSigner: false,
+        isWritable: false,
+      },
+      // 7.   [writeable] The mint.
+      { pubkey: this.tokenMintPubKey, isSigner: false, isWritable: true },
+      // 8.   [writeable] The token sender's associated token account.
+      {
+        pubkey: await this.deriveAssociatedTokenAccount(sender),
+        isSigner: false,
+        isWritable: true,
+      },
+      // 9.   [writeable] The escrow PDA account.
+      { pubkey: this.deriveEscrowAccount(), isSigner: false, isWritable: true },
+      // 10+. Target HandleLocal accounts (from simulation).
+      // Skip index 0 (cc_dispatch_authority) — transfer_remote_to_local
+      // prepends it to the CPI, so remaining_accounts starts at index 1.
+      ...handleLocalAccountMetas.slice(1),
+    ];
+
+    return keys;
+  }
+
+  /**
+   * Sealevel-only — returns the building blocks of a `transfer_remote_to` tx
+   * (compute-budget ixs separated from the warp ix, ALTs, fee payer, signers)
+   * without compiling them into a `Transaction` / `VersionedTransaction`. The
+   * composing layer (typically the offchain-quoted-transfer provider)
+   * prepends `SubmitFeeQuote` / `SubmitIgpQuote` ixs between the compute-
+   * budget head and the transfer ix.
+   *
+   * `scopedSalt` (optional) is the 32-byte `keccak256(payer || clientSalt)`
+   * for a same-tx offchain transient quote — threaded through to the fee +
+   * IGP cascade simulations so their PDA enumeration includes the transient
+   * quote PDA. Matches the on-chain `scoped_salt` field. Standing-only
+   * callers omit it.
+   */
+  async getTransferRemoteToIxBundle({
+    amount,
+    destination,
+    recipient,
+    fromAccountOwner,
+    targetRouter,
+    extraSigners,
+    scopedSalt,
+  }: TransferRemoteToParams & {
+    /** Sealevel-only — see method docs. */
+    scopedSalt?: Uint8Array;
+  }): Promise<SealevelTransferBundle> {
+    assert(fromAccountOwner, 'fromAccountOwner required for Sealevel');
+
+    const sender = new PublicKey(fromAccountOwner);
+    const recipientBytes = padBytesToLength(addressToBytes(recipient), 32);
+    const targetRouterBytes = padBytesToLength(
+      addressToBytes(targetRouter),
+      32,
+    );
+    const localDomain = this.multiProvider.getDomainId(this.chainName);
+
+    const tokenData = await this.getTokenAccountData();
+    // CC fee account uses the destination warp router H256 in its
+    // standing-quote PDA seeds.
+    const feeSection = tokenData.fee_config
+      ? await this.buildFeeSectionKeys({
+          feeConfig: tokenData.fee_config,
+          payer: sender,
+          destination,
+          targetRouter: targetRouterBytes,
+          scopedSalt,
+        })
+      : undefined;
+
+    let keys: Array<AccountMeta>;
+    // Local-domain CC transfers don't have a unique-message PDA, so
+    // randomWallet is omitted and we skip pre-signing.
+    let randomWallet: Keypair | undefined;
+
+    if (destination === localDomain) {
+      const targetProgram = new PublicKey(targetRouter);
+      keys = await this.getTransferRemoteToLocalKeyList({
+        sender,
+        targetProgram,
+        senderProgram: this.warpProgramPubKey,
+        amount: BigInt(amount),
+        recipient: recipientBytes,
+        feeSection,
+      });
+    } else {
+      randomWallet = extraSigners?.length
+        ? extraSigners[0]
+        : Keypair.generate();
+      const mailbox = new PublicKey(this.addresses.mailbox);
+      const igpState = await this.innerIgpFeeState.get();
+      const igpProgramId =
+        tokenData.interchain_gas_paymaster?.program_id_pubkey;
+      const igpQuotedSection =
+        igpState?.feeConfig && igpProgramId
+          ? await this.buildIgpQuotedSectionKeys({
+              igpProgramId,
+              innerIgpAccount: igpState.innerIgpAccount,
+              payer: sender,
+              destination,
+              scopedSalt,
+            })
+          : undefined;
+      keys = await this.getTransferRemoteToRemoteKeyList({
+        sender,
+        mailbox,
+        randomWallet: randomWallet.publicKey,
+        igp: await this.getIgpKeys(),
+        feeSection,
+        igpQuotedSection,
+      });
+    }
+
+    const value = new SealevelInstructionWrapper({
+      instruction: SealevelCCInstructionKind.TransferRemoteTo,
+      data: new SealevelCCTransferRemoteToInstruction({
+        destination_domain: destination,
+        recipient: recipientBytes,
+        amount_or_id: BigInt(amount),
+        target_router: targetRouterBytes,
+      }),
+    });
+    const serializedData = serialize(SealevelCCTransferRemoteToSchema, value);
+
+    const transferInstruction = new TransactionInstruction({
+      keys,
+      programId: this.warpProgramPubKey,
+      data: Buffer.concat([CC_DISCRIMINATOR, Buffer.from(serializedData)]),
+    });
+
+    const setComputeLimitInstruction = ComputeBudgetProgram.setComputeUnitLimit(
+      { units: TRANSFER_REMOTE_COMPUTE_LIMIT },
+    );
+    const setPriorityFeeInstruction = ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: (await this.getMedianPriorityFee()) || 0,
+    });
+
+    const addressLookupTableAccounts = this.addresses.altAddresses
+      ? await this.addressLookupTableAccounts.get()
+      : [];
+
+    return {
+      computeBudgetInstructions: [
+        setComputeLimitInstruction,
+        setPriorityFeeInstruction,
+      ],
+      transferInstructions: [transferInstruction],
+      addressLookupTableAccounts,
+      feePayer: sender,
+      signers: randomWallet ? [randomWallet] : [],
+    };
+  }
+
+  // For remote transfers, `recipient` is a destination-chain address (e.g., Ethereum hex).
+  // For local (same-chain) transfers, `recipient` must be a valid Solana pubkey
+  // that can receive the target token (used to derive the recipient's ATA).
+  async populateTransferRemoteToTx(
+    params: TransferRemoteToParams,
+  ): Promise<Transaction | VersionedTransaction> {
+    const bundle = await this.getTransferRemoteToIxBundle(params);
+    const allInstructions = [
+      ...bundle.computeBudgetInstructions,
+      ...bundle.transferInstructions,
+    ];
+
+    const recentBlockhash = (
+      await this.getProvider().getLatestBlockhash('finalized')
+    ).blockhash;
+
+    if (this.addresses.altAddresses) {
+      // ALT path: when the route registers ALT addresses, compile a v0
+      // message so the on-chain account-key list stays under Solana's
+      // 1232-byte tx limit (40+ accounts on new-flow fee + IGP routes).
+      const message = MessageV0.compile({
+        payerKey: bundle.feePayer,
+        instructions: allInstructions,
+        recentBlockhash,
+        addressLookupTableAccounts: bundle.addressLookupTableAccounts,
+      });
+      const versionedTx = new VersionedTransaction(message);
+      if (bundle.signers.length > 0) {
+        versionedTx.sign(bundle.signers);
+      }
+      return versionedTx;
+    }
+
+    // Legacy path — unchanged for routes without ALT.
+    const tx = new Transaction({
+      feePayer: bundle.feePayer,
+      recentBlockhash,
+    });
+    for (const ix of allInstructions) tx.add(ix);
+    for (const signer of bundle.signers) tx.partialSign(signer);
+    return tx;
+  }
+}

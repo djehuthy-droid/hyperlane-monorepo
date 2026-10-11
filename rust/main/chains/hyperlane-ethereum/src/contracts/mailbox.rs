@@ -17,13 +17,13 @@ use futures_util::future::join_all;
 use hyperlane_core::Metadata;
 use tokio::join;
 use tokio::sync::Mutex;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use hyperlane_core::{
     rpc_clients::call_and_retry_indefinitely, BatchItem, BatchResult, ChainCommunicationError,
-    ChainResult, ContractLocator, HyperlaneAbi, HyperlaneChain, HyperlaneContract, HyperlaneDomain,
-    HyperlaneMessage, HyperlaneProtocolError, HyperlaneProvider, Indexed, Indexer, LogMeta,
-    Mailbox, QueueOperation, RawHyperlaneMessage, ReorgPeriod, SequenceAwareIndexer,
+    ChainResult, ContractLocator, Decode, HyperlaneAbi, HyperlaneChain, HyperlaneContract,
+    HyperlaneDomain, HyperlaneMessage, HyperlaneProtocolError, HyperlaneProvider, Indexed, Indexer,
+    LogMeta, Mailbox, QueueOperation, RawHyperlaneMessage, ReorgPeriod, SequenceAwareIndexer,
     TxCostEstimate, TxOutcome, H160, H256, H512, U256,
 };
 
@@ -60,6 +60,10 @@ impl BuildableWithProvider for SequenceIndexerBuilder {
     type Output = Box<dyn SequenceAwareIndexer<HyperlaneMessage>>;
     const NEEDS_SIGNER: bool = false;
 
+    fn uses_dynamic_block_cache(&self) -> bool {
+        true
+    }
+
     async fn build_with_provider<M: Middleware + 'static>(
         &self,
         provider: M,
@@ -82,6 +86,10 @@ pub struct DeliveryIndexerBuilder {
 impl BuildableWithProvider for DeliveryIndexerBuilder {
     type Output = Box<dyn SequenceAwareIndexer<H256>>;
     const NEEDS_SIGNER: bool = false;
+
+    fn uses_dynamic_block_cache(&self) -> bool {
+        true
+    }
 
     async fn build_with_provider<M: Middleware + 'static>(
         &self,
@@ -106,6 +114,47 @@ where
     contract: Arc<EthereumMailboxInternal<M>>,
     provider: Arc<M>,
     reorg_period: EthereumReorgPeriod,
+}
+
+/// Counts CCTP V2 MessageSent events from MessageTransmitter V2 in a transaction receipt.
+///
+/// MessageSent is emitted by MessageTransmitter V2 for both native USDC transfers
+/// (depositForBurn → MessageTransmitter.sendMessage internally) and GMP messages
+/// (sendMessage called directly). Supporting both lets the relay API handle the full
+/// range of CCTP V2 usage patterns.
+///
+/// Both the topic hash and the emitting address are checked: topic-only matching would let
+/// any contract spoof the V2 detection by emitting a log with the same topics[0]. Note that
+/// MessageTransmitter V2's sendMessage is permissionless, so an attacker can produce a real
+/// MessageSent from the canonical address with arbitrary body. The address check rules out
+/// third-party contract spoofing but not direct transmitter calls; treat is_cctp_v2 as an
+/// admission heuristic, not a verification claim.
+fn cctp_v2_message_sent_count(logs: &[ethers::types::Log]) -> usize {
+    use ethers::types::{Address, H256 as EthersH256};
+    use ethers_core::utils::keccak256;
+
+    let message_sent_topic = EthersH256::from(keccak256(b"MessageSent(bytes)"));
+
+    // Circle deploys MessageTransmitter V2 at a small set of known addresses.
+    // Source: https://developers.circle.com/cctp/references/contract-addresses#messagetransmitterv2
+    let message_transmitter_v2_addresses: [Address; 3] = [
+        "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64" // mainnet (all chains except EDGE)
+            .parse()
+            .expect("valid address"),
+        "0x5b61381Fc9e58E70EfC13a4A97516997019198ee" // mainnet EDGE
+            .parse()
+            .expect("valid address"),
+        "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275" // testnet (all chains)
+            .parse()
+            .expect("valid address"),
+    ];
+
+    logs.iter()
+        .filter(|log| {
+            message_transmitter_v2_addresses.contains(&log.address)
+                && log.topics.first() == Some(&message_sent_topic)
+        })
+        .count()
 }
 
 impl<M> EthereumMailboxIndexer<M>
@@ -139,6 +188,10 @@ impl<M> Indexer<HyperlaneMessage> for EthereumMailboxIndexer<M>
 where
     M: Middleware + 'static,
 {
+    fn parse_tx_hash(&self, tx_hash: &str) -> ChainResult<H512> {
+        hyperlane_core::parse_evm_hex_tx_hash(tx_hash)
+    }
+
     async fn get_finalized_block_number(&self) -> ChainResult<u32> {
         self.get_finalized_block_number().await
     }
@@ -157,13 +210,13 @@ where
             .query_with_meta()
             .await?
             .into_iter()
-            .map(|(event, meta)| {
-                (
-                    HyperlaneMessage::from(event.message.to_vec()).into(),
+            .map(|(event, meta)| -> ChainResult<_> {
+                Ok((
+                    HyperlaneMessage::read_from(&mut event.message.as_ref())?.into(),
                     meta.into(),
-                )
+                ))
             })
-            .collect();
+            .collect::<ChainResult<Vec<_>>>()?;
 
         events.sort_by(|a, b| a.0.inner().nonce.cmp(&b.0.inner().nonce));
         Ok(events)
@@ -177,20 +230,96 @@ where
             let provider = self.provider.clone();
             let contract = self.contract.address();
             Box::pin(async move {
-                fetch_raw_logs_and_meta::<DispatchFilter, M>(tx_hash, provider, contract).await
+                fetch_raw_logs_and_meta::<DispatchFilter, M>(tx_hash, provider, contract)
+                    .await?
+                    .ok_or_else(|| {
+                        ChainCommunicationError::CustomError(format!(
+                            "No receipt found for tx hash {tx_hash:?}"
+                        ))
+                    })
             })
         })
         .await;
         let logs = raw_logs_and_meta
             .into_iter()
-            .map(|(log, log_meta)| {
-                (
-                    HyperlaneMessage::from(log.message.to_vec()).into(),
+            .map(|(log, log_meta)| -> ChainResult<_> {
+                Ok((
+                    HyperlaneMessage::read_from(&mut log.message.as_ref())?.into(),
                     log_meta,
-                )
+                ))
             })
-            .collect();
+            .collect::<ChainResult<Vec<_>>>()?;
         Ok(logs)
+    }
+
+    async fn fetch_logs_and_cctp_v2(
+        &self,
+        tx_hash: H512,
+    ) -> ChainResult<(Vec<(Indexed<HyperlaneMessage>, LogMeta)>, bool)> {
+        use ethers::abi::RawLog;
+        use ethers::types::H256 as EthersH256;
+        use ethers_contract::{EthEvent, LogMeta as EthersLogMeta};
+
+        let (raw_dispatch_logs, is_cctp_v2) = call_and_retry_indefinitely(|| {
+            let provider = self.provider.clone();
+            let contract_address = self.contract.address();
+            Box::pin(async move {
+                let ethers_tx_hash: EthersH256 = tx_hash.into();
+                let receipt = provider
+                    .get_transaction_receipt(ethers_tx_hash)
+                    .await
+                    .map_err(ChainCommunicationError::from_other)?
+                    .ok_or_else(|| {
+                        ChainCommunicationError::CustomError(format!(
+                            "No receipt found for tx hash {tx_hash:?}"
+                        ))
+                    })?;
+
+                let message_sent_count = cctp_v2_message_sent_count(&receipt.logs);
+
+                let dispatch_logs: Vec<(DispatchFilter, LogMeta)> = receipt
+                    .logs
+                    .into_iter()
+                    .filter_map(|log| {
+                        if log.address != contract_address {
+                            return None;
+                        }
+                        let raw_log = RawLog {
+                            topics: log.topics.clone(),
+                            data: log.data.to_vec(),
+                        };
+                        let log_meta: EthersLogMeta = (&log).into();
+                        DispatchFilter::decode_log(&raw_log)
+                            .ok()
+                            .map(|decoded| (decoded, log_meta.into()))
+                    })
+                    .collect();
+
+                // Treat as CCTP V2 if every Dispatch has a corresponding MessageSent from
+                // MessageTransmitter V2. Both native USDC transfers (depositForBurn path) and
+                // GMP-only transfers (_postDispatch path) emit exactly 1 MessageSent per
+                // Dispatch, so a 1:1 match is the correct invariant. A mixed tx (some CCTP,
+                // some unrelated dispatches) produces fewer MessageSent than Dispatch events
+                // and correctly gets is_cctp_v2=false.
+                let is_cctp_v2 =
+                    message_sent_count > 0 && message_sent_count == dispatch_logs.len();
+
+                Ok((dispatch_logs, is_cctp_v2))
+            })
+        })
+        .await;
+
+        let messages = raw_dispatch_logs
+            .into_iter()
+            .map(|(log, meta)| -> ChainResult<_> {
+                Ok((
+                    HyperlaneMessage::read_from(&mut log.message.as_ref())?.into(),
+                    meta,
+                ))
+            })
+            .collect::<ChainResult<Vec<_>>>()?;
+
+        Ok((messages, is_cctp_v2))
     }
 }
 
@@ -341,7 +470,16 @@ where
         tx_gas_estimate: Option<U256>,
         with_gas_estimate_buffer: bool,
     ) -> ChainResult<ContractCall<M, ()>> {
-        let tx = self.contract_call(message, metadata, tx_gas_estimate)?;
+        let mut tx = self.contract_call(message, metadata, tx_gas_estimate)?;
+
+        // Explicitly set `from` to the relayer's signer address so that during
+        // eth_estimateGas the simulated msg.sender matches the trusted relayer.
+        // TrustedRelayerIsm sets deliveries[id].processor = msg.sender *before*
+        // calling ism.verify(), so verify() checks msg.sender == trustedRelayer.
+        // Without this, from defaults to address(0) and estimation reverts.
+        if let Some(sender) = self.provider.default_sender() {
+            tx = tx.from(sender);
+        }
 
         fill_tx_gas_params(
             tx,
@@ -644,22 +782,32 @@ where
             .ok_or(HyperlaneProtocolError::ProcessGasLimitRequired)?;
 
         // If we have a ArbitrumNodeInterface, we need to set the l2_gas_limit.
+        // Note: estimate_retryable_ticket simulates execution via a retryable ticket, where
+        // msg.sender is the L2 alias of the sender arg (not the actual relayer address).
+        // For ISMs like TrustedRelayerIsm that check msg.sender, this simulation will fail.
+        // In that case we fall back to l2_gas_limit = None so enforceable_gas_limit() uses
+        // the direct process() gas estimate instead.
         let l2_gas_limit = if let Some(arbitrum_node_interface) = &self.arbitrum_node_interface {
-            Some(
-                arbitrum_node_interface
-                    .estimate_retryable_ticket(
-                        H160::zero().into(),
-                        // Give the sender a deposit (100 ETH), otherwise it reverts
-                        WEI_IN_ETHER.mul(100u32),
-                        self.contract.address(),
-                        U256::zero().into(),
-                        H160::zero().into(),
-                        H160::zero().into(),
-                        contract_call.calldata().unwrap_or_default(),
-                    )
-                    .estimate_gas()
-                    .await?,
-            )
+            let mut retryable_call = arbitrum_node_interface.estimate_retryable_ticket(
+                H160::zero().into(),
+                // Give the sender a deposit (100 ETH), otherwise it reverts
+                WEI_IN_ETHER.mul(100u32),
+                self.contract.address(),
+                U256::zero().into(),
+                H160::zero().into(),
+                H160::zero().into(),
+                contract_call.calldata().unwrap_or_default(),
+            );
+            if let Some(sender) = self.provider.default_sender() {
+                retryable_call = retryable_call.from(sender);
+            }
+            match retryable_call.estimate_gas().await {
+                Ok(estimate) => Some(estimate),
+                Err(err) => {
+                    warn!(?err, "Failed to estimate l2_gas_limit via ArbitrumNodeInterface, falling back to direct gas estimate");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -741,6 +889,7 @@ mod test {
             transaction_overrides: Default::default(),
             op_submission_config: Default::default(),
             consider_null_transaction_receipt: false,
+            fallback_hedge: None,
         };
 
         let mailbox = EthereumMailbox::new(
@@ -757,7 +906,7 @@ mod test {
 
     #[tokio::test]
     async fn test_process_estimate_costs_sets_l2_gas_limit_for_arbitrum() {
-        let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::PlumeTestnet);
+        let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
         // An Arbitrum Nitro chain
         let (mailbox, mock_provider) = get_test_mailbox(domain.clone());
 
@@ -897,5 +1046,83 @@ mod test {
                 l2_gas_limit: None,
             },
         );
+    }
+
+    mod cctp_v2_message_sent_count {
+        use ethers::types::{Bytes, Log, H160, H256 as EthersH256};
+        use ethers_core::utils::keccak256;
+
+        use super::super::cctp_v2_message_sent_count;
+
+        fn message_sent_topic() -> EthersH256 {
+            EthersH256::from(keccak256(b"MessageSent(bytes)"))
+        }
+
+        fn mainnet_transmitter() -> H160 {
+            "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64"
+                .parse()
+                .unwrap()
+        }
+
+        fn make_log(address: H160, topic: EthersH256) -> Log {
+            Log {
+                address,
+                topics: vec![topic],
+                data: Bytes::default(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn counts_message_sent_from_mainnet_transmitter() {
+            let log = make_log(mainnet_transmitter(), message_sent_topic());
+            assert_eq!(cctp_v2_message_sent_count(&[log]), 1);
+        }
+
+        #[test]
+        fn counts_message_sent_from_edge_transmitter() {
+            let edge: H160 = "0x5b61381Fc9e58E70EfC13a4A97516997019198ee"
+                .parse()
+                .unwrap();
+            let log = make_log(edge, message_sent_topic());
+            assert_eq!(cctp_v2_message_sent_count(&[log]), 1);
+        }
+
+        #[test]
+        fn counts_message_sent_from_testnet_transmitter() {
+            let testnet: H160 = "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275"
+                .parse()
+                .unwrap();
+            let log = make_log(testnet, message_sent_topic());
+            assert_eq!(cctp_v2_message_sent_count(&[log]), 1);
+        }
+
+        #[test]
+        fn ignores_message_sent_from_unknown_address() {
+            let unknown: H160 = "0x1234567890123456789012345678901234567890"
+                .parse()
+                .unwrap();
+            let log = make_log(unknown, message_sent_topic());
+            assert_eq!(cctp_v2_message_sent_count(&[log]), 0);
+        }
+
+        #[test]
+        fn ignores_wrong_topic_from_known_transmitter() {
+            let wrong_topic = EthersH256::from(keccak256(b"SomeOtherEvent(bytes)"));
+            let log = make_log(mainnet_transmitter(), wrong_topic);
+            assert_eq!(cctp_v2_message_sent_count(&[log]), 0);
+        }
+
+        #[test]
+        fn empty_logs_returns_zero() {
+            assert_eq!(cctp_v2_message_sent_count(&[]), 0);
+        }
+
+        #[test]
+        fn counts_multiple_message_sent_logs() {
+            // Two matching logs should count as two
+            let log = make_log(mainnet_transmitter(), message_sent_topic());
+            assert_eq!(cctp_v2_message_sent_count(&[log.clone(), log]), 2);
+        }
     }
 }

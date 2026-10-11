@@ -1,13 +1,24 @@
 import { expect } from 'chai';
-import { type PopulatedTransaction as EV5Transaction, ethers } from 'ethers';
+import {
+  type PopulatedTransaction as EV5Transaction,
+  Wallet,
+  ethers,
+} from 'ethers';
+import { readdirSync, rmSync, writeFileSync } from 'fs';
 
 import { type XERC20VSTest, XERC20VSTest__factory } from '@hyperlane-xyz/core';
 import { TxSubmitterType, randomAddress } from '@hyperlane-xyz/sdk';
 import { type Address, randomInt } from '@hyperlane-xyz/utils';
 
+import { EV5FileSubmitter } from '../../../submitters/EV5FileSubmitter.js';
 import { CustomTxSubmitterType } from '../../../submitters/types.js';
+import { ExternalSignerType } from '../../../context/externalSigner.js';
 import { readYamlOrJson, writeYamlOrJson } from '../../../utils/files.js';
-import { deployXERC20VSToken, hyperlaneSubmit } from '../commands/helpers.js';
+import {
+  deployXERC20VSToken,
+  hyperlaneSubmit,
+  startMockTurnkeyApi,
+} from '../commands/helpers.js';
 import {
   ANVIL_KEY,
   CHAIN_NAME_2,
@@ -118,11 +129,13 @@ describe('hyperlane submit', function () {
     const users = [ALICE, BOB];
     const xerc20Chains = [xerc20Chain2, xerc20Chain3];
 
-    await expectUserBalances(users, xerc20Chains, [0, 0]);
+    const initialBalances = await Promise.all(
+      users.map((user, i) => xerc20Chains[i].balanceOf(user)),
+    );
     await hyperlaneSubmit({ strategyPath, transactionsPath });
     await expectUserBalances(users, xerc20Chains, [
-      chain2MintAmount,
-      chain3MintAmount,
+      initialBalances[0].add(chain2MintAmount).toNumber(),
+      initialBalances[1].add(chain3MintAmount).toNumber(),
     ]);
   });
 
@@ -149,12 +162,79 @@ describe('hyperlane submit', function () {
     const users = [ALICE, BOB];
     const xerc20Chains = [xerc20Chain2, xerc20Chain3];
 
-    await expectUserBalances(users, xerc20Chains, [0, 0]);
+    const initialBalances = await Promise.all(
+      users.map((user, i) => xerc20Chains[i].balanceOf(user)),
+    );
     await hyperlaneSubmit({ transactionsPath });
     await expectUserBalances(users, xerc20Chains, [
-      chain2MintAmount,
-      chain3MintAmount,
+      initialBalances[0].add(chain2MintAmount).toNumber(),
+      initialBalances[1].add(chain3MintAmount).toNumber(),
     ]);
+  });
+
+  it('submits a transaction file with a Turnkey external signer', async function () {
+    const provider = xerc20Chain2.provider;
+    const feeWallet = Wallet.createRandom().connect(provider);
+    await (
+      await xerc20Chain2.signer.sendTransaction({
+        to: feeWallet.address,
+        value: ethers.utils.parseEther('1'),
+      })
+    ).wait();
+    const originalOwner = await xerc20Chain2.owner();
+    await (await xerc20Chain2.transferOwnership(feeWallet.address)).wait();
+
+    const mintAmount = randomInt(1, 1000);
+    const transaction = await getMintOnlyOwnerTransaction(
+      xerc20Chain2,
+      ALICE,
+      mintAmount,
+      ANVIL2_CHAIN_ID,
+    );
+    const suffix = randomInt(0, 1_000_000);
+    const transactionsPath = `${TEMP_PATH}/external-signer-transactions-${suffix}.json`;
+    const signerConfigPath = `${TEMP_PATH}/external-signer-config-${suffix}.json`;
+    const receiptsPath = `${TEMP_PATH}/external-signer-receipts-${suffix}`;
+    writeYamlOrJson(transactionsPath, [transaction], 'json');
+
+    const mockTurnkey = await startMockTurnkeyApi(feeWallet);
+    writeFileSync(
+      signerConfigPath,
+      JSON.stringify({
+        type: ExternalSignerType.TURNKEY,
+        ...mockTurnkey.apiKey,
+        organizationId: 'test-organization',
+        privateKeyId: 'test-private-key',
+        publicKey: feeWallet.address,
+        apiBaseUrl: mockTurnkey.url,
+      }),
+      { mode: 0o600 },
+    );
+
+    const initialBalance = await xerc20Chain2.balanceOf(ALICE);
+    try {
+      await hyperlaneSubmit({
+        transactionsPath,
+        signerConfigPath,
+        receiptsPath,
+      });
+    } finally {
+      try {
+        await (
+          await xerc20Chain2.connect(feeWallet).transferOwnership(originalOwner)
+        ).wait();
+      } finally {
+        rmSync(signerConfigPath, { force: true });
+        await mockTurnkey.close();
+      }
+    }
+
+    expect(await xerc20Chain2.balanceOf(ALICE)).to.eql(
+      initialBalance.add(mintAmount),
+    );
+    expect(
+      readdirSync(receiptsPath).some((file) => file.includes('jsonRpc')),
+    ).to.equal(true);
   });
 
   describe('FileSubmitter', function () {
@@ -204,6 +284,42 @@ describe('hyperlane submit', function () {
       expect(outputtedTransactions).to.deep.equal(transactions);
     });
 
+    it('should serialize parallel writes to the same file', async () => {
+      const outputTransactionPath = `${TEMP_PATH}/transactions_${randomInt(0, 1_000_000)}.json`;
+      const submitterA = new EV5FileSubmitter({
+        chain: CHAIN_NAME_2,
+        filepath: outputTransactionPath,
+      });
+      const submitterB = new EV5FileSubmitter({
+        chain: CHAIN_NAME_3,
+        filepath: outputTransactionPath,
+      });
+
+      const chain2MintAmount = randomInt(1, 1000);
+      const chain3MintAmount = randomInt(1, 1000);
+      const [tx1, tx2] = await Promise.all([
+        getMintOnlyOwnerTransaction(
+          xerc20Chain2,
+          ALICE,
+          chain2MintAmount,
+          ANVIL2_CHAIN_ID,
+        ),
+        getMintOnlyOwnerTransaction(
+          xerc20Chain3,
+          BOB,
+          chain3MintAmount,
+          ANVIL3_CHAIN_ID,
+        ),
+      ]);
+
+      await Promise.all([submitterA.submit(tx1), submitterB.submit(tx2)]);
+
+      const outputtedTransactions = readYamlOrJson(outputTransactionPath);
+      expect(outputtedTransactions).to.have.length(2);
+      expect(outputtedTransactions).to.deep.include(tx1);
+      expect(outputtedTransactions).to.deep.include(tx2);
+    });
+
     it('should overwrite a transactions file if it is malformed (not array)', async () => {
       const outputTransactionPath = `${TEMP_PATH}/transactions_${randomInt(0, 1_000_000)}.json`;
       const fileSubmitterStrategy = {
@@ -223,14 +339,13 @@ describe('hyperlane submit', function () {
       writeYamlOrJson(transactionsPath, { invalid: 'transaction' });
 
       const chain2MintAmount = randomInt(1, 1000);
-      const transactions = await Promise.all([
-        getMintOnlyOwnerTransaction(
-          xerc20Chain2,
-          ALICE,
-          chain2MintAmount,
-          ANVIL2_CHAIN_ID,
-        ),
-      ]);
+      const transaction = await getMintOnlyOwnerTransaction(
+        xerc20Chain2,
+        ALICE,
+        chain2MintAmount,
+        ANVIL2_CHAIN_ID,
+      );
+      const transactions = [transaction];
       writeYamlOrJson(transactionsPath, transactions);
 
       await hyperlaneSubmit({ strategyPath, transactionsPath });

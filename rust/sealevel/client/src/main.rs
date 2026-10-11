@@ -9,15 +9,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use solana_clap_utils::input_validators::{is_keypair, is_url, normalize_to_url_if_moniker};
 use solana_cli_config::{Config, CONFIG_FILE};
 use solana_client::rpc_client::RpcClient;
+use solana_commitment_config::CommitmentConfig;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_program::pubkey;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    compute_budget::ComputeBudgetInstruction,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{read_keypair_file, Keypair, Signer as _},
-    system_program,
 };
+use solana_system_interface::program as system_program;
 
 use account_utils::DiscriminatorEncode;
 use hyperlane_core::{H160, H256};
@@ -35,7 +35,6 @@ use hyperlane_sealevel_mailbox::{
     mailbox_message_dispatch_authority_pda_seeds, mailbox_outbox_pda_seeds,
     mailbox_processed_message_pda_seeds,
     protocol_fee::ProtocolFee,
-    spl_noop,
 };
 
 use hyperlane_sealevel_token::{
@@ -66,8 +65,10 @@ use hyperlane_sealevel_validator_announce::{
 use squads::{process_squads_cmd, SquadsCmd};
 use warp_route::parse_token_account_data;
 
+mod alt;
 mod artifacts;
 mod cmd_utils;
+mod composite_ism;
 mod context;
 mod r#core;
 mod helloworld;
@@ -79,6 +80,7 @@ mod serde;
 mod squads;
 mod warp_route;
 
+use crate::composite_ism::process_composite_ism_cmd;
 use crate::helloworld::process_helloworld_cmd;
 use crate::igp::process_igp_cmd;
 use crate::multisig_ism::process_multisig_ism_message_id_cmd;
@@ -115,12 +117,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum HyperlaneSealevelCmd {
+    Alt(AltCmd),
     Core(CoreCmd),
     Mailbox(MailboxCmd),
     Token(TokenCmd),
     Igp(IgpCmd),
     ValidatorAnnounce(ValidatorAnnounceCmd),
     MultisigIsmMessageId(MultisigIsmMessageIdCmd),
+    CompositeIsm(CompositeIsmCmd),
     WarpRoute(WarpRouteCmd),
     HelloWorld(HelloWorldCmd),
     Squads(SquadsCmd),
@@ -132,6 +136,34 @@ pub struct EnvironmentArgs {
     environment: String,
     #[arg(long)]
     environments_dir: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct AltCmd {
+    #[command(subcommand)]
+    cmd: AltSubCmd,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AltSubCmd {
+    /// Create an Address Lookup Table for Hyperlane
+    Create(AltCreateCmd),
+}
+
+#[derive(Args)]
+pub(crate) struct AltCreateCmd {
+    /// Mailbox program ID (inbox PDA derived from this)
+    #[arg(long)]
+    pub mailbox: Pubkey,
+    /// Output format (text or json)
+    #[arg(long, default_value = "text")]
+    pub output_format: AltOutputFormat,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum AltOutputFormat {
+    Text,
+    Json,
 }
 
 #[derive(Args)]
@@ -199,6 +231,10 @@ struct CoreDeploy {
     remote_domains: Vec<u32>,
     #[arg(long)]
     built_so_dir: PathBuf,
+    /// If provided, deploy a composite ISM with this config as the mailbox default ISM
+    /// instead of the multisig ISM.
+    #[arg(long)]
+    composite_ism_config_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -215,6 +251,8 @@ enum MailboxSubCmd {
     Delivered(Delivered),
     TransferOwnership(TransferOwnership),
     SetDefaultIsm(SetDefaultIsm),
+    /// Simulate processing a message to debug delivery failures
+    Simulate(Simulate),
 }
 
 const MAILBOX_PROG_ID: Pubkey = pubkey!("692KZJaoe2KRcD6uhCQDLLXnLNA5ZLnfvdqjE4aX9iu1");
@@ -294,6 +332,13 @@ struct Delivered {
 }
 
 #[derive(Args)]
+struct Simulate {
+    /// Base58-encoded transaction to simulate
+    #[arg(long)]
+    transaction: String,
+}
+
+#[derive(Args)]
 struct TokenCmd {
     #[command(subcommand)]
     cmd: TokenSubCmd,
@@ -336,6 +381,18 @@ struct TokenTransferRemote {
     recipient: String,
     #[arg(value_enum)]
     token_type: TokenType,
+    /// Commitment level to confirm the transfer at.
+    #[arg(long, default_value = "finalized", value_parser = parse_transfer_commitment)]
+    commitment: CommitmentConfig,
+}
+
+/// `processed` is rejected: the tx is then read back at `confirmed`, which may not have landed yet.
+fn parse_transfer_commitment(s: &str) -> Result<CommitmentConfig, String> {
+    match s {
+        "confirmed" => Ok(CommitmentConfig::confirmed()),
+        "finalized" => Ok(CommitmentConfig::finalized()),
+        _ => Err("expected `confirmed` or `finalized`".to_owned()),
+    }
 }
 
 #[derive(Args)]
@@ -690,6 +747,61 @@ struct MultisigIsmMessageIdSetValidatorsAndThreshold {
 }
 
 #[derive(Args)]
+pub(crate) struct CompositeIsmCmd {
+    #[command(subcommand)]
+    cmd: CompositeIsmSubCmd,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CompositeIsmSubCmd {
+    Deploy(CompositeIsmDeploy),
+    Update(CompositeIsmUpdate),
+    Read(CompositeIsmRead),
+    SetDomainIsm(CompositeIsmSetDomainIsm),
+    TransferOwnership(TransferOwnership),
+}
+
+#[derive(Args)]
+pub(crate) struct CompositeIsmDeploy {
+    #[command(flatten)]
+    env_args: EnvironmentArgs,
+    #[arg(long)]
+    built_so_dir: PathBuf,
+    #[arg(long)]
+    chain: String,
+    #[arg(long)]
+    local_domain: u32,
+    #[arg(long)]
+    config_file: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct CompositeIsmUpdate {
+    #[arg(long, short)]
+    program_id: Pubkey,
+    #[arg(long)]
+    config_file: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct CompositeIsmRead {
+    #[arg(long, short)]
+    program_id: Pubkey,
+}
+
+#[derive(Args)]
+pub(crate) struct CompositeIsmSetDomainIsm {
+    #[arg(long, short)]
+    program_id: Pubkey,
+    /// Origin domain ID for which this ISM should be registered.
+    #[arg(long)]
+    domain: u32,
+    /// Path to a JSON file containing the ISM node config.
+    #[arg(long)]
+    config_file: PathBuf,
+}
+
+#[derive(Args)]
 pub(crate) struct HelloWorldCmd {
     #[command(subcommand)]
     cmd: HelloWorldSubCmd,
@@ -788,12 +900,14 @@ fn main() {
         cli.write_instructions,
     );
     match cli.cmd {
+        HyperlaneSealevelCmd::Alt(cmd) => alt::process_alt_cmd(ctx, cmd),
         HyperlaneSealevelCmd::Mailbox(cmd) => process_mailbox_cmd(ctx, cmd),
         HyperlaneSealevelCmd::Token(cmd) => process_token_cmd(ctx, cmd),
         HyperlaneSealevelCmd::ValidatorAnnounce(cmd) => process_validator_announce_cmd(ctx, cmd),
         HyperlaneSealevelCmd::MultisigIsmMessageId(cmd) => {
             process_multisig_ism_message_id_cmd(ctx, cmd)
         }
+        HyperlaneSealevelCmd::CompositeIsm(cmd) => process_composite_ism_cmd(ctx, cmd),
         HyperlaneSealevelCmd::Core(cmd) => process_core_cmd(ctx, cmd),
         HyperlaneSealevelCmd::WarpRoute(cmd) => process_warp_route_cmd(ctx, cmd),
         HyperlaneSealevelCmd::HelloWorld(cmd) => process_helloworld_cmd(ctx, cmd),
@@ -875,7 +989,7 @@ fn process_mailbox_cmd(ctx: Context, cmd: MailboxCmd) {
                 accounts: vec![
                     AccountMeta::new(outbox_account, false),
                     AccountMeta::new_readonly(ctx.payer_pubkey, true),
-                    AccountMeta::new_readonly(spl_noop::id(), false),
+                    AccountMeta::new_readonly(account_utils::SPL_NOOP_PROGRAM_ID, false),
                 ],
             };
             ctx.new_txn().add(outbox_instruction).send_with_payer();
@@ -925,6 +1039,42 @@ fn process_mailbox_cmd(ctx: Context, cmd: MailboxCmd) {
                     format!("Setting default ISM to {}", set_default_ism.default_ism),
                 )
                 .send_with_payer();
+        }
+        MailboxSubCmd::Simulate(simulate) => {
+            // Decode the base58 transaction
+            let tx_bytes = bs58::decode(&simulate.transaction)
+                .into_vec()
+                .expect("Failed to decode base58 transaction");
+            let transaction: solana_sdk::transaction::Transaction =
+                bincode::deserialize(&tx_bytes).expect("Failed to deserialize transaction");
+
+            println!("Simulating transaction...");
+            println!("Transaction signatures: {:?}", transaction.signatures);
+
+            // Simulate the transaction
+            let result = ctx
+                .client
+                .simulate_transaction(&transaction)
+                .expect("Failed to simulate transaction");
+
+            println!("\n=== Simulation Result ===");
+            if let Some(err) = result.value.err {
+                println!("❌ Transaction would FAIL");
+                println!("Error: {:?}", err);
+            } else {
+                println!("✅ Transaction would SUCCEED");
+            }
+
+            if let Some(logs) = result.value.logs {
+                println!("\n=== Program Logs ===");
+                for log in logs {
+                    println!("{}", log);
+                }
+            }
+
+            if let Some(units) = result.value.units_consumed {
+                println!("\nCompute units consumed: {}", units);
+            }
         }
     };
 }
@@ -1058,7 +1208,7 @@ fn process_token_cmd(mut ctx: Context, cmd: TokenCmd) {
         }
         TokenSubCmd::TransferRemote(xfer) => {
             is_keypair(&xfer.sender).unwrap();
-            ctx.commitment = CommitmentConfig::finalized();
+            ctx.commitment = xfer.commitment;
             let sender = read_keypair_file(xfer.sender).unwrap();
 
             let recipient = if xfer.recipient.starts_with("0x") {
@@ -1125,7 +1275,7 @@ fn process_token_cmd(mut ctx: Context, cmd: TokenCmd) {
             // 14..N [??..??] Plugin-specific accounts.
             let mut accounts = vec![
                 AccountMeta::new_readonly(system_program::id(), false),
-                AccountMeta::new_readonly(spl_noop::id(), false),
+                AccountMeta::new_readonly(account_utils::SPL_NOOP_PROGRAM_ID, false),
                 AccountMeta::new_readonly(token_account, false),
                 AccountMeta::new_readonly(token.mailbox, false),
                 AccountMeta::new(mailbox_outbox_account, false),

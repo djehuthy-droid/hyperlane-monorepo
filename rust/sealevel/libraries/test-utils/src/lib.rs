@@ -4,7 +4,6 @@ use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey,
     pubkey::Pubkey,
-    system_program,
 };
 use solana_program_test::*;
 use solana_sdk::{
@@ -14,6 +13,7 @@ use solana_sdk::{
     signers::Signers,
     transaction::{Transaction, TransactionError},
 };
+use solana_system_interface::{instruction as system_instruction, program as system_program};
 
 use spl_token_2022::{extension::StateWithExtensions, state::Account};
 
@@ -35,6 +35,27 @@ use serializable_account_meta::{SerializableAccountMeta, SimulationReturnData};
 
 pub mod igp;
 pub use igp::*;
+
+// ========= Crypto test helpers =========
+
+/// Signs a 32-byte hash with a k256 secp256k1 key, returning a 65-byte recoverable signature.
+pub fn sign_hash(signing_key: &k256::ecdsa::SigningKey, hash: &[u8; 32]) -> [u8; 65] {
+    let (sig, recovery_id) = signing_key
+        .sign_prehash_recoverable(hash)
+        .expect("signing failed");
+    let mut bytes = [0u8; 65];
+    bytes[..64].copy_from_slice(&sig.to_bytes());
+    bytes[64] = recovery_id.to_byte();
+    bytes
+}
+
+/// Derives the Ethereum address (H160) from a k256 signing key via keccak256.
+pub fn eth_address(signing_key: &k256::ecdsa::SigningKey) -> hyperlane_core::H160 {
+    let verifying_key = k256::ecdsa::VerifyingKey::from(signing_key);
+    let pubkey_bytes = verifying_key.to_encoded_point(false);
+    let hash = solana_program::keccak::hash(&pubkey_bytes.as_bytes()[1..]);
+    hyperlane_core::H160::from_slice(&hash.as_ref()[12..])
+}
 
 // ========= Mailbox =========
 
@@ -76,7 +97,7 @@ pub async fn initialize_mailbox(
         program_id: *mailbox_program_id,
         data: ixn.into_instruction_data().unwrap(),
         accounts: vec![
-            AccountMeta::new(system_program::id(), false),
+            AccountMeta::new(system_program::ID, false),
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(inbox_account, false),
             AccountMeta::new(outbox_account, false),
@@ -102,7 +123,7 @@ async fn initialize_test_ism(
     banks_client: &mut BanksClient,
     payer: &Keypair,
 ) -> Result<(), BanksClientError> {
-    let mut test_ism = TestIsmTestClient::new(banks_client.clone(), clone_keypair(payer));
+    let mut test_ism = TestIsmTestClient::new(banks_client.clone(), payer.insecure_clone());
     test_ism.init().await?;
 
     Ok(())
@@ -402,14 +423,14 @@ pub async fn get_process_account_metas(
     // Craft the accounts for the transaction.
     let mut accounts: Vec<AccountMeta> = vec![
         AccountMeta::new_readonly(payer.pubkey(), true),
-        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new(mailbox_accounts.inbox, false),
         AccountMeta::new_readonly(process_authority_key, false),
         AccountMeta::new(processed_message_account_key, false),
     ];
     accounts.extend(ism_getter_account_metas);
     accounts.extend([
-        AccountMeta::new_readonly(spl_noop::id(), false),
+        AccountMeta::new_readonly(account_utils::SPL_NOOP_PROGRAM_ID, false),
         AccountMeta::new_readonly(ism, false),
     ]);
 
@@ -474,7 +495,7 @@ pub async fn transfer_lamports(
 ) {
     process_instruction(
         banks_client,
-        solana_sdk::system_instruction::transfer(&payer.pubkey(), to, lamports),
+        system_instruction::transfer(&payer.pubkey(), to, lamports),
         payer,
         &[payer],
     )
@@ -492,12 +513,6 @@ pub fn assert_transaction_error<T>(
     } else {
         panic!("expected TransactionError");
     }
-}
-
-// Hack to get around the absence of a Clone implementation in solana-sdk 1.14.13.
-pub fn clone_keypair(keypair: &Keypair) -> Keypair {
-    let serialized = keypair.to_bytes();
-    Keypair::from_bytes(&serialized).unwrap()
 }
 
 pub async fn process_instruction<T: Signers>(

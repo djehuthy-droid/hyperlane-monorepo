@@ -4,20 +4,19 @@
 //! and validations it defines are not applied here, we should mirror them.
 //! ANY CHANGES HERE NEED TO BE REFLECTED IN THE TYPESCRIPT SDK.
 
-use std::{collections::HashSet, ops::Add, path::PathBuf};
+use std::{collections::HashSet, ops::Add, path::PathBuf, sync::Arc};
 
-use convert_case::Case;
 use derive_more::{AsMut, AsRef, Deref, DerefMut};
 use ethers::utils::hex;
 use eyre::{eyre, Context};
 use hyperlane_base::{
     impl_loadable_from_settings,
     settings::{
-        parser::{recase_json_value, RawAgentConf, ValueParser},
+        parser::{parse_json_array, parse_matching_list, RawAgentConf, ValueParser},
         Settings,
     },
 };
-use hyperlane_core::{cfg_unwrap_all, config::*, HyperlaneDomain, U256};
+use hyperlane_core::{cfg_unwrap_all, config::*, HyperlaneDomain, H160, U256};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,7 +62,7 @@ pub struct RelayerSettings {
     /// Not intended for production use.
     pub allow_local_checkpoint_syncers: bool,
     /// App contexts used for metrics.
-    pub metric_app_contexts: Vec<(MatchingList, String)>,
+    pub metric_app_contexts: Arc<Vec<(MatchingList, String)>>,
     /// Whether to allow contract call caching at all.
     pub allow_contract_call_caching: bool,
     /// The ISM cache policies to use
@@ -74,6 +73,32 @@ pub struct RelayerSettings {
     pub tx_id_indexing_enabled: bool,
     /// Whether to enable IGP indexing.
     pub igp_indexing_enabled: bool,
+    /// Optional scraper-proxy WebSocket used for shared indexing.
+    pub websocket_url: Option<url::Url>,
+    /// Whether a healthy scraper-proxy stream may replace direct RPC indexing.
+    pub websocket_authority_enabled: bool,
+    /// Whether to enable the relay API endpoint (default: false)
+    ///
+    /// # Deployment requirement
+    ///
+    /// The relay API shares the bounded, backpressured message-processing channel
+    /// with the normal loader. The rate limiter (`relay_api_rate_limit_*`) and
+    /// `MAX_MESSAGES_PER_TX=10` additionally limit admitted work, but do not
+    /// replace per-tenant limiting at the ingress layer.
+    ///
+    /// **The relay API must be deployed behind an ingress that enforces
+    /// per-tenant rate limits.** Enabling it on a publicly reachable port
+    /// without ingress-level controls risks OOM under a flood of requests.
+    pub relay_api_enabled: bool,
+    /// Port for the relay API HTTP server. When set, the relay API is served on
+    /// this dedicated port instead of the shared metrics port. Defaults to 8900.
+    pub relay_api_port: Option<u16>,
+    /// Relay API rate limit: max requests per window (default: 100)
+    pub relay_api_rate_limit_max_requests: Option<usize>,
+    /// Relay API rate limit: time window in seconds (default: 60)
+    pub relay_api_rate_limit_window_secs: Option<u64>,
+    /// Relay API allowed CORS origins (comma-separated). Defaults to https://nexus.hyperlane.xyz.
+    pub relay_api_cors_origins: Vec<String>,
 }
 
 /// Config for gas payment enforcement
@@ -199,6 +224,19 @@ impl FromRawConf<RawRelayerSettings> for RelayerSettings {
                 let minimum_is_defined = matches!(policy.get_opt_key("minimum"), Ok(Some(_)));
 
                 let matching_list = policy.chain(&mut err).get_opt_key("matchingList").and_then(parse_matching_list).unwrap_or_default();
+                let fee_token = policy.chain(&mut err)
+                    .get_opt_key("feeToken")
+                    .parse_from_str::<H160>("Expected feeToken to be an EVM address")
+                    .end()
+                    .unwrap_or_else(H160::zero);
+                if fee_token != H160::zero() {
+                    err.push(
+                        (&policy.cwp).add("fee_token"),
+                        eyre!(
+                            "`feeToken` gas payment enforcement is not supported without token-aware IGP indexing; use onChainFeeQuoting with the native token field unset"
+                        ),
+                    );
+                }
 
                 let parse_minimum = |p| GasPaymentEnforcementPolicy::Minimum { payment: p };
                 match policy_type {
@@ -338,6 +376,7 @@ impl FromRawConf<RawRelayerSettings> for RelayerSettings {
                 .collect_vec()
             })
             .unwrap_or_default();
+        let metric_app_contexts: Arc<Vec<(MatchingList, String)>> = Arc::new(metric_app_contexts);
 
         let allow_contract_call_caching = p
             .chain(&mut err)
@@ -369,6 +408,89 @@ impl FromRawConf<RawRelayerSettings> for RelayerSettings {
             .parse_bool()
             .unwrap_or(true);
 
+        let websocket_url: Option<url::Url> = p
+            .chain(&mut err)
+            .get_opt_key("websocketUrl")
+            .parse_from_str("Expected a valid scraper-proxy WebSocket URL")
+            .end();
+        if let Some(url) = &websocket_url {
+            if !matches!(url.scheme(), "ws" | "wss") {
+                err.push(
+                    cwp.clone(),
+                    eyre::eyre!("`websocketUrl` must use ws:// or wss://"),
+                );
+            }
+        }
+        let websocket_authority_enabled = p
+            .chain(&mut err)
+            .get_opt_key("websocketAuthorityEnabled")
+            .parse_bool()
+            .unwrap_or(false);
+        if websocket_authority_enabled && websocket_url.is_none() {
+            err.push(
+                cwp.clone(),
+                eyre::eyre!("`websocketAuthorityEnabled` requires `websocketUrl`"),
+            );
+        }
+
+        let relay_api_enabled = p
+            .chain(&mut err)
+            .get_opt_key("relayApiEnabled")
+            .parse_bool()
+            .unwrap_or(false);
+
+        let relay_api_port = p
+            .chain(&mut err)
+            .get_opt_key("relayApiPort")
+            .parse_u16()
+            .end();
+
+        let relay_api_rate_limit_max_requests = p
+            .chain(&mut err)
+            .get_opt_key("relayApiRateLimitMaxRequests")
+            .parse_u32()
+            .end()
+            .and_then(|v| {
+                if v > 0 {
+                    Some(v as usize)
+                } else {
+                    err.push(
+                        (&p.cwp).add("relayApiRateLimitMaxRequests"),
+                        eyre::eyre!("relayApiRateLimitMaxRequests must be greater than 0"),
+                    );
+                    None
+                }
+            });
+
+        let relay_api_rate_limit_window_secs = p
+            .chain(&mut err)
+            .get_opt_key("relayApiRateLimitWindowSecs")
+            .parse_u64()
+            .end()
+            .and_then(|v| {
+                if v > 0 {
+                    Some(v)
+                } else {
+                    err.push(
+                        (&p.cwp).add("relayApiRateLimitWindowSecs"),
+                        eyre::eyre!("relayApiRateLimitWindowSecs must be greater than 0"),
+                    );
+                    None
+                }
+            });
+
+        let relay_api_cors_origins: Vec<String> = p
+            .chain(&mut err)
+            .get_opt_key("relayApiCorsOrigins")
+            .parse_string()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["https://nexus.hyperlane.xyz".to_string()]);
+
         err.into_result(RelayerSettings {
             base,
             db,
@@ -387,44 +509,15 @@ impl FromRawConf<RawRelayerSettings> for RelayerSettings {
             max_retries: max_message_retries,
             tx_id_indexing_enabled,
             igp_indexing_enabled,
+            websocket_url,
+            websocket_authority_enabled,
+            relay_api_enabled,
+            relay_api_port,
+            relay_api_rate_limit_max_requests,
+            relay_api_rate_limit_window_secs,
+            relay_api_cors_origins,
         })
     }
-}
-
-fn parse_json_array(p: ValueParser) -> Option<(ConfigPath, Value)> {
-    let mut err = ConfigParsingError::default();
-
-    match p {
-        ValueParser {
-            val: Value::String(array_str),
-            cwp,
-        } => serde_json::from_str::<Value>(array_str)
-            .context("Expected JSON string")
-            .take_err(&mut err, || cwp.clone())
-            .map(|v| (cwp, recase_json_value(v, Case::Flat))),
-        ValueParser {
-            val: value @ Value::Array(_),
-            cwp,
-        } => Some((cwp, value.clone())),
-        _ => Err(eyre!("Expected JSON array or stringified JSON"))
-            .take_err(&mut err, || p.cwp.clone()),
-    }
-}
-
-fn parse_matching_list(p: ValueParser) -> ConfigResult<MatchingList> {
-    let mut err = ConfigParsingError::default();
-
-    let raw_list = parse_json_array(p.clone()).map(|(_, v)| v);
-    let Some(raw_list) = raw_list else {
-        return err.into_result(MatchingList::default());
-    };
-    let p = ValueParser::new(p.cwp.clone(), &raw_list);
-    let ml = p
-        .parse_value::<MatchingList>("Expected matching list")
-        .take_config_err(&mut err)
-        .unwrap_or_default();
-
-    err.into_result(ml)
 }
 
 fn parse_ism_cache_configs(p: ValueParser) -> ConfigResult<Vec<IsmCacheConfig>> {
@@ -463,6 +556,38 @@ fn parse_address_list(
 mod test {
     use super::*;
     use hyperlane_core::H160;
+    use serde_json::json;
+
+    fn chain_config(name: &str, domain_id: u32) -> Value {
+        json!({
+            "name": name,
+            "domainid": domain_id,
+            "chainid": domain_id,
+            "protocol": "ethereum",
+            "rpcurls": [{ "http": "http://localhost:8545" }],
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004",
+        })
+    }
+
+    fn parse_settings(raw: Value) -> ConfigResult<RelayerSettings> {
+        RelayerSettings::from_config_filtered(
+            RawRelayerSettings(raw),
+            &ConfigPath::default(),
+            (),
+            "relayer",
+        )
+    }
+
+    fn assert_fee_token_error(error: ConfigParsingError) {
+        let error = error.to_string();
+        assert!(
+            error.contains("`feeToken` gas payment enforcement is not supported"),
+            "unexpected error: {error}",
+        );
+    }
 
     #[test]
     fn test_parse_address_blacklist() {
@@ -520,5 +645,98 @@ mod test {
         let p = ValueParser::new(ConfigPath::default(), &value);
         let configs = parse_ism_cache_configs(p).expect("Failed to parse ism cache config");
         assert_eq!(configs.len(), 2);
+    }
+
+    #[test]
+    fn fee_token_policy_rejects_non_zero_fee_token() {
+        let settings = parse_settings(json!({
+            "relaychains": "legacy",
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+            "gaspaymentenforcement": [{
+                "type": "minimum",
+                "payment": "1",
+                "feetoken": "0x0000000000000000000000000000000000000005",
+            }],
+        }));
+
+        assert_fee_token_error(settings.expect_err("non-zero feeToken policy must reject"));
+    }
+
+    #[test]
+    fn fee_token_policy_allows_unset_fee_token() {
+        parse_settings(json!({
+            "relaychains": "legacy",
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+            "gaspaymentenforcement": [{
+                "type": "onChainFeeQuoting",
+            }],
+        }))
+        .expect("unset feeToken should parse");
+    }
+
+    #[test]
+    fn fee_token_policy_allows_zero_fee_token() {
+        parse_settings(json!({
+            "relaychains": "legacy",
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+            "gaspaymentenforcement": [{
+                "type": "onChainFeeQuoting",
+                "feetoken": "0x0000000000000000000000000000000000000000",
+            }],
+        }))
+        .expect("zero feeToken should parse");
+    }
+
+    #[test]
+    fn parses_scraper_websocket_url() {
+        let settings = parse_settings(json!({
+            "relaychains": "legacy",
+            "websocketurl": "wss://scraper.example/ws/events",
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+        }))
+        .expect("valid WebSocket URL should parse");
+
+        assert_eq!(
+            settings.websocket_url.expect("configured URL").as_str(),
+            "wss://scraper.example/ws/events"
+        );
+    }
+
+    #[test]
+    fn rejects_non_websocket_scraper_url() {
+        let error = parse_settings(json!({
+            "relaychains": "legacy",
+            "websocketurl": "https://scraper.example/ws/events",
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+        }))
+        .expect_err("HTTP URL must reject")
+        .to_string();
+
+        assert!(error.contains("must use ws:// or wss://"));
+    }
+
+    #[test]
+    fn scraper_authority_requires_websocket_url() {
+        let error = parse_settings(json!({
+            "relaychains": "legacy",
+            "websocketauthorityenabled": true,
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+        }))
+        .expect_err("authority without a WebSocket URL must reject")
+        .to_string();
+
+        assert!(error.contains("requires `websocketUrl`"));
     }
 }

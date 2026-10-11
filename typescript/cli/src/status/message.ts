@@ -1,13 +1,16 @@
 import type { TransactionReceipt } from '@ethersproject/providers';
 import { input } from '@inquirer/prompts';
 
+import { HyperlaneRelayer } from '@hyperlane-xyz/relayer';
 import {
   type ChainName,
   type DispatchedMessage,
   HyperlaneCore,
-  HyperlaneRelayer,
 } from '@hyperlane-xyz/sdk';
 
+import { isNullish } from '@hyperlane-xyz/utils';
+
+import { ensureEvmSignersForChains } from '../context/context.js';
 import {
   type CommandContext,
   type WriteCommandContext,
@@ -72,6 +75,27 @@ export async function checkMessageStatus({
     ? dispatched.filter((m) => m.id === messageId)
     : dispatched;
 
+  if (selfRelay && context.key) {
+    const destinationChains = [
+      ...new Set(
+        messages
+          .map((m) => m.parsed.destinationChain)
+          .filter((c): c is string => !isNullish(c)),
+      ),
+    ];
+    if (destinationChains.length > 0) {
+      await ensureEvmSignersForChains(
+        {
+          key: context.key,
+          multiProtocolProvider: context.multiProtocolProvider,
+          multiProvider: context.multiProvider,
+          strategyPath: context.strategyPath,
+        },
+        destinationChains,
+      );
+    }
+  }
+
   const undelivered = [];
   for (const message of messages) {
     log(
@@ -128,7 +152,16 @@ export async function checkMessageStatus({
         const merkleAddress = coreAddresses[origin].merkleTreeHook;
         stubMerkleTreeConfig(relayer, origin, hookAddress, merkleAddress);
       }
-      await relayer.relayAll(dispatchedReceipt, relayable);
+      // relayAll returns a receipt per message: either from the relay tx or,
+      // if the message was already delivered, from getProcessedReceipt.
+      const results = await relayer.relayAll(dispatchedReceipt, relayable);
+      const delivered = Object.values(results).flat().length;
+      const failed = relayable.length - delivered;
+      if (failed > 0) {
+        logRed(`Failed to relay ${failed}/${relayable.length} messages`);
+        process.exit(1);
+      }
+      logGreen(`Relayed ${delivered} message(s)`);
     } else if (undelivered.length > 0) {
       warnYellow(
         'No messages could be relayed - missing signers for all destination chains',

@@ -1,0 +1,6 @@
+{
+  "fail-zero": true,
+  "extensions": ["ts"],
+  "file": ["src/tests/starknet/e2e-test.setup.ts"],
+  "node-option": ["import=tsx/esm"]
+}

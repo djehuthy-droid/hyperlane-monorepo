@@ -4,6 +4,7 @@
 // middleware can request keys up front when required.
 export const SIGN_COMMANDS = [
   'apply',
+  'create',
   'deploy',
   'send',
   'submit',
@@ -18,18 +19,21 @@ export const CONDITIONAL_SIGN_COMMANDS = ['status'];
 export function isSignCommand(argv: any): boolean {
   const command = argv._[0];
   const subCommand = argv._.length > 1 ? argv._[1] : undefined;
+  const nestedCommand = argv._.length > 2 ? argv._[2] : undefined;
 
   // Check if it's a conditional command that only needs keys with --relay
   if (
     CONDITIONAL_SIGN_COMMANDS.includes(command) ||
-    (subCommand && CONDITIONAL_SIGN_COMMANDS.includes(subCommand))
+    (subCommand && CONDITIONAL_SIGN_COMMANDS.includes(subCommand)) ||
+    (nestedCommand && CONDITIONAL_SIGN_COMMANDS.includes(nestedCommand))
   ) {
     return !!argv.relay;
   }
 
   return !!(
     SIGN_COMMANDS.includes(command) ||
-    (subCommand && SIGN_COMMANDS.includes(subCommand))
+    (subCommand && SIGN_COMMANDS.includes(subCommand)) ||
+    (nestedCommand && SIGN_COMMANDS.includes(nestedCommand))
   );
 }
 
@@ -38,6 +42,7 @@ export enum CommandType {
   WARP_READ = 'warp:read',
   WARP_SEND = 'warp:send',
   WARP_APPLY = 'warp:apply',
+  WARP_CHECK = 'warp:check',
   WARP_REBALANCER = 'warp:rebalancer',
   SEND_MESSAGE = 'send:message',
   STATUS = 'status:',
@@ -48,4 +53,14 @@ export enum CommandType {
   CORE_READ = 'core:read',
   CORE_CHECK = 'core:check',
   ICA_DEPLOY = 'ica:deploy',
+  ISM_DEPLOY = 'ism:deploy',
+  ISM_READ = 'ism:read',
+  HOOK_DEPLOY = 'hook:deploy',
+  HOOK_APPLY = 'hook:apply',
+  HOOK_READ = 'hook:read',
+  WARP_ALT_CREATE = 'warp:alt:create',
+  WARP_ALT_CHECK = 'warp:alt:check',
+  WARP_ALT_READ = 'warp:alt:read',
+  WARP_QUOTE_CREATE = 'warp:quote:create',
+  WARP_QUOTE_READ = 'warp:quote:read',
 }

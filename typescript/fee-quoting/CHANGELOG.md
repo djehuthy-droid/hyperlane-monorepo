@@ -1,0 +1,556 @@
+# @hyperlane-xyz/fee-quoting
+
+## 27.3.16
+
+### Patch Changes
+
+- Updated dependencies [4efffd5]
+- Updated dependencies [35d3002]
+- Updated dependencies [fe26a26]
+- Updated dependencies [19dbb59]
+  - @hyperlane-xyz/sdk@45.0.1
+  - @hyperlane-xyz/sealevel-sdk@45.0.1
+  - @hyperlane-xyz/utils@45.0.1
+  - @hyperlane-xyz/provider-sdk@11.0.1
+
+## 27.3.15
+
+### Patch Changes
+
+- Updated dependencies [e0d3394]
+- Updated dependencies [b83bac5]
+- Updated dependencies [9b9de8d]
+- Updated dependencies [4975a40]
+- Updated dependencies [d02c93e]
+- Updated dependencies [ee50f43]
+- Updated dependencies [12678bc]
+- Updated dependencies [9a59116]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [87b2c63]
+- Updated dependencies [28eda66]
+- Updated dependencies [f05bb6d]
+- Updated dependencies [8373a74]
+- Updated dependencies [0015102]
+- Updated dependencies [6f7b511]
+- Updated dependencies [249517a]
+- Updated dependencies [2762075]
+- Updated dependencies [7e357be]
+- Updated dependencies [5e7cc26]
+- Updated dependencies [f9cf910]
+- Updated dependencies [323faae]
+- Updated dependencies [55e6699]
+- Updated dependencies [e994943]
+- Updated dependencies [28eda66]
+- Updated dependencies [6eaa8c6]
+- Updated dependencies [11d5de3]
+- Updated dependencies [98ec7d5]
+- Updated dependencies [2a938f3]
+- Updated dependencies [43f89c6]
+- Updated dependencies [4e2ab65]
+- Updated dependencies [4c644c0]
+- Updated dependencies [4ad4577]
+- Updated dependencies [f64f992]
+- Updated dependencies [74001ec]
+- Updated dependencies [5a3ec14]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [692cdb4]
+- Updated dependencies [ea5b010]
+- Updated dependencies [b83bac5]
+- Updated dependencies [b83bac5]
+- Updated dependencies [67f3cd3]
+  - @hyperlane-xyz/sdk@45.0.0
+  - @hyperlane-xyz/sealevel-sdk@45.0.0
+  - @hyperlane-xyz/provider-sdk@11.0.0
+  - @hyperlane-xyz/utils@45.0.0
+
+## 27.3.14
+
+### Patch Changes
+
+- Updated dependencies [16df6ee]
+  - @hyperlane-xyz/sdk@44.0.2
+  - @hyperlane-xyz/sealevel-sdk@44.0.2
+  - @hyperlane-xyz/utils@44.0.2
+  - @hyperlane-xyz/provider-sdk@10.0.2
+
+## 27.3.13
+
+### Patch Changes
+
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/sdk@44.0.1
+  - @hyperlane-xyz/sealevel-sdk@44.0.1
+  - @hyperlane-xyz/utils@44.0.1
+
+## 27.3.12
+
+### Patch Changes
+
+- Updated dependencies [85c44af]
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/sdk@44.0.0
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+  - @hyperlane-xyz/sealevel-sdk@44.0.0
+
+## 27.3.11
+
+### Patch Changes
+
+- Updated dependencies [0848474]
+- Updated dependencies [e76189e]
+- Updated dependencies [3ced099]
+- Updated dependencies [a00b342]
+- Updated dependencies [b58c7eb]
+- Updated dependencies [60fc463]
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+- Updated dependencies [8d91ef8]
+- Updated dependencies [11f2dee]
+  - @hyperlane-xyz/sdk@43.0.0
+  - @hyperlane-xyz/sealevel-sdk@43.0.0
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/utils@43.0.0
+
+## 27.3.10
+
+### Patch Changes
+
+- Updated dependencies [1713edd]
+- Updated dependencies [9003bab]
+- Updated dependencies [aa29187]
+- Updated dependencies [f0f8a56]
+- Updated dependencies [1b136e1]
+- Updated dependencies [1b136e1]
+- Updated dependencies [1b136e1]
+- Updated dependencies [9a8bb17]
+  - @hyperlane-xyz/sdk@42.0.0
+  - @hyperlane-xyz/sealevel-sdk@42.0.0
+  - @hyperlane-xyz/utils@42.0.0
+  - @hyperlane-xyz/provider-sdk@8.1.3
+
+## 27.3.9
+
+### Patch Changes
+
+- Updated dependencies [c201794]
+  - @hyperlane-xyz/sdk@41.3.1
+  - @hyperlane-xyz/sealevel-sdk@41.3.1
+  - @hyperlane-xyz/utils@41.3.1
+  - @hyperlane-xyz/provider-sdk@8.1.2
+
+## 27.3.8
+
+### Patch Changes
+
+- Updated dependencies [4a21153]
+- Updated dependencies [c328efa]
+- Updated dependencies [4a21153]
+- Updated dependencies [4a21153]
+- Updated dependencies [322a418]
+- Updated dependencies [d5d7d1a]
+  - @hyperlane-xyz/sdk@41.3.0
+  - @hyperlane-xyz/sealevel-sdk@41.3.0
+  - @hyperlane-xyz/utils@41.3.0
+  - @hyperlane-xyz/provider-sdk@8.1.1
+
+## 27.3.7
+
+### Patch Changes
+
+- Updated dependencies [bd4e5f0]
+- Updated dependencies [e7666ef]
+- Updated dependencies [5fac94d]
+- Updated dependencies [5899416]
+- Updated dependencies [5fac94d]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/sealevel-sdk@41.2.0
+  - @hyperlane-xyz/sdk@41.2.0
+  - @hyperlane-xyz/utils@41.2.0
+
+## 27.3.6
+
+### Patch Changes
+
+- Updated dependencies [0adcbb2]
+  - @hyperlane-xyz/sealevel-sdk@41.1.0
+  - @hyperlane-xyz/sdk@41.1.0
+  - @hyperlane-xyz/utils@41.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.4
+
+## 27.3.5
+
+### Patch Changes
+
+- Updated dependencies [0057c5d]
+- Updated dependencies [fa19409]
+- Updated dependencies [1a32515]
+- Updated dependencies [1ba623d]
+- Updated dependencies [fcb4331]
+- Updated dependencies [eb24243]
+- Updated dependencies [72738e2]
+- Updated dependencies [fa19409]
+- Updated dependencies [7846658]
+- Updated dependencies [0765fe0]
+- Updated dependencies [b1c6b7e]
+- Updated dependencies [a09ba71]
+- Updated dependencies [d9426bc]
+  - @hyperlane-xyz/sdk@41.0.0
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+  - @hyperlane-xyz/sealevel-sdk@41.0.0
+
+## 27.3.4
+
+### Patch Changes
+
+- Updated dependencies [745fb77]
+- Updated dependencies [469da6d]
+- Updated dependencies [745fb77]
+- Updated dependencies [57b1e14]
+- Updated dependencies [1cac66f]
+- Updated dependencies [a7f757b]
+- Updated dependencies [4acd9a6]
+- Updated dependencies [c6a2f61]
+  - @hyperlane-xyz/sdk@40.0.0
+  - @hyperlane-xyz/sealevel-sdk@40.0.0
+  - @hyperlane-xyz/utils@40.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.2
+
+## 27.3.3
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+- Updated dependencies [6c9210b]
+- Updated dependencies [086ec59]
+  - @hyperlane-xyz/sdk@39.1.0
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.1
+  - @hyperlane-xyz/sealevel-sdk@39.1.0
+
+## 27.3.2
+
+### Patch Changes
+
+- Updated dependencies [f41f9fd]
+- Updated dependencies [ba0e9c1]
+- Updated dependencies [4ef1fde]
+- Updated dependencies [43eb24a]
+- Updated dependencies [406b5c7]
+- Updated dependencies [11e215e]
+- Updated dependencies [bf7c658]
+- Updated dependencies [4bebbbf]
+- Updated dependencies [6793396]
+- Updated dependencies [735793b]
+- Updated dependencies [2d398b9]
+- Updated dependencies [15b249c]
+- Updated dependencies [6967bef]
+- Updated dependencies [213f626]
+- Updated dependencies [3811ba9]
+- Updated dependencies [6c2ca1d]
+- Updated dependencies [1a31d04]
+- Updated dependencies [9997aee]
+  - @hyperlane-xyz/sdk@39.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/sealevel-sdk@39.0.0
+  - @hyperlane-xyz/utils@39.0.0
+
+## 27.3.1
+
+### Patch Changes
+
+- 2208b91: - `QuotedTransferProvider` gained a `getQuotedTransferFee` method so display and submit call sites use the same protocol-agnostic entry point for offchain-quoted transfers.
+  - `SealevelQuotedTransferProvider.getQuotedTransferFee` decodes the warp signed-quote `data` as a Borsh `FeeDataStrategy` (17 bytes, Linear-only) and applies the on-chain Linear formula at the transfer amount; the IGP signed-quote `data` decodes as a 33-byte `IgpQuoteData` (`token_exchange_rate ‖ gas_price ‖ token_decimals`) and the result is computed via `compute_gas_fee` against `tokenData.destination_gas` plus the per-destination `OverheadIgp.gas_overhead` (matching the on-chain `OverheadIgp::quote_gas_payment`).
+  - `SealevelHypTokenAdapter.innerIgpFeeState` now exposes the resolved `gasOverheads` map alongside the inner-IGP account.
+  - `WarpCore.getQuotedTransferFee` now takes `quotedTransfer: QuotedTransferProvider` — callers construct the provider themselves, mirroring `getTransferRemoteTxs({ quotedTransfer })`.
+  - The EVM provider is refactored around a shared private `runQuoteExecute` helper and the dead `QuotedCallsParams.feeQuotes` reuse field is removed; both display and submit now invoke the `quoteExecute` eth_call independently (deterministic for a given `(quotes, clientSalt, block)`, so display ↔ submit results match within a block).
+  - The `hyperlane warp send` CLI now unifies the preflight estimate behind `WarpCore.getQuotedTransferFee` for both EVM and Sealevel origins, logging the quoted IGP + token fee before submit.
+  - The SVM fee-quoting service's CC quote-walker docstring is corrected to reflect that the on-chain CC submit handler enforces route scope via `CcQuoteFeeValidation::{Specific, Default}`; the `DEFAULT_ROUTER` transient-fallback behavior it describes already ships on `main`, and this change adds test coverage for it.
+  - The Sealevel IGP fee computation normalizes the Borsh-decoded `destination_gas` and `gasOverheads` values (bn.js `BN` at runtime despite their `bigint` types) before arithmetic, so a `warp send` preflight on a fee-enabled SVM origin no longer crashes on the `BN`-vs-`bigint` type mismatch.
+  - Legacy (non-upgraded) SVM IGP routes with no offchain `fee_config` now display the on-chain `quoteGasPayment` fee via the shared `SealevelHypTokenAdapter.quoteLegacyIgpGasPayment` helper instead of reporting IGP = 0, matching what the submit path pays.
+  - `SealevelQuotedTransferProvider.getQuotedTransferFee` now skips IGP for same-domain (local) transfers — mirroring the submit path's local gate — so a local cross-collateral transfer no longer asserts on an unset `destination_gas`.
+  - The SVM IGP fee computation now rejects a quote whose priced fee exceeds `u64`, mirroring the on-chain `as_u64()` narrowing, so preflight fails fast instead of displaying a fee the transfer could never pay.
+  - Tests added for warp Linear strategy decode + IGP gas-fee math (12 new cases) and a CC DEFAULT_ROUTER cascade case in the SVM transfer-remote E2E.
+- Updated dependencies [961a89d]
+- Updated dependencies [2208b91]
+- Updated dependencies [2208b91]
+- Updated dependencies [2208b91]
+- Updated dependencies [197b1e0]
+- Updated dependencies [293abdc]
+  - @hyperlane-xyz/sdk@38.0.0
+  - @hyperlane-xyz/sealevel-sdk@38.0.0
+  - @hyperlane-xyz/provider-sdk@7.2.0
+  - @hyperlane-xyz/utils@38.0.0
+
+## 27.3.0
+
+### Minor Changes
+
+- 262073e: The SVM quote service was changed to substitute the user-supplied `recipient` with `WILDCARD_RECIPIENT` (`0xff × 32`) when signing standing-mode warp quotes — transient mode is unchanged. SVM standing quotes are stored at a PDA keyed by `(fee_account, dest_domain, target_router)` with no recipient in the seeds, so signing the user's actual recipient partitioned the standing PDA per recipient and prevented reuse. The on-chain consume handler already has a wildcard-recipient fallback (fee program `processor/quote.rs`) that accepts the substituted value, so standing quotes became universally consumable as designed. EVM behavior is unchanged — EVM quotes are recipient-bound by the wrapper contract's exec-time verification, not by a PDA lookup, so the substitution doesn't apply there.
+
+### Patch Changes
+
+- Updated dependencies [92909f8]
+- Updated dependencies [262073e]
+- Updated dependencies [df34a68]
+- Updated dependencies [262073e]
+- Updated dependencies [af8e1f6]
+- Updated dependencies [cc4bdb6]
+- Updated dependencies [c7895b6]
+- Updated dependencies [262073e]
+- Updated dependencies [6e803be]
+- Updated dependencies [cb0c7c9]
+- Updated dependencies [a82c918]
+- Updated dependencies [262073e]
+- Updated dependencies [351cf01]
+- Updated dependencies [5122e71]
+- Updated dependencies [262073e]
+- Updated dependencies [262073e]
+- Updated dependencies [262073e]
+- Updated dependencies [262073e]
+- Updated dependencies [c4b3ff5]
+- Updated dependencies [31f8b51]
+- Updated dependencies [97e8ca1]
+- Updated dependencies [955281d]
+- Updated dependencies [5122e71]
+- Updated dependencies [9c8b435]
+  - @hyperlane-xyz/sdk@37.0.0
+  - @hyperlane-xyz/sealevel-sdk@37.0.0
+  - @hyperlane-xyz/provider-sdk@7.1.0
+  - @hyperlane-xyz/utils@37.0.0
+
+## 27.2.19
+
+### Patch Changes
+
+- Updated dependencies [d288e7b]
+- Updated dependencies [d288e7b]
+- Updated dependencies [d288e7b]
+- Updated dependencies [019201a]
+- Updated dependencies [cc722b8]
+- Updated dependencies [9cd7606]
+- Updated dependencies [2821252]
+- Updated dependencies [a6a3a33]
+- Updated dependencies [2821252]
+- Updated dependencies [d288e7b]
+- Updated dependencies [d288e7b]
+- Updated dependencies [aa41ce4]
+- Updated dependencies [2f9d783]
+- Updated dependencies [9bdab1d]
+- Updated dependencies [d288e7b]
+- Updated dependencies [cf6857e]
+- Updated dependencies [32b87ad]
+- Updated dependencies [cf6857e]
+  - @hyperlane-xyz/sdk@36.0.0
+  - @hyperlane-xyz/utils@36.0.0
+
+## 27.2.18
+
+### Patch Changes
+
+- Updated dependencies [88e51ed]
+- Updated dependencies [fb63f5f]
+- Updated dependencies [889c68a]
+- Updated dependencies [fb63f5f]
+- Updated dependencies [92ef474]
+- Updated dependencies [f0b325a]
+- Updated dependencies [6db4aee]
+- Updated dependencies [babb3d0]
+- Updated dependencies [867ce3c]
+- Updated dependencies [b77faf4]
+- Updated dependencies [fb63f5f]
+- Updated dependencies [fb63f5f]
+  - @hyperlane-xyz/sdk@35.2.0
+  - @hyperlane-xyz/utils@35.2.0
+
+## 27.2.17
+
+### Patch Changes
+
+- Updated dependencies [830ce1d]
+- Updated dependencies [9cdf9eb]
+  - @hyperlane-xyz/sdk@35.1.0
+  - @hyperlane-xyz/utils@35.1.0
+
+## 27.2.16
+
+### Patch Changes
+
+- Updated dependencies [06a5b6b]
+- Updated dependencies [da1cfb1]
+- Updated dependencies [4bb1c3e]
+- Updated dependencies [93c2290]
+  - @hyperlane-xyz/sdk@35.0.1
+  - @hyperlane-xyz/utils@35.0.1
+
+## 27.2.15
+
+### Patch Changes
+
+- Updated dependencies [38479d0]
+- Updated dependencies [4adf279]
+- Updated dependencies [7089676]
+- Updated dependencies [44aa432]
+- Updated dependencies [631d7e7]
+- Updated dependencies [6c687ee]
+- Updated dependencies [a8c9430]
+  - @hyperlane-xyz/sdk@35.0.0
+  - @hyperlane-xyz/utils@35.0.0
+
+## 27.2.14
+
+### Patch Changes
+
+- Updated dependencies [9a1ce26]
+- Updated dependencies [f758a70]
+- Updated dependencies [2151352]
+- Updated dependencies [b8a600c]
+  - @hyperlane-xyz/sdk@34.0.0
+  - @hyperlane-xyz/utils@34.0.0
+
+## 27.2.13
+
+### Patch Changes
+
+- Updated dependencies [9ad1bd0]
+- Updated dependencies [530f02e]
+- Updated dependencies [9670e43]
+- Updated dependencies [cc90a8f]
+  - @hyperlane-xyz/sdk@33.1.1
+  - @hyperlane-xyz/utils@33.1.1
+
+## 27.2.12
+
+### Patch Changes
+
+- Updated dependencies [6f4b790]
+- Updated dependencies [bfe4d2e]
+- Updated dependencies [6929388]
+- Updated dependencies [47649b7]
+- Updated dependencies [0b1c1d1]
+- Updated dependencies [d9dec53]
+  - @hyperlane-xyz/sdk@33.1.0
+  - @hyperlane-xyz/utils@33.1.0
+
+## 27.2.11
+
+### Patch Changes
+
+- Updated dependencies [1f918d0]
+- Updated dependencies [78199f4]
+  - @hyperlane-xyz/sdk@33.0.2
+  - @hyperlane-xyz/utils@33.0.2
+
+## 27.2.10
+
+### Patch Changes
+
+- Updated dependencies [a2081df]
+- Updated dependencies [4c91737]
+  - @hyperlane-xyz/sdk@33.0.1
+  - @hyperlane-xyz/utils@33.0.1
+
+## 27.2.9
+
+### Patch Changes
+
+- Updated dependencies [dc8e560]
+  - @hyperlane-xyz/sdk@33.0.0
+  - @hyperlane-xyz/utils@33.0.0
+
+## 27.2.8
+
+### Patch Changes
+
+- Updated dependencies [611b911]
+- Updated dependencies [c6de4c9]
+  - @hyperlane-xyz/sdk@32.0.1
+  - @hyperlane-xyz/utils@32.0.1
+
+## 27.2.7
+
+### Patch Changes
+
+- Updated dependencies [e4da110]
+- Updated dependencies [d588eb5]
+- Updated dependencies [ab17263]
+- Updated dependencies [ebde778]
+  - @hyperlane-xyz/sdk@32.0.0
+  - @hyperlane-xyz/utils@32.0.0
+
+## 27.2.6
+
+### Patch Changes
+
+- Updated dependencies [f9c8f83]
+  - @hyperlane-xyz/sdk@31.2.1
+  - @hyperlane-xyz/utils@31.2.1
+
+## 27.2.5
+
+### Patch Changes
+
+- Updated dependencies [35fb5c8]
+  - @hyperlane-xyz/sdk@31.2.0
+  - @hyperlane-xyz/utils@31.2.0
+
+## 27.2.4
+
+### Patch Changes
+
+- Updated dependencies [8a082af]
+- Updated dependencies [c8fe242]
+- Updated dependencies [8a082af]
+  - @hyperlane-xyz/sdk@31.1.0
+  - @hyperlane-xyz/utils@31.1.0
+
+## 27.2.3
+
+### Patch Changes
+
+- Updated dependencies [d5168fc]
+  - @hyperlane-xyz/utils@31.0.1
+  - @hyperlane-xyz/sdk@31.0.1
+
+## 27.2.2
+
+### Patch Changes
+
+- Updated dependencies [44626fb]
+- Updated dependencies [df33d41]
+- Updated dependencies [4963b32]
+- Updated dependencies [9003721]
+- Updated dependencies [69e6b3f]
+- Updated dependencies [fc0a1cf]
+  - @hyperlane-xyz/sdk@31.0.0
+  - @hyperlane-xyz/utils@31.0.0
+
+## 27.2.1
+
+### Patch Changes
+
+- Updated dependencies [26d682b]
+  - @hyperlane-xyz/sdk@30.1.1
+  - @hyperlane-xyz/utils@30.1.1
+
+## 27.2.0
+
+### Minor Changes
+
+- e1f35a7: The offchain fee quoting service and client were added, with CLI integration for quoted transfers and SDK export of DEFAULT_ROUTER_KEY.
+
+### Patch Changes
+
+- Updated dependencies [4c4462f]
+- Updated dependencies [71f0ca4]
+- Updated dependencies [9061916]
+- Updated dependencies [2057d1a]
+- Updated dependencies [e1f35a7]
+- Updated dependencies [b691b87]
+- Updated dependencies [6f8c503]
+- Updated dependencies [5eae48e]
+- Updated dependencies [57e46b1]
+  - @hyperlane-xyz/sdk@30.1.0
+  - @hyperlane-xyz/utils@30.1.0

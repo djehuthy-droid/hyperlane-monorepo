@@ -1,7 +1,9 @@
+import { generateKeyPairSync } from 'crypto';
 import { ethers } from 'ethers';
 import http from 'http';
+import { type IncomingMessage, type ServerResponse } from 'http';
 import path from 'path';
-import { $ } from 'zx';
+import { $, type ProcessPromise } from 'zx';
 
 import {
   type AbstractCcipReadIsm,
@@ -21,14 +23,28 @@ import {
 } from '@hyperlane-xyz/core';
 import { type TestChainMetadata } from '@hyperlane-xyz/provider-sdk/chain';
 import {
+  type MultiProvider,
   type WarpCoreConfig,
   WarpCoreConfigSchema,
   type WarpRouteDeployConfig,
 } from '@hyperlane-xyz/sdk';
-import { type Address, assert, inCIMode } from '@hyperlane-xyz/utils';
+import {
+  type Address,
+  ProtocolType,
+  assert,
+  ensure0x,
+  inCIMode,
+} from '@hyperlane-xyz/utils';
+
+import { TronWallet } from '@hyperlane-xyz/tron-sdk';
 
 import { getContext } from '../../../context/context.js';
-import { readYamlOrJson, writeYamlOrJson } from '../../../utils/files.js';
+import { configureLocalPolling } from '../localProvider.js';
+import {
+  isFile,
+  readYamlOrJson,
+  writeYamlOrJson,
+} from '../../../utils/files.js';
 import { KeyBoardKeys, type TestPromptAction } from '../../commands/helpers.js';
 import {
   ANVIL_KEY,
@@ -41,7 +57,6 @@ export const GET_WARP_DEPLOY_CORE_CONFIG_OUTPUT_PATH = (
   symbol: string,
 ): string => {
   const fileName = path.parse(originalDeployConfigPath).name;
-
   return getCombinedWarpRoutePath(symbol, [fileName]);
 };
 
@@ -154,10 +169,16 @@ export function getTokenAddressFromWarpConfig(
  * Retrieves the deployed Warp address from the Warp core config.
  */
 export function getDeployedWarpAddress(chain: string, warpCorePath: string) {
+  assert(isFile(warpCorePath), `File doesn't exist at ${warpCorePath}`);
   const warpCoreConfig: WarpCoreConfig = readYamlOrJson(warpCorePath);
   WarpCoreConfigSchema.parse(warpCoreConfig);
-  return warpCoreConfig.tokens.find((t) => t.chainName === chain)!
-    .addressOrDenom;
+  const tokenConfig = warpCoreConfig.tokens.find(
+    (token) => token.chainName === chain,
+  );
+  if (!tokenConfig?.addressOrDenom) {
+    throw new Error(`Could not find token config for ${chain}`);
+  }
+  return tokenConfig.addressOrDenom;
 }
 
 export async function getDomainId(
@@ -170,6 +191,32 @@ export async function getDomainId(
   });
   const chainMetadata = await registry.getChainMetadata(chainName);
   return String(chainMetadata?.domainId);
+}
+
+/**
+ * Set the appropriate signer type on the MultiProvider based on the chain's
+ * technical stack (TronWallet for Tron chains, ethers.Wallet otherwise).
+ */
+function setSignerForChain(
+  multiProvider: MultiProvider,
+  chain: string,
+  privateKey: string,
+): void {
+  const key = ensure0x(privateKey);
+  const { protocol, rpcUrls } = multiProvider.getChainMetadata(chain);
+  if (protocol === ProtocolType.Tron) {
+    assert(rpcUrls?.length, `No rpcUrls configured for chain ${chain}`);
+    multiProvider.setSigner(chain, new TronWallet(key, rpcUrls[0].http));
+  } else {
+    const provider = multiProvider.getProvider(chain);
+    if (provider instanceof ethers.providers.BaseProvider) {
+      configureLocalPolling(
+        provider,
+        rpcUrls.map(({ http }) => http),
+      );
+    }
+    multiProvider.setSigner(chain, new ethers.Wallet(key));
+  }
 }
 
 export async function deployToken(
@@ -185,15 +232,14 @@ export async function deployToken(
     key: privateKey,
   });
 
-  // Future works: make signer compatible with protocol/chain stack
-  multiProvider.setSigner(chain, new ethers.Wallet(privateKey));
+  setSignerForChain(multiProvider, chain, privateKey);
 
-  const token = await new ERC20Test__factory(
-    multiProvider.getSigner(chain),
-  ).deploy(name, symbol.toLocaleUpperCase(), '100000000000000000000', decimals);
-  await token.deployed();
-
-  return token;
+  return multiProvider.handleDeploy(chain, new ERC20Test__factory(), [
+    name,
+    symbol.toLocaleUpperCase(),
+    '100000000000000000000',
+    decimals,
+  ]);
 }
 
 export async function deployFiatToken(
@@ -208,14 +254,14 @@ export async function deployFiatToken(
     key: privateKey,
   });
 
-  multiProvider.setSigner(chain, new ethers.Wallet(privateKey));
+  setSignerForChain(multiProvider, chain, privateKey);
 
-  const token = await new FiatTokenTest__factory(
-    multiProvider.getSigner(chain),
-  ).deploy(name, symbol.toLocaleUpperCase(), '100000000000000000000', decimals);
-  await token.deployed();
-
-  return token;
+  return multiProvider.handleDeploy(chain, new FiatTokenTest__factory(), [
+    name,
+    symbol.toLocaleUpperCase(),
+    '100000000000000000000',
+    decimals,
+  ]);
 }
 
 export async function deploy4626Vault(
@@ -228,15 +274,13 @@ export async function deploy4626Vault(
     key: privateKey,
   });
 
-  // Future works: make signer compatible with protocol/chain stack
-  multiProvider.setSigner(chain, new ethers.Wallet(privateKey));
+  setSignerForChain(multiProvider, chain, privateKey);
 
-  const vault = await new ERC4626Test__factory(
-    multiProvider.getSigner(chain),
-  ).deploy(tokenAddress, 'VAULT', 'VAULT');
-  await vault.deployed();
-
-  return vault;
+  return multiProvider.handleDeploy(chain, new ERC4626Test__factory(), [
+    tokenAddress,
+    'VAULT',
+    'VAULT',
+  ]);
 }
 
 export async function deployXERC20VSToken(
@@ -250,20 +294,14 @@ export async function deployXERC20VSToken(
     key: privateKey,
   });
 
-  // Future works: make signer compatible with protocol/chain stack
-  multiProvider.setSigner(chain, new ethers.Wallet(privateKey));
+  setSignerForChain(multiProvider, chain, privateKey);
 
-  const token = await new XERC20VSTest__factory(
-    multiProvider.getSigner(chain),
-  ).deploy(
+  return multiProvider.handleDeploy(chain, new XERC20VSTest__factory(), [
     'token',
     symbol.toLocaleUpperCase(),
     '100000000000000000000',
     decimals,
-  );
-  await token.deployed();
-
-  return token;
+  ]);
 }
 
 export async function deployXERC20LockboxToken(
@@ -276,8 +314,7 @@ export async function deployXERC20LockboxToken(
     key: privateKey,
   });
 
-  // Future works: make signer compatible with protocol/chain stack
-  multiProvider.setSigner(chain, new ethers.Wallet(privateKey));
+  setSignerForChain(multiProvider, chain, privateKey);
 
   const [tokenSymbol, tokenName, tokenDecimals, tokenTotalSupply] =
     await Promise.all([
@@ -287,17 +324,12 @@ export async function deployXERC20LockboxToken(
       token.totalSupply(),
     ]);
 
-  const lockboxToken = await new XERC20LockboxTest__factory(
-    multiProvider.getSigner(chain),
-  ).deploy(
+  return multiProvider.handleDeploy(chain, new XERC20LockboxTest__factory(), [
     tokenName,
     tokenSymbol.toLocaleUpperCase(),
     tokenTotalSupply,
     tokenDecimals,
-  );
-  await lockboxToken.deployed();
-
-  return lockboxToken;
+  ]);
 }
 
 export async function deployTestOffchainLookupISM(
@@ -311,12 +343,13 @@ export async function deployTestOffchainLookupISM(
     key: privateKey,
   });
 
-  multiProvider.setSigner(chain, new ethers.Wallet(privateKey));
+  setSignerForChain(multiProvider, chain, privateKey);
 
-  const testIsm = await new TestCcipReadIsm__factory(
-    multiProvider.getSigner(chain),
-  ).deploy(urls);
-  await testIsm.deployed();
+  const testIsm = await multiProvider.handleDeploy(
+    chain,
+    new TestCcipReadIsm__factory(),
+    [urls],
+  );
 
   return AbstractCcipReadIsm__factory.connect(
     testIsm.address,
@@ -334,14 +367,13 @@ export async function deployEverclearBridgeAdapter(
     key: privateKey,
   });
 
-  multiProvider.setSigner(chain, new ethers.Wallet(privateKey));
+  setSignerForChain(multiProvider, chain, privateKey);
 
-  const adapter = await new MockEverclearAdapter__factory(
-    multiProvider.getSigner(chain),
-  ).deploy();
-  await adapter.deployed();
-
-  return adapter;
+  return multiProvider.handleDeploy(
+    chain,
+    new MockEverclearAdapter__factory(),
+    [],
+  );
 }
 
 // Verifies if the IS_CI var is set and generates the correct prefix for running the command
@@ -392,14 +424,38 @@ export function hyperlaneStatus({
         --yes`;
 }
 
-export function hyperlaneRelayer(chains: string[], warp?: string) {
+export function hyperlaneRelayer(chains: string[], warpRouteId?: string) {
   return $`${localTestRunCmdPrefix()} hyperlane relayer \
         --registry ${REGISTRY_PATH} \
-        --chains ${chains.join(',')} \
-        --warp ${warp ?? ''} \
+        ${chains.flatMap((c) => ['--chains', c])} \
+        ${warpRouteId ? ['--warp-route-id', warpRouteId] : []} \
         --key ${ANVIL_KEY} \
         --verbosity debug \
         --yes`;
+}
+
+/**
+ * True for the two ways a relayer process can already be gone by the time it is
+ * signalled: zx refusing to signal a settled process, and the OS reporting no
+ * such process.
+ */
+function isAlreadyExitedError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.message.includes('Too late to kill the process')) return true;
+  return 'code' in error && error.code === 'ESRCH';
+}
+
+/**
+ * Stops a relayer started with hyperlaneRelayer. Only an already-exited process
+ * is tolerated: any other failure means the relayer may still be running and
+ * would poison the rest of the suite, so it is surfaced.
+ */
+export async function stopRelayer(relayer: ProcessPromise): Promise<void> {
+  try {
+    await relayer.kill('SIGINT');
+  } catch (error) {
+    if (!isAlreadyExitedError(error)) throw error;
+  }
 }
 
 export function createSnapshot(rpcUrl: string) {
@@ -440,10 +496,14 @@ async function snapshotBaseCall<T>(
 export async function hyperlaneSubmit({
   transactionsPath,
   strategyPath,
+  signerConfigPath,
+  receiptsPath,
   hypKey,
 }: {
   transactionsPath: string;
   strategyPath?: string;
+  signerConfigPath?: string;
+  receiptsPath?: string;
   hypKey?: string;
 }) {
   return $`${
@@ -451,10 +511,123 @@ export async function hyperlaneSubmit({
   } ${localTestRunCmdPrefix()} hyperlane submit \
         --registry ${REGISTRY_PATH} \
         --transactions ${transactionsPath} \
-        --key ${ANVIL_KEY} \
+        ${
+          signerConfigPath
+            ? ['--signer-config', signerConfigPath]
+            : ['--key', ANVIL_KEY]
+        } \
         --verbosity debug \
         ${strategyPath ? ['--strategy', strategyPath] : []} \
+        ${receiptsPath ? ['--receipts', receiptsPath] : []} \
         --yes`;
+}
+
+export async function startMockTurnkeyApi(wallet: ethers.Wallet): Promise<{
+  url: string;
+  apiKey: { apiPublicKey: string; apiPrivateKey: string };
+  close: () => Promise<void>;
+}> {
+  const keyPair = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const jwk = keyPair.privateKey.export({ format: 'jwk' });
+  assert(jwk.x && jwk.y && jwk.d, 'Expected complete P-256 JWK');
+  const x = Buffer.from(jwk.x, 'base64url');
+  const y = Buffer.from(jwk.y, 'base64url');
+  assert(y.length > 0, 'Expected P-256 public key bytes');
+  const apiKey = {
+    apiPublicKey: `${y[y.length - 1] & 1 ? '03' : '02'}${x.toString('hex')}`,
+    apiPrivateKey: Buffer.from(jwk.d, 'base64url').toString('hex'),
+  };
+
+  const server = http.createServer((request, response) => {
+    void handleTurnkeyRequest(wallet, request, response);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert(address && typeof address !== 'string', 'Expected TCP server address');
+
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    apiKey,
+    close: () =>
+      new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      ),
+  };
+}
+
+async function handleTurnkeyRequest(
+  wallet: ethers.Wallet,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  try {
+    if (request.url === '/public/v1/query/whoami') {
+      sendJson(response, { organizationId: 'test-organization' });
+      return;
+    }
+    if (request.url === '/public/v1/submit/sign_transaction') {
+      const body: unknown = JSON.parse(await readRequestBody(request));
+      assert(isRecord(body), 'Expected request body');
+      const parameters = body.parameters;
+      assert(isRecord(parameters), 'Expected request parameters');
+      const unsignedTransaction = parameters.unsignedTransaction;
+      assert(
+        typeof unsignedTransaction === 'string',
+        'Expected unsigned transaction',
+      );
+      const signedTransaction = await wallet.signTransaction(
+        parseUnsignedTransaction(`0x${unsignedTransaction}`),
+      );
+      sendJson(response, {
+        activity: {
+          id: 'test-activity',
+          status: 'ACTIVITY_STATUS_COMPLETED',
+          result: { signTransactionResult: { signedTransaction } },
+        },
+      });
+      return;
+    }
+    response.writeHead(404).end();
+  } catch (error) {
+    response.writeHead(500).end(error instanceof Error ? error.message : '');
+  }
+}
+
+function parseUnsignedTransaction(
+  serialized: string,
+): ethers.providers.TransactionRequest {
+  const parsed = ethers.utils.parseTransaction(serialized);
+  return {
+    to: parsed.to ?? undefined,
+    nonce: parsed.nonce,
+    gasLimit: parsed.gasLimit,
+    gasPrice: parsed.gasPrice ?? undefined,
+    data: parsed.data,
+    value: parsed.value,
+    chainId: parsed.chainId,
+    type: parsed.type ?? undefined,
+    maxPriorityFeePerGas: parsed.maxPriorityFeePerGas ?? undefined,
+    maxFeePerGas: parsed.maxFeePerGas ?? undefined,
+    accessList: parsed.accessList ?? undefined,
+  };
+}
+
+async function readRequestBody(request: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function sendJson(response: ServerResponse, body: unknown): void {
+  response.setHeader('content-type', 'application/json');
+  response.end(JSON.stringify(body));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -477,42 +650,51 @@ export async function createMockSafeApi(
   );
   const port = new URL(serviceUrl).port;
 
+  // Send a JSON body with an explicit Content-Length. The Safe SDK's HTTP
+  // client (node-fetch via @safe-global/api-kit) rejects responses without
+  // proper framing as "Premature close", which would make getSafeInfo retry
+  // until the test times out.
+  const sendJson = (
+    res: http.ServerResponse,
+    status: number,
+    body: unknown,
+  ) => {
+    const payload = JSON.stringify(body);
+    res.writeHead(status, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+    });
+    res.end(payload);
+  };
+
   const server = http.createServer((req, res) => {
     const url = req.url || '';
     console.info('Mock safe API received request', req.method, url);
 
-    if (url.includes('/safes/') && url.includes('multisig-transactions')) {
+    if (req.method === 'POST' && url.includes('/multisig-transactions')) {
+      // Mock POST /api/v2/safes/{address}/multisig-transactions/
+      sendJson(res, 201, { success: true });
+    } else if (
+      req.method === 'GET' &&
+      url.includes('/safes/') &&
+      url.includes('multisig-transactions')
+    ) {
       // Mock GET /v2/safes/${address}/multisig-transactions/`
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-
-      res.end(JSON.stringify({ count: 0, results: [] }));
+      sendJson(res, 200, { count: 0, results: [] });
     } else if (url.includes('/safes/')) {
       // Mock GET /api/v1/safes/{address}/
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          address: safeAddress,
-          nonce,
-          threshold: 1,
-          owners: [safeOwner],
-          masterCopy: safeAddress,
-          modules: [],
-          version: '1.3.0',
-        }),
-      );
+      sendJson(res, 200, {
+        address: safeAddress,
+        nonce,
+        threshold: 1,
+        owners: [safeOwner],
+        masterCopy: safeAddress,
+        modules: [],
+        version: '1.3.0',
+      });
     } else if (url.includes('/delegates')) {
       // Mock GET /api/v2/delegates?safe={address}
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-
-      res.end(JSON.stringify({ count: 1, results: [{ delegate: safeOwner }] }));
-    } else if (
-      req.method === 'POST' &&
-      url.includes('/multisig-transactions')
-    ) {
-      // Mock POST /api/v2/safes/{address}/multisig-transactions/
-      res.writeHead(201, { 'Content-Type': 'application/json' });
-
-      res.end(JSON.stringify({ success: true }));
+      sendJson(res, 200, { count: 1, results: [{ delegate: safeOwner }] });
     } else {
       res.statusCode = 404;
       res.end();

@@ -15,11 +15,14 @@ use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signer::Signer as _,
-    system_program,
 };
+use solana_system_interface::program as system_program;
 use tracing::{info, instrument};
 
-use crate::{ConnectionConf, SealevelKeypair, SealevelProvider, TransactionSubmitter};
+use crate::{
+    ConnectionConf, SealevelKeypair, SealevelProvider, SealevelTransactionFormat,
+    TransactionSubmitter,
+};
 
 /// A reference to a ValidatorAnnounce contract on some Sealevel chain
 pub struct SealevelValidatorAnnounce {
@@ -206,6 +209,8 @@ impl ValidatorAnnounce for SealevelValidatorAnnounce {
                 payer,
                 self.tx_submitter.clone(),
                 self.conn.priority_fee_oracle.create_oracle(),
+                SealevelTransactionFormat::Legacy,
+                &[], // no additional signers
             )
             .await?;
 

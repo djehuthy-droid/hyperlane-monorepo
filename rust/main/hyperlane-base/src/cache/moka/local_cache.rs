@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::cache::FunctionCallCache;
+use crate::cache::{CacheMetricsSnapshot, FunctionCallCache};
 
 use super::{BaseCache, CacheResult, ExpirationType};
 
@@ -20,6 +20,10 @@ impl LocalCache {
 
 #[async_trait]
 impl FunctionCallCache for LocalCache {
+    fn metrics_snapshot(&self) -> CacheMetricsSnapshot {
+        self.0.metrics_snapshot()
+    }
+
     /// Cache a call result with the given parameters
     async fn cache_call_result(
         &self,
@@ -28,11 +32,26 @@ impl FunctionCallCache for LocalCache {
         fn_params: &(impl Serialize + Send + Sync),
         result: &(impl Serialize + Send + Sync),
     ) -> CacheResult<()> {
+        self.cache_call_result_with_expiration(
+            domain_name,
+            method,
+            fn_params,
+            result,
+            ExpirationType::Default,
+        )
+        .await
+    }
+
+    async fn cache_call_result_with_expiration(
+        &self,
+        domain_name: &str,
+        method: &str,
+        fn_params: &(impl Serialize + Send + Sync),
+        result: &(impl Serialize + Send + Sync),
+        expiration: ExpirationType,
+    ) -> CacheResult<()> {
         let key = (domain_name, method, fn_params);
-        self.0
-            .set(&key, result, ExpirationType::Default)
-            .await
-            .map(|_| ())
+        self.0.set(&key, result, expiration).await.map(|_| ())
     }
 
     /// Get a cached call result with the given parameters

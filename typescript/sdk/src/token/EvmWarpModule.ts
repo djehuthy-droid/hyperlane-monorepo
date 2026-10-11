@@ -1,0 +1,3205 @@
+// import { expect } from 'chai';
+import { compareVersions } from 'compare-versions';
+import { BigNumberish, constants, providers } from 'ethers';
+
+import {
+  CrossCollateralRouter__factory,
+  EverclearTokenBridge__factory,
+  GasRouter__factory,
+  IERC20__factory,
+  MailboxClient__factory,
+  MovableCollateralRouter__factory,
+  PredicateRouterWrapper__factory,
+  ProxyAdmin__factory,
+  StaticAggregationHook__factory,
+  StaticAggregationHookFactory__factory,
+  TimelockController__factory,
+  TokenBridgeCctpV2__factory,
+  TokenRouter__factory,
+} from '@hyperlane-xyz/core';
+import { buildArtifact as coreBuildArtifact } from '@hyperlane-xyz/core/buildArtifact.js';
+import {
+  Address,
+  Domain,
+  EvmChainId,
+  ProtocolType,
+  ZERO_ADDRESS_HEX_32,
+  addressToBytes32,
+  assert,
+  deepEquals,
+  difference,
+  eqAddress,
+  isAddressEvm,
+  isNullish,
+  isObjEmpty,
+  isZeroishAddress,
+  normalizeAddressEvm,
+  objDiff,
+  objFilter,
+  objKeys,
+  objMap,
+  promiseObjAll,
+  rootLogger,
+} from '@hyperlane-xyz/utils';
+
+import { ExplorerLicenseType } from '../block-explorer/etherscan.js';
+import { CCIPContractCache } from '../ccip/utils.js';
+import { transferOwnershipTransactions } from '../contracts/contracts.js';
+import { HyperlaneAddresses } from '../contracts/types.js';
+import {
+  HyperlaneModule,
+  HyperlaneModuleParams,
+} from '../core/AbstractHyperlaneModule.js';
+import { ProxyFactoryFactories } from '../deploy/contracts.js';
+import {
+  contractHasCode,
+  isInitialized,
+  isStorageEmpty,
+  proxyAdmin,
+  proxyAdminUpdateTxs,
+} from '../deploy/proxy.js';
+import { ContractVerifier } from '../deploy/verify/ContractVerifier.js';
+import { EvmTokenFeeModule } from '../fee/EvmTokenFeeModule.js';
+import { TokenFeeReaderParams } from '../fee/EvmTokenFeeReader.js';
+import { mergeCrossCollateralRouters } from '../fee/crossCollateralUtils.js';
+import { TokenFeeType } from '../fee/types.js';
+import { getEvmHookUpdateTransactions } from '../hook/updates.js';
+import {
+  collectHybridHookNodes,
+  resolveHybridHookNodesToAddress,
+  stripPredicateSubHook,
+} from '../hook/utils.js';
+import {
+  DerivedHookConfig,
+  HookConfig,
+  HookType,
+  OnchainHookType,
+} from '../hook/types.js';
+import { EvmIsmModule } from '../ism/EvmIsmModule.js';
+import { EvmIsmReader } from '../ism/EvmIsmReader.js';
+import { HyperlaneIsmFactory } from '../ism/HyperlaneIsmFactory.js';
+import { moduleMatchesConfig } from '../ism/utils.js';
+import { PredicateWrapperDeployer } from '../predicate/PredicateDeployer.js';
+import { MultiProvider } from '../providers/MultiProvider.js';
+import { AnnotatedEV5Transaction } from '../providers/ProviderType.js';
+import { RemoteRouters, resolveRouterMapConfig } from '../router/types.js';
+import {
+  CANCELLER_ROLE,
+  EXECUTOR_ROLE,
+  PROPOSER_ROLE,
+  TIMELOCK_ADMIN_ROLE,
+} from '../timelock/evm/constants.js';
+import { isDeterministicTimelockReadError } from '../timelock/evm/errors.js';
+import { ChainName, ChainNameOrId } from '../types.js';
+import {
+  type WarpHybridChainPlan,
+  planChainHybrid,
+} from '../deploy/warpHybridPlan.js';
+import { scalesEqual } from '../utils/decimals.js';
+import { IsmConfig, IsmType } from '../ism/types.js';
+import {
+  DelayedFlowRemoteIsmsSourceType,
+  type HybridHookIsmConfig,
+  collectHybridIsmNodes,
+  completeHybridIsmNodes,
+  extractIsmAndHookFactoryAddresses,
+  ismTreeContainsHybridHookIsm,
+  ismTreeContainsRateLimited,
+  normalizeConfig,
+  resolveHybridIsmNodesToAddress,
+  setRateLimitedIsmRecipient,
+} from '../utils/ism.js';
+
+import {
+  CCTP_PPM_STORAGE_VERSION,
+  EvmWarpRouteReader,
+} from './EvmWarpRouteReader.js';
+import { EvmXERC20Module } from './EvmXERC20Module.js';
+import { DeployableTokenType, TokenType } from './config.js';
+import {
+  resolveAndValidateRebalanceConfig,
+  resolveTokenFeeAddress,
+} from './configUtils.js';
+import { hypERC20contracts } from './contracts.js';
+import { HypERC20Deployer } from './deploy.js';
+import {
+  CrossCollateralTokenConfig,
+  DerivedTokenRouterConfig,
+  EverclearCollateralTokenConfig,
+  HypTokenRouterConfig,
+  HypTokenRouterConfigSchema,
+  MovableTokenConfig,
+  PredicateWrapperConfig,
+  PredicateWrapperConfigSchema,
+  VERSION_ERROR_MESSAGE,
+  contractVersionMatchesDependency,
+  derivedHookAddress,
+  derivedIsmAddress,
+  isCctpTokenConfig,
+  isEverclearTokenBridgeConfig,
+  isMovableCollateralTokenConfig,
+  isCrossCollateralTokenConfig,
+  isOftTokenConfig,
+  isXERC20TokenConfig,
+} from './types.js';
+
+type WarpRouteAddresses = HyperlaneAddresses<ProxyFactoryFactories> & {
+  deployedTokenRoute: Address;
+};
+
+// The last contract version where `approveTokenForBridge` granted max allowance
+// instead of revoking it. Hardcoded (not CONTRACTS_PACKAGE_VERSION) because the
+// package version moves to the next major at release and would wrongly match the
+// new revoke-semantics implementations.
+export const MAX_LEGACY_BRIDGE_APPROVAL_VERSION = '11.3.1';
+
+/**
+ * Whether `approveTokenForBridge` GRANTS a standing max allowance on the given
+ * contract version (legacy impls) rather than REVOKING it (new impls). The
+ * selector is overloaded by implementation version.
+ */
+export function bridgeApprovalGrantsMaxAllowance(
+  contractVersion: string,
+): boolean {
+  return (
+    compareVersions(contractVersion, MAX_LEGACY_BRIDGE_APPROVAL_VERSION) <= 0
+  );
+}
+
+const getAllowedRebalancingBridgesByDomain = (
+  allowedRebalancingBridgesByDomain: NonNullable<
+    MovableTokenConfig['allowedRebalancingBridges']
+  >,
+): Record<string, Set<Address>> => {
+  return objMap(
+    allowedRebalancingBridgesByDomain,
+    (_domainId, allowedRebalancingBridges) => {
+      return new Set(
+        allowedRebalancingBridges.map((bridgeConfig) =>
+          normalizeAddressEvm(bridgeConfig.bridge),
+        ),
+      );
+    },
+  );
+};
+export type WarpUpdateResult = {
+  txs: AnnotatedEV5Transaction[];
+  feeTxs: AnnotatedEV5Transaction[];
+  ownershipTxs: AnnotatedEV5Transaction[];
+};
+
+const getRebalanceTargetsByDomain = (
+  rebalanceTargetsByDomain: NonNullable<
+    CrossCollateralTokenConfig['rebalanceTargets']
+  >,
+): Record<string, Set<Address>> => {
+  return objMap(
+    rebalanceTargetsByDomain,
+    (_domainId, targets) =>
+      new Set(targets.map((target) => addressToBytes32(target).toLowerCase())),
+  );
+};
+
+const getRebalanceRecipientsByDomain = (
+  rebalanceRecipientsByDomain: NonNullable<
+    CrossCollateralTokenConfig['rebalanceRecipients']
+  >,
+): Record<string, Address> => {
+  return objMap(rebalanceRecipientsByDomain, (_domainId, recipient) =>
+    addressToBytes32(recipient).toLowerCase(),
+  );
+};
+
+/** Per-chain transaction groups used by warp apply. */
+export type WarpUpdatePhases = {
+  /** Proxy implementation upgrades. Must precede everything else. */
+  upgradeTxs: AnnotatedEV5Transaction[];
+  /** Shared hybrid instance mutations. Must precede its router installation. */
+  instanceTxs: AnnotatedEV5Transaction[];
+  /** Installs the router's hook (and any predicate wrapper). */
+  hookTxs: AnnotatedEV5Transaction[];
+  /** Installs the router's ISM; runs first only when removing delayed flow. */
+  ismTxs: AnnotatedEV5Transaction[];
+  /** Everything else the router owner signs: enrollment, gas, rebalancers, … */
+  txs: AnnotatedEV5Transaction[];
+  feeTxs: AnnotatedEV5Transaction[];
+  ownershipTxs: AnnotatedEV5Transaction[];
+  /**
+   * The shared hybrid hook/ISM instance this update installs on both surfaces,
+   * when the config declares one. Callers use it for cross-chain counterpart
+   * enrollment before either router surface changes in this chain's batch.
+   */
+  hybridIsm?: Address;
+  /** An installed delayed-flow router is absent from the target config. */
+  removesDelayedFlowRouter?: boolean;
+};
+export class EvmWarpModule extends HyperlaneModule<
+  ProtocolType.Ethereum,
+  HypTokenRouterConfig,
+  WarpRouteAddresses
+> {
+  private static readonly deployedTimelockByProvider = new WeakMap<
+    MultiProvider,
+    Map<string, Address>
+  >();
+  protected logger = rootLogger.child({
+    module: 'EvmWarpModule',
+  });
+  reader: EvmWarpRouteReader;
+  public readonly chainName: ChainName;
+  public readonly chainId: EvmChainId;
+  public readonly domainId: Domain;
+
+  constructor(
+    protected readonly multiProvider: MultiProvider,
+    args: HyperlaneModuleParams<HypTokenRouterConfig, WarpRouteAddresses>,
+    protected readonly ccipContractCache?: CCIPContractCache,
+    protected readonly contractVerifier?: ContractVerifier,
+  ) {
+    super(args);
+    this.reader = new EvmWarpRouteReader(multiProvider, args.chain);
+    this.chainName = this.multiProvider.getChainName(args.chain);
+    this.chainId = multiProvider.getEvmChainId(args.chain);
+    this.domainId = multiProvider.getDomainId(args.chain);
+    this.chainId = multiProvider.getEvmChainId(args.chain);
+    this.contractVerifier ??= new ContractVerifier(
+      multiProvider,
+      {},
+      coreBuildArtifact,
+      ExplorerLicenseType.MIT,
+    );
+  }
+
+  /**
+   * Retrieves the token router configuration for the specified address.
+   *
+   * @param address - The address to derive the token router configuration from.
+   * @returns A promise that resolves to the token router configuration.
+   */
+  async read(): Promise<DerivedTokenRouterConfig> {
+    const config = await this.reader.deriveWarpRouteConfig(
+      this.args.addresses.deployedTokenRoute,
+    );
+    // recipient is always the token address itself — implicit in the warp
+    // context, so omit it from read() output to keep configs clean.
+    // Mutate in place to preserve the DerivedIsmConfig type (WithAddress<...>).
+    const stripRecipient = (node: unknown): void => {
+      if (typeof node !== 'object' || node === null) return;
+      const n = node as Record<string, unknown>;
+      if (n.type === IsmType.RATE_LIMITED) {
+        delete n.recipient;
+        return;
+      }
+      if (Array.isArray(n.modules)) n.modules.forEach(stripRecipient);
+      if (typeof n.domains === 'object' && n.domains !== null)
+        Object.values(n.domains as Record<string, unknown>).forEach(
+          stripRecipient,
+        );
+      if (n.lowerIsm) stripRecipient(n.lowerIsm);
+      if (n.upperIsm) stripRecipient(n.upperIsm);
+    };
+    const ism = config.interchainSecurityModule;
+    if (typeof ism !== 'string' && ismTreeContainsRateLimited(ism))
+      stripRecipient(ism);
+    return config;
+  }
+
+  private async timelockMatchesConfig(
+    timelockAddress: Address,
+    config: NonNullable<HypTokenRouterConfig['timelock']>,
+    codeAlreadyVerified = false,
+  ): Promise<boolean> {
+    const provider = this.multiProvider.getProvider(this.chainName);
+    if (
+      !codeAlreadyVerified &&
+      isStorageEmpty(await provider.getCode(timelockAddress))
+    ) {
+      this.logger.debug(
+        { chain: this.chainName, timelockAddress },
+        'ProxyAdmin owner has no contract code and is not a TimelockController',
+      );
+      return false;
+    }
+
+    const timelockController = TimelockController__factory.connect(
+      timelockAddress,
+      provider,
+    );
+
+    try {
+      const [delay, hasProposer, hasExecutor, hasCanceller, hasAdminSelf] =
+        await Promise.all([
+          timelockController.getMinDelay(),
+          timelockController.hasRole(PROPOSER_ROLE, config.roles.proposer),
+          timelockController.hasRole(EXECUTOR_ROLE, config.roles.executor),
+          timelockController.hasRole(CANCELLER_ROLE, config.roles.proposer),
+          timelockController.hasRole(TIMELOCK_ADMIN_ROLE, timelockAddress),
+        ]);
+
+      return (
+        delay.eq(config.delay) &&
+        hasProposer &&
+        hasExecutor &&
+        hasCanceller &&
+        hasAdminSelf
+      );
+    } catch (error) {
+      if (!isDeterministicTimelockReadError(error)) throw error;
+      this.logger.debug(
+        { chain: this.chainName, error, timelockAddress },
+        'ProxyAdmin owner does not match the expected timelock config',
+      );
+      return false;
+    }
+  }
+
+  private async cachedTimelockMatchesConfig(
+    timelockAddress: Address,
+    config: NonNullable<HypTokenRouterConfig['timelock']>,
+  ): Promise<boolean> {
+    const provider = this.multiProvider.getProvider(this.chainName);
+    if (!(await contractHasCode(provider, timelockAddress))) {
+      this.logger.debug(
+        { chain: this.chainName, timelockAddress },
+        'Cached TimelockController has no code after visibility retry',
+      );
+      return false;
+    }
+    return this.timelockMatchesConfig(timelockAddress, config, true);
+  }
+
+  private async configWithTimelockProxyAdminOwner(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): Promise<HypTokenRouterConfig> {
+    if (!expectedConfig.timelock) return expectedConfig;
+
+    assert(
+      actualConfig.proxyAdmin?.address && actualConfig.proxyAdmin.owner,
+      `Cannot configure timelock for non-proxied warp route on ${this.chainName}`,
+    );
+    assert(
+      !expectedConfig.proxyAdmin?.address ||
+        eqAddress(
+          expectedConfig.proxyAdmin.address,
+          actualConfig.proxyAdmin.address,
+        ),
+      `Cannot configure timelock while changing ProxyAdmin address on ${this.chainName}`,
+    );
+
+    let timelockControllerAddress: Address | undefined;
+    if (
+      await this.timelockMatchesConfig(
+        actualConfig.proxyAdmin.owner,
+        expectedConfig.timelock,
+      )
+    ) {
+      timelockControllerAddress = actualConfig.proxyAdmin.owner;
+    } else {
+      const timelockCacheKey = this.timelockDeploymentCacheKey(
+        actualConfig.proxyAdmin.address,
+        expectedConfig.timelock,
+      );
+      const deployedTimelockByConfig = EvmWarpModule.deployedTimelockByConfig(
+        this.multiProvider,
+      );
+      const cachedTimelockControllerAddress =
+        deployedTimelockByConfig.get(timelockCacheKey);
+      if (
+        cachedTimelockControllerAddress &&
+        (await this.cachedTimelockMatchesConfig(
+          cachedTimelockControllerAddress,
+          expectedConfig.timelock,
+        ))
+      ) {
+        timelockControllerAddress = cachedTimelockControllerAddress;
+      } else {
+        timelockControllerAddress = (
+          await new HypERC20Deployer(
+            this.multiProvider,
+            undefined,
+            this.contractVerifier,
+          ).deployTimelock(this.chainName, expectedConfig.timelock)
+        ).address;
+        deployedTimelockByConfig.set(
+          timelockCacheKey,
+          timelockControllerAddress,
+        );
+      }
+    }
+
+    return {
+      ...expectedConfig,
+      proxyAdmin: {
+        ...expectedConfig.proxyAdmin,
+        address: actualConfig.proxyAdmin.address,
+        owner: timelockControllerAddress,
+      },
+    };
+  }
+
+  private timelockDeploymentCacheKey(
+    proxyAdminAddress: Address,
+    config: NonNullable<HypTokenRouterConfig['timelock']>,
+  ): string {
+    return JSON.stringify({
+      chainName: this.chainName,
+      delay: config.delay.toString(),
+      executor: normalizeAddressEvm(config.roles.executor),
+      proposer: normalizeAddressEvm(config.roles.proposer),
+      proxyAdminAddress: normalizeAddressEvm(proxyAdminAddress),
+    });
+  }
+
+  private static deployedTimelockByConfig(
+    multiProvider: MultiProvider,
+  ): Map<string, Address> {
+    let deployedTimelockByConfig =
+      EvmWarpModule.deployedTimelockByProvider.get(multiProvider);
+    if (!deployedTimelockByConfig) {
+      deployedTimelockByConfig = new Map();
+      EvmWarpModule.deployedTimelockByProvider.set(
+        multiProvider,
+        deployedTimelockByConfig,
+      );
+    }
+    return deployedTimelockByConfig;
+  }
+
+  /**
+   * Plans a Warp Route update as per-chain transaction groups.
+   *
+   * IMPORTANT — irreversible side effects when expectedConfig includes `predicateWrapper`:
+   * The PredicateRouterWrapper contract is deployed on-chain during planning (before this
+   * method returns). If the returned transactions are never submitted, the wrapper is
+   * orphaned. See PredicateWrapperDeployer.deployAndConfigure for details.
+   *
+   * IMPORTANT — irreversible side effects when expectedConfig includes `timelock`:
+   * A TimelockController may be deployed on-chain during planning so the returned ownership
+   * transactions can transfer ProxyAdmin ownership to it. The deployment address is cached
+   * per MultiProvider, revalidated, and reused across retries for the same
+   * chain/ProxyAdmin/timelock config, but a declined or externally persisted
+   * transaction plan can still leave an untracked timelock deployment.
+   *
+   * @param expectedConfig - The configuration for the token router to be updated.
+   * Used by warp apply to assemble one ordered batch for this chain.
+   */
+  async updatePhases(
+    expectedConfig: HypTokenRouterConfig,
+    tokenReaderParams?: Partial<TokenFeeReaderParams>,
+  ): Promise<WarpUpdatePhases> {
+    HypTokenRouterConfigSchema.parse(expectedConfig);
+    const actualConfig = await this.read();
+    const hybridPlan = this.planHybridUpdate(actualConfig, expectedConfig);
+    const actualHasDelayedFlowRouter =
+      (typeof actualConfig.hook === 'object' &&
+        collectHybridHookNodes(actualConfig.hook).some(
+          ({ type }) => type === HookType.DELAYED_FLOW_ROUTER,
+        )) ||
+      (typeof actualConfig.interchainSecurityModule === 'object' &&
+        collectHybridIsmNodes(actualConfig.interchainSecurityModule).some(
+          ({ type }) => type === IsmType.DELAYED_FLOW_ROUTER,
+        ));
+    const targetHasDelayedFlowRouter =
+      (typeof expectedConfig.hook === 'object' &&
+        collectHybridHookNodes(expectedConfig.hook).some(
+          ({ type }) => type === HookType.DELAYED_FLOW_ROUTER,
+        )) ||
+      (typeof expectedConfig.interchainSecurityModule === 'object' &&
+        collectHybridIsmNodes(expectedConfig.interchainSecurityModule).some(
+          ({ type }) => type === IsmType.DELAYED_FLOW_ROUTER,
+        ));
+    const removesDelayedFlowRouter =
+      actualHasDelayedFlowRouter && !targetHasDelayedFlowRouter;
+    expectedConfig = await this.configWithTimelockProxyAdminOwner(
+      actualConfig,
+      expectedConfig,
+    );
+    const transactions = [];
+
+    let xerc20Txs: AnnotatedEV5Transaction[] = [];
+    if (isXERC20TokenConfig(expectedConfig)) {
+      const { module, config } = await EvmXERC20Module.fromWarpRouteConfig(
+        this.multiProvider,
+        this.chainName,
+        expectedConfig,
+        this.args.addresses.deployedTokenRoute,
+      );
+      xerc20Txs = await module.update(config);
+    }
+
+    const allFeeTxs = await this.createTokenFeeUpdateTxs(
+      actualConfig,
+      expectedConfig,
+      tokenReaderParams,
+    );
+
+    // Split feeTxs by authority: setFeeRecipient targets the token router (router
+    // owner gated) while all other fee txs target the fee contract (fee-contract
+    // owner gated).  Keeping them in the same bucket means a dedicated feeSubmitter
+    // (which owns the fee contract) would try to call setFeeRecipient — which reverts
+    // because it doesn't own the router.  Router-owner txs go into the main batch;
+    // only fee-contract-owner txs are returned as feeTxs for the feeSubmitter.
+    const routerAddress = this.args.addresses.deployedTokenRoute.toLowerCase();
+    const routerOwnerFeeTxs = allFeeTxs.filter(
+      (tx) => tx.to?.toLowerCase() === routerAddress,
+    );
+    const feeTxs = allFeeTxs.filter(
+      (tx) => tx.to?.toLowerCase() !== routerAddress,
+    );
+
+    /**
+     * @remark
+     * The order of operations matter
+     * 1. createOwnershipUpdateTxs() must always be LAST because no updates possible after ownership transferred
+     * 2. createEnrollRemoteRoutersUpdateTxs() must be BEFORE createSetDestinationGasUpdateTxs()
+     *    because GasRouter requires routers to be enrolled before setting destination gas
+     * 3. createHookAndPredicateUpdateTxs() handles hook + predicate wrapper together so the
+     *    pending new hook address is threaded through without leaking into other method signatures
+     * 4. The hook transactions are pushed BEFORE the ISM transactions, whatever the order they
+     *    are built in — see the comment at the push
+     */
+    const upgradeTxs = await this.upgradeWarpRouteImplementationTx(
+      actualConfig,
+      expectedConfig,
+    );
+
+    // Pure hybrid validation already ran immediately after the read. Resolve
+    // (and, when needed, deploy) the shared instance for both config trees.
+    const hybrid = await this.resolveHybridInstance(
+      actualConfig,
+      expectedConfig,
+      hybridPlan,
+    );
+
+    // With the shared address known, both trees reference it as an ordinary
+    // address child and the existing ISM/hook modules deploy whatever parents
+    // remain. Nothing downstream needs to know a hybrid is involved.
+    const resolvedConfig: HypTokenRouterConfig = hybrid
+      ? {
+          ...expectedConfig,
+          interchainSecurityModule: resolveHybridIsmNodesToAddress(
+            hybrid.ismTree,
+            hybrid.address,
+          ),
+          hook: resolveHybridHookNodesToAddress(
+            hybrid.hookTree,
+            hybrid.address,
+          ),
+        }
+      : expectedConfig;
+
+    const ismTxs = await this.createIsmUpdateTxs(
+      actualConfig,
+      resolvedConfig,
+      hybrid?.address,
+    );
+
+    // Built after the ISM step, which may deploy the tree, but ORDERED BEFORE
+    // it: a batch executes sequentially with no rollback, so a failure between
+    // the two installs is a state the route can be left in. Hook first leaves
+    // the previous ISM verifying inbound messages. ISM first can leave a hybrid
+    // hook/ISM gating delivery while nothing drives its postDispatch — no
+    // preverification is ever sent for the messages dispatched in that window,
+    // and none can be sent afterwards, so they are permanently undeliverable.
+    // Returned in their own buckets so callers can choose the safe order within
+    // this chain's batch, including reversing it when removing delayed flow.
+    const hookTxs = await this.createHookAndPredicateUpdateTxs(
+      actualConfig,
+      resolvedConfig,
+      hybrid?.address,
+    );
+
+    transactions.push(
+      ...this.createFeeHookUpdateTxs(actualConfig, expectedConfig),
+      ...this.createUnenrollRemoteRoutersUpdateTxs(
+        actualConfig,
+        expectedConfig,
+      ),
+      ...this.createEnrollRemoteRoutersUpdateTxs(actualConfig, expectedConfig),
+      // MC unenroll before enroll for consistency with remote routers.
+      // MC enrollment must come before gas setting so that MC-only domains
+      ...this.createUnenrollCrossCollateralRoutersTxs(
+        actualConfig,
+        expectedConfig,
+      ),
+      ...this.createEnrollCrossCollateralRoutersTxs(
+        actualConfig,
+        expectedConfig,
+      ),
+      ...this.createSetDestinationGasUpdateTxs(actualConfig, expectedConfig),
+      ...this.createAddRebalancersUpdateTxs(actualConfig, expectedConfig),
+      ...this.createRemoveRebalancersUpdateTxs(actualConfig, expectedConfig),
+      ...(await this.createAddAllowedBridgesUpdateTxs(
+        actualConfig,
+        expectedConfig,
+      )),
+      ...this.createRemoveBridgesTxs(actualConfig, expectedConfig),
+      ...this.createAddRebalanceTargetsUpdateTxs(actualConfig, expectedConfig),
+      ...this.createRemoveRebalanceTargetsTxs(actualConfig, expectedConfig),
+      ...this.createSetRecipientsUpdateTxs(actualConfig, expectedConfig),
+      ...this.createRemoveRecipientsTxs(actualConfig, expectedConfig),
+      ...(await this.createRevokeStaleBridgeAllowancesTxs(
+        actualConfig,
+        expectedConfig,
+        upgradeTxs.length > 0,
+      )),
+
+      ...this.createAddRemoteOutputAssetsTxs(actualConfig, expectedConfig),
+      ...this.createRemoveRemoteOutputAssetsTxs(actualConfig, expectedConfig),
+
+      ...this.createUpdateEverclearFeeParamsTxs(actualConfig, expectedConfig),
+      ...this.createRemoveEverclearFeeParamsTxs(actualConfig, expectedConfig),
+      ...this.createSetMaxFeePpmTxs(actualConfig, expectedConfig),
+      ...xerc20Txs,
+      // Router-owner fee txs (setFeeRecipient) belong in the main batch so they
+      // always execute under the router owner's authority — even when a dedicated
+      // feeSubmitter is configured for fee-contract-owner txs.
+      ...routerOwnerFeeTxs,
+    );
+
+    // Ownership/proxyAdmin must always execute last; returned separately so callers
+    // can place feeTxs between main txs and ownership (see update() below).
+    const ownershipTxs = [
+      ...(hybrid?.ownershipTxs ?? []),
+      ...this.createOwnershipUpdateTxs(actualConfig, expectedConfig),
+      ...proxyAdminUpdateTxs(
+        this.chainId,
+        this.args.addresses.deployedTokenRoute,
+        actualConfig,
+        expectedConfig,
+      ),
+    ];
+
+    return {
+      upgradeTxs,
+      instanceTxs: hybrid?.instanceTxs ?? [],
+      hookTxs,
+      ismTxs,
+      txs: transactions,
+      feeTxs,
+      ownershipTxs,
+      hybridIsm: hybrid?.address,
+      removesDelayedFlowRouter,
+    };
+  }
+
+  /**
+   * Main-compatible split: router-owner work, fee-owner work, then ownership.
+   */
+  async updateSplit(
+    expectedConfig: HypTokenRouterConfig,
+    tokenReaderParams?: Partial<TokenFeeReaderParams>,
+  ): Promise<WarpUpdateResult> {
+    const {
+      upgradeTxs,
+      instanceTxs,
+      hookTxs,
+      ismTxs,
+      txs,
+      feeTxs,
+      ownershipTxs,
+      removesDelayedFlowRouter,
+    } = await this.updatePhases(expectedConfig, tokenReaderParams);
+    return {
+      txs: removesDelayedFlowRouter
+        ? [...upgradeTxs, ...instanceTxs, ...ismTxs, ...hookTxs, ...txs]
+        : [...upgradeTxs, ...instanceTxs, ...hookTxs, ...ismTxs, ...txs],
+      feeTxs,
+      ownershipTxs,
+    };
+  }
+
+  /** Returns a flat, ordered transaction array suitable for one submitter. */
+  async update(
+    expectedConfig: HypTokenRouterConfig,
+    tokenReaderParams?: Partial<TokenFeeReaderParams>,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    const { txs, feeTxs, ownershipTxs } = await this.updateSplit(
+      expectedConfig,
+      tokenReaderParams,
+    );
+    // feeTxs (fee-contract-owner calls) must come before ownershipTxs so they
+    // execute before the router owner changes.
+    return [...txs, ...feeTxs, ...ownershipTxs];
+  }
+
+  /**
+   * Validates hybrid composition and fee-hook transitions before update
+   * planning reaches any operation that may deploy a contract.
+   */
+  private planHybridUpdate(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): WarpHybridChainPlan | undefined {
+    // An omitted feeHook is intentionally left unchanged by warp apply. Plan
+    // against the effective value so an already-installed ERC20 fee hook
+    // cannot bypass hybrid hook composition validation.
+    const effectiveFeeHook = expectedConfig.feeHook ?? actualConfig.feeHook;
+    const plan = planChainHybrid({
+      multiProvider: this.multiProvider,
+      chain: this.chainName,
+      config: { ...expectedConfig, feeHook: effectiveFeeHook },
+    });
+    if (!plan) return undefined;
+
+    if (
+      plan.node.type === IsmType.DELAYED_FLOW_ROUTER &&
+      actualConfig.feeHook &&
+      !isZeroishAddress(actualConfig.feeHook) &&
+      expectedConfig.feeHook &&
+      isZeroishAddress(expectedConfig.feeHook)
+    ) {
+      const actualHook = actualConfig.hook;
+      const expectedHook = expectedConfig.hook;
+      const installedHybrid =
+        typeof actualHook === 'object'
+          ? collectHybridHookNodes(actualHook)[0]
+          : undefined;
+      const delayedFlowHookStaysInstalled =
+        installedHybrid?.type === HookType.DELAYED_FLOW_ROUTER &&
+        installedHybrid.duration === plan.node.duration &&
+        installedHybrid.thresholdBps === plan.node.thresholdBps &&
+        installedHybrid.maxDelay === plan.node.maxDelay &&
+        (plan.node.warpRouter === undefined ||
+          (!!installedHybrid.warpRouter &&
+            eqAddress(installedHybrid.warpRouter, plan.node.warpRouter))) &&
+        typeof expectedHook === 'object' &&
+        deepEquals(
+          normalizeConfig(
+            resolveHybridHookNodesToAddress(actualHook, constants.AddressZero),
+          ),
+          normalizeConfig(
+            resolveHybridHookNodesToAddress(
+              expectedHook,
+              constants.AddressZero,
+            ),
+          ),
+        );
+      assert(
+        delayedFlowHookStaysInstalled,
+        `Cannot introduce, replace, or recompose ${IsmType.DELAYED_FLOW_ROUTER} on ${this.chainName} while clearing existing feeHook ${actualConfig.feeHook} in the same warp apply. Hook installation runs before router updates, leaving the delayed-flow hook active while ERC20 fee metadata still prevents its native control dispatch. Apply feeHook address(0) without changing the hook first, execute that update, then apply the ${IsmType.DELAYED_FLOW_ROUTER} config.`,
+      );
+    }
+
+    return plan;
+  }
+
+  /**
+   * Reuses or deploys the one hybrid leaf declared on both config surfaces.
+   * Parent trees only ever receive the returned address, preventing duplicate
+   * bucket state. Instance mutations are returned separately so counterpart
+   * enrollment can precede either router-surface change in this chain's batch.
+   */
+  private async resolveHybridInstance(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+    plan: WarpHybridChainPlan | undefined,
+  ): Promise<
+    | {
+        address: Address;
+        ismTree: IsmConfig;
+        hookTree: HookConfig;
+        instanceTxs: AnnotatedEV5Transaction[];
+        ownershipTxs: AnnotatedEV5Transaction[];
+      }
+    | undefined
+  > {
+    if (!plan) return undefined;
+
+    const completed = completeHybridIsmNodes(
+      plan.node,
+      this.args.addresses.deployedTokenRoute,
+      { type: DelayedFlowRemoteIsmsSourceType.Deferred },
+      actualConfig.owner,
+      this.multiProvider,
+    );
+    assert(
+      typeof completed === 'object' &&
+        (completed.type === IsmType.NET_FLOW_RATE_LIMITED ||
+          completed.type === IsmType.DELAYED_FLOW_ROUTER),
+      `Failed to complete hybrid hook/ISM config on ${this.chainName}`,
+    );
+    // Every owner-gated mutation is signed by the router's current owner.
+    // Ownership moves to the target owner only in the final ownership phase.
+    const desired: HybridHookIsmConfig = {
+      ...completed,
+      owner: actualConfig.owner,
+    };
+
+    const actualHook = actualConfig.hook;
+    const hookNodes =
+      typeof actualHook === 'object' ? collectHybridHookNodes(actualHook) : [];
+    const actualIsm = actualConfig.interchainSecurityModule;
+    const ismNodes =
+      typeof actualIsm === 'object' ? collectHybridIsmNodes(actualIsm) : [];
+    assert(
+      hookNodes.length <= 1 && ismNodes.length <= 1,
+      `Expected at most one installed hybrid hook/ISM on each surface of ${this.chainName}, found ${hookNodes.length} under hook and ${ismNodes.length} under interchainSecurityModule`,
+    );
+    // Prefer the hook: submission can be interrupted after its update but before
+    // the ISM update, leaving the new leaf installed while the ISM still has the
+    // old tree. A later apply must reuse that new leaf.
+    const candidate = hookNodes[0] ?? ismNodes[0];
+    const currentAddress =
+      candidate &&
+      'address' in candidate &&
+      typeof candidate.address === 'string'
+        ? candidate.address
+        : undefined;
+
+    if (currentAddress) {
+      const current = await new EvmIsmReader(
+        this.multiProvider,
+        this.chainName,
+      ).deriveIsmConfig(currentAddress);
+      assert(
+        typeof current === 'object' &&
+          (current.type === IsmType.NET_FLOW_RATE_LIMITED ||
+            current.type === IsmType.DELAYED_FLOW_ROUTER),
+        `Expected ${currentAddress} on ${this.chainName} to be a hybrid hook/ISM`,
+      );
+      const ownedByRouter =
+        current.owner && eqAddress(current.owner, actualConfig.owner);
+      const alreadyTransferred =
+        !ownedByRouter &&
+        current.owner &&
+        expectedConfig.owner &&
+        eqAddress(current.owner, expectedConfig.owner);
+      assert(
+        ownedByRouter || alreadyTransferred,
+        `Hybrid hook/ISM ${currentAddress} on ${this.chainName} is owned by ${current.owner}, but its warp router is owned by ${actualConfig.owner}. Warp apply uses the router's submitter for every non-fee mutation, so align the owners before applying this config.`,
+      );
+      if (alreadyTransferred) {
+        const factory = HyperlaneIsmFactory.fromAddressesMap(
+          { [this.chainName]: this.args.addresses },
+          this.multiProvider,
+          this.ccipContractCache,
+          this.contractVerifier,
+        );
+        const matchesFinalConfig = await moduleMatchesConfig(
+          this.chainName,
+          currentAddress,
+          { ...completed, owner: expectedConfig.owner },
+          this.multiProvider,
+          factory.getContracts(this.chainName),
+          actualConfig.mailbox,
+        );
+        assert(
+          matchesFinalConfig,
+          `Hybrid hook/ISM ${currentAddress} on ${this.chainName} was already transferred to the target owner ${expectedConfig.owner}, but its config does not match the target. Complete or revert the interrupted ownership transfer before changing its config.`,
+        );
+        return {
+          address: currentAddress,
+          ismTree: plan.ismTree,
+          hookTree: plan.hookTree,
+          instanceTxs: [],
+          ownershipTxs: [],
+        };
+      }
+      const module = new EvmIsmModule(
+        this.multiProvider,
+        {
+          chain: this.chainName,
+          config: current,
+          addresses: {
+            ...this.args.addresses,
+            mailbox: actualConfig.mailbox,
+            deployedIsm: currentAddress,
+          },
+        },
+        this.ccipContractCache,
+        this.contractVerifier,
+      );
+      const txs = await module.updateDeployedInstance(desired);
+      const { deployedIsm } = module.serialize();
+      assert(
+        deployedIsm,
+        `Failed to resolve hybrid hook/ISM on ${this.chainName}`,
+      );
+      const ownershipTxs = transferOwnershipTransactions(
+        this.chainId,
+        deployedIsm,
+        { owner: actualConfig.owner },
+        { owner: expectedConfig.owner },
+        `hybrid hook/ISM on ${this.chainName}`,
+      );
+      return {
+        address: deployedIsm,
+        ismTree: plan.ismTree,
+        hookTree: plan.hookTree,
+        instanceTxs: txs,
+        ownershipTxs,
+      };
+    }
+
+    const factory = HyperlaneIsmFactory.fromAddressesMap(
+      { [this.chainName]: this.args.addresses },
+      this.multiProvider,
+      this.ccipContractCache,
+      this.contractVerifier,
+    );
+    const deployed = await factory.deployInternal({
+      destination: this.chainName,
+      config: desired,
+      mailbox: actualConfig.mailbox,
+    });
+    const ownershipTxs = transferOwnershipTransactions(
+      this.chainId,
+      deployed.address,
+      { owner: actualConfig.owner },
+      { owner: expectedConfig.owner },
+      `hybrid hook/ISM on ${this.chainName}`,
+    );
+    return {
+      address: deployed.address,
+      ismTree: plan.ismTree,
+      hookTree: plan.hookTree,
+      instanceTxs: [],
+      ownershipTxs,
+    };
+  }
+
+  /**
+   * Create a transaction to update the remote routers for the Warp Route contract.
+   *
+   * @param actualConfig - The on-chain router configuration, including the remoteRouters array.
+   * @param expectedConfig - The expected token router configuration.
+   * @returns A array with a single Ethereum transaction that need to be executed to enroll the routers
+   */
+  createEnrollRemoteRoutersUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    // OFT contracts don't have Router interface — no remote router enrollment
+    if (isOftTokenConfig(expectedConfig)) {
+      return [];
+    }
+    const updateTransactions: AnnotatedEV5Transaction[] = [];
+    if (!expectedConfig.remoteRouters) {
+      return [];
+    }
+
+    assert(actualConfig.remoteRouters, 'actualRemoteRouters is undefined');
+    assert(expectedConfig.remoteRouters, 'actualRemoteRouters is undefined');
+
+    const { remoteRouters: actualRemoteRouters } = actualConfig;
+    const { remoteRouters: expectedRemoteRouters } = expectedConfig;
+
+    const routesToEnroll = Object.entries(expectedRemoteRouters)
+      .map(([domain, rawRouter]): [string, RemoteRouters[string]] => [
+        domain,
+        { address: addressToBytes32(rawRouter.address) },
+      ])
+      .filter(([domain, expectedRouter]) => {
+        const actualRouter = actualRemoteRouters[domain];
+        // Enroll if router doesn't exist for domain or has different address
+        return !actualRouter || actualRouter.address !== expectedRouter.address;
+      })
+      .map(([domain]) => domain);
+
+    if (routesToEnroll.length === 0) {
+      return updateTransactions;
+    }
+
+    const contractToUpdate = TokenRouter__factory.connect(
+      this.args.addresses.deployedTokenRoute,
+      this.multiProvider.getProvider(this.domainId),
+    );
+
+    updateTransactions.push({
+      chainId: this.chainId,
+      annotation: `Enrolling Router ${this.args.addresses.deployedTokenRoute} on ${this.args.chain}`,
+      to: contractToUpdate.address,
+      data: contractToUpdate.interface.encodeFunctionData(
+        'enrollRemoteRouters',
+        [
+          routesToEnroll.map((k) => Number(k)),
+          routesToEnroll.map((a) =>
+            addressToBytes32(expectedRemoteRouters[a].address),
+          ),
+        ],
+      ),
+    });
+
+    return updateTransactions;
+  }
+
+  createUnenrollRemoteRoutersUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    // OFT contracts don't have Router interface — no remote router unenrollment
+    if (isOftTokenConfig(expectedConfig)) {
+      return [];
+    }
+    const updateTransactions: AnnotatedEV5Transaction[] = [];
+    if (!expectedConfig.remoteRouters) {
+      return [];
+    }
+
+    assert(actualConfig.remoteRouters, 'actualRemoteRouters is undefined');
+    assert(expectedConfig.remoteRouters, 'actualRemoteRouters is undefined');
+
+    const { remoteRouters: actualRemoteRouters } = actualConfig;
+    const { remoteRouters: expectedRemoteRouters } = expectedConfig;
+
+    const routesToUnenroll = Array.from(
+      difference(
+        new Set(Object.keys(actualRemoteRouters)),
+        new Set(Object.keys(expectedRemoteRouters)),
+      ),
+    );
+
+    if (routesToUnenroll.length === 0) {
+      return updateTransactions;
+    }
+
+    const contractToUpdate = TokenRouter__factory.connect(
+      this.args.addresses.deployedTokenRoute,
+      this.multiProvider.getProvider(this.domainId),
+    );
+
+    updateTransactions.push({
+      annotation: `Unenrolling Router ${this.args.addresses.deployedTokenRoute} on ${this.args.chain}`,
+      chainId: this.chainId,
+      to: contractToUpdate.address,
+      data: contractToUpdate.interface.encodeFunctionData(
+        'unenrollRemoteRouters(uint32[])',
+        [routesToUnenroll.map((k) => Number(k))],
+      ),
+    });
+
+    return updateTransactions;
+  }
+
+  createAddRebalancersUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isMovableCollateralTokenConfig(expectedConfig) ||
+      !isMovableCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.allowedRebalancers) {
+      return [];
+    }
+
+    const formattedExpectedRebalancers = new Set(
+      expectedConfig.allowedRebalancers.map(normalizeAddressEvm),
+    );
+    const formattedActualRebalancers = new Set(
+      (actualConfig.allowedRebalancers ?? []).map(normalizeAddressEvm),
+    );
+
+    const rebalancersToAdd = Array.from(
+      difference(formattedExpectedRebalancers, formattedActualRebalancers),
+    );
+
+    if (rebalancersToAdd.length === 0) {
+      return [];
+    }
+
+    return rebalancersToAdd.map((rebalancerToAdd) => ({
+      chainId: this.chainId,
+      annotation: `Adding rebalancer role to "${rebalancerToAdd}" on token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+      to: this.args.addresses.deployedTokenRoute,
+      data: MovableCollateralRouter__factory.createInterface().encodeFunctionData(
+        'addRebalancer(address)',
+        [rebalancerToAdd],
+      ),
+    }));
+  }
+
+  createRemoveRebalancersUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isMovableCollateralTokenConfig(expectedConfig) ||
+      !isMovableCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.allowedRebalancers) {
+      return [];
+    }
+
+    const formattedExpectedRebalancers = new Set(
+      expectedConfig.allowedRebalancers.map(normalizeAddressEvm),
+    );
+    const formattedActualRebalancers = new Set(
+      (actualConfig.allowedRebalancers ?? []).map(normalizeAddressEvm),
+    );
+
+    const rebalancersToRemove = Array.from(
+      difference(formattedActualRebalancers, formattedExpectedRebalancers),
+    );
+
+    if (rebalancersToRemove.length === 0) {
+      return [];
+    }
+
+    return rebalancersToRemove.map((rebalancerToRemove) => ({
+      chainId: this.chainId,
+      annotation: `Removing rebalancer role from "${rebalancerToRemove}" on token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+      to: this.args.addresses.deployedTokenRoute,
+      data: MovableCollateralRouter__factory.createInterface().encodeFunctionData(
+        'removeRebalancer(address)',
+        [rebalancerToRemove],
+      ),
+    }));
+  }
+
+  /**
+   * Create transactions to enroll CrossCollateralRouter routers.
+   */
+  createEnrollCrossCollateralRoutersTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isCrossCollateralTokenConfig(expectedConfig) ||
+      !isCrossCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.crossCollateralRouters) {
+      return [];
+    }
+
+    const actualEnrolled = resolveRouterMapConfig(
+      this.multiProvider,
+      actualConfig.crossCollateralRouters ?? {},
+    );
+    const expectedEnrolled = resolveRouterMapConfig(
+      this.multiProvider,
+      expectedConfig.crossCollateralRouters,
+    );
+
+    const domainsToEnroll: number[] = [];
+    const routersToEnroll: string[] = [];
+
+    for (const [domain, expectedRouters] of Object.entries(expectedEnrolled)) {
+      const domainId = Number(domain);
+      const actualRouters = new Set(
+        (actualEnrolled[domainId] ?? []).map((router) =>
+          this.toCanonicalRouterId(router),
+        ),
+      );
+      for (const router of expectedRouters) {
+        const canonicalRouter = this.toCanonicalRouterId(router);
+        if (!actualRouters.has(canonicalRouter)) {
+          domainsToEnroll.push(domainId);
+          routersToEnroll.push(canonicalRouter);
+        }
+      }
+    }
+
+    if (domainsToEnroll.length === 0) {
+      return [];
+    }
+
+    return [
+      {
+        chainId: this.chainId,
+        annotation: `Enrolling ${domainsToEnroll.length} CrossCollateralRouter routers on ${this.args.addresses.deployedTokenRoute} on ${this.chainName}`,
+        to: this.args.addresses.deployedTokenRoute,
+        data: CrossCollateralRouter__factory.createInterface().encodeFunctionData(
+          'enrollCrossCollateralRouters',
+          [domainsToEnroll, routersToEnroll],
+        ),
+      },
+    ];
+  }
+
+  /**
+   * Create transactions to unenroll CrossCollateralRouter routers.
+   */
+  createUnenrollCrossCollateralRoutersTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isCrossCollateralTokenConfig(expectedConfig) ||
+      !isCrossCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+    const expectedCrossCollateralRouters =
+      expectedConfig.crossCollateralRouters ?? {};
+
+    const actualEnrolled = resolveRouterMapConfig(
+      this.multiProvider,
+      actualConfig.crossCollateralRouters ?? {},
+    );
+    const expectedEnrolled = resolveRouterMapConfig(
+      this.multiProvider,
+      expectedCrossCollateralRouters,
+    );
+
+    const domainsToUnenroll: number[] = [];
+    const routersToUnenroll: string[] = [];
+
+    for (const [domain, actualRouters] of Object.entries(actualEnrolled)) {
+      const domainId = Number(domain);
+      const expectedRouters = new Set(
+        (expectedEnrolled[domainId] ?? []).map((router) =>
+          this.toCanonicalRouterId(router),
+        ),
+      );
+      for (const router of actualRouters) {
+        const canonicalRouter = this.toCanonicalRouterId(router);
+        if (!expectedRouters.has(canonicalRouter)) {
+          domainsToUnenroll.push(domainId);
+          routersToUnenroll.push(canonicalRouter);
+        }
+      }
+    }
+
+    if (domainsToUnenroll.length === 0) {
+      return [];
+    }
+
+    return [
+      {
+        chainId: this.chainId,
+        annotation: `Unenrolling ${domainsToUnenroll.length} CrossCollateralRouter routers on ${this.args.addresses.deployedTokenRoute} on ${this.chainName}`,
+        to: this.args.addresses.deployedTokenRoute,
+        data: CrossCollateralRouter__factory.createInterface().encodeFunctionData(
+          'unenrollCrossCollateralRouters',
+          [domainsToUnenroll, routersToUnenroll],
+        ),
+      },
+    ];
+  }
+
+  private toCanonicalRouterId(router: string): string {
+    const lower = router.toLowerCase();
+    if (isAddressEvm(lower)) {
+      return addressToBytes32(lower);
+    }
+    return lower;
+  }
+
+  /**
+   * Grants standing ERC20 allowances declared in `allowedRebalancingBridges[].approvedTokens`.
+   *
+   * Only legacy (pre-atomic-rebalancing) routers need explicit grants: their
+   * `approveTokenForBridge` sets max allowance. New impls grant an exact temporary
+   * allowance per rebalance and the same selector REVOKES, so emitting grants there
+   * would be wrong. Gated on the on-chain version being legacy, mirroring
+   * `createRevokeStaleBridgeAllowancesTxs`.
+   */
+  async getAllowedBridgesApprovalTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    if (
+      !isMovableCollateralTokenConfig(expectedConfig) ||
+      !isMovableCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.allowedRebalancingBridges) {
+      return [];
+    }
+
+    // Only routers on a legacy impl grant max via `approveTokenForBridge`; on a new
+    // impl the same selector revokes, so there is nothing to grant ahead of time.
+    if (
+      !actualConfig.contractVersion ||
+      !bridgeApprovalGrantsMaxAllowance(actualConfig.contractVersion)
+    ) {
+      return [];
+    }
+
+    const tokensToApproveByAllowedBridge = Object.values(
+      expectedConfig.allowedRebalancingBridges,
+    ).reduce(
+      (acc, allowedBridgesConfigs) => {
+        allowedBridgesConfigs.forEach((bridgeConfig) => {
+          acc[bridgeConfig.bridge] ??= [];
+          acc[bridgeConfig.bridge].push(...(bridgeConfig.approvedTokens ?? []));
+        });
+
+        return acc;
+      },
+      // allowed bridge -> tokens to approve
+      {} as Record<Address, Address[]>,
+    );
+
+    const filteredTokensToApproveByAllowedBridge = await promiseObjAll(
+      objMap(tokensToApproveByAllowedBridge, async (bridge, tokens) => {
+        const filteredApprovals = [];
+        for (const token of tokens) {
+          const instance = IERC20__factory.connect(
+            token,
+            this.multiProvider.getProvider(this.chainId),
+          );
+
+          const allowance = await instance.allowance(
+            this.args.addresses.deployedTokenRoute,
+            bridge,
+          );
+
+          if (!allowance.eq(constants.MaxUint256)) {
+            filteredApprovals.push(token);
+          }
+        }
+
+        return filteredApprovals;
+      }),
+    );
+
+    return Object.entries(filteredTokensToApproveByAllowedBridge).flatMap(
+      ([bridge, tokensToApprove]) =>
+        tokensToApprove.map((tokenToApprove) => ({
+          chainId: this.chainId,
+          annotation: `Approving allowed bridge "${bridge}" to spend token "${tokenToApprove}" on behalf of "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+          to: this.args.addresses.deployedTokenRoute,
+          data: MovableCollateralRouter__factory.createInterface().encodeFunctionData(
+            'approveTokenForBridge(address,address)',
+            [tokenToApprove, bridge],
+          ),
+        })),
+    );
+  }
+
+  async createAddAllowedBridgesUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    if (
+      !isMovableCollateralTokenConfig(expectedConfig) ||
+      !isMovableCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.allowedRebalancingBridges) {
+      return [];
+    }
+
+    const actualAllowedBridges = getAllowedRebalancingBridgesByDomain(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        actualConfig.allowedRebalancingBridges ?? {},
+      ),
+    );
+
+    const expectedAllowedBridges = getAllowedRebalancingBridgesByDomain(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        expectedConfig.allowedRebalancingBridges,
+      ),
+    );
+    const rebalancingBridgesToAddByDomain = objMap(
+      expectedAllowedBridges,
+      (domain, bridges) => {
+        const actualBridges = actualAllowedBridges[domain] ?? new Set();
+
+        return Array.from(difference(bridges, actualBridges));
+      },
+    );
+
+    const bridgesToAllow = Object.entries(
+      rebalancingBridgesToAddByDomain,
+    ).flatMap(([domain, allowedBridgesToAdd]) => {
+      return allowedBridgesToAdd.map((bridgeToAdd) => {
+        return {
+          chainId: this.chainId,
+          annotation: `Adding allowed bridge "${bridgeToAdd}" on token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+          to: this.args.addresses.deployedTokenRoute,
+          data: MovableCollateralRouter__factory.createInterface().encodeFunctionData(
+            'addBridge(uint32,address)',
+            [domain, bridgeToAdd],
+          ),
+        };
+      });
+    });
+
+    const approvalTxs = await this.getAllowedBridgesApprovalTxs(
+      actualConfig,
+      expectedConfig,
+    );
+    return [...bridgesToAllow, ...approvalTxs];
+  }
+
+  createRemoveBridgesTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isMovableCollateralTokenConfig(expectedConfig) ||
+      !isMovableCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.allowedRebalancingBridges) {
+      return [];
+    }
+
+    const actualAllowedBridges = getAllowedRebalancingBridgesByDomain(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        actualConfig.allowedRebalancingBridges ?? {},
+      ),
+    );
+    const expectedAllowedBridges = getAllowedRebalancingBridgesByDomain(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        expectedConfig.allowedRebalancingBridges,
+      ),
+    );
+    const rebalancingBridgesToAddByDomain = objMap(
+      actualAllowedBridges,
+      (domain, bridges) => {
+        const expectedBridges = expectedAllowedBridges[domain] ?? new Set();
+
+        return Array.from(difference(bridges, expectedBridges));
+      },
+    );
+
+    return Object.entries(rebalancingBridgesToAddByDomain).flatMap(
+      ([domain, allowedBridgesToAdd]) => {
+        return allowedBridgesToAdd.map((bridgeToAdd) => {
+          return {
+            chainId: this.chainId,
+            annotation: `Removing allowed bridge "${bridgeToAdd}" on token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+            to: this.args.addresses.deployedTokenRoute,
+            data: MovableCollateralRouter__factory.createInterface().encodeFunctionData(
+              'removeBridge(uint32,address)',
+              [domain, bridgeToAdd],
+            ),
+          };
+        });
+      },
+    );
+  }
+
+  createAddRebalanceTargetsUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isCrossCollateralTokenConfig(expectedConfig) ||
+      !isCrossCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.rebalanceTargets) {
+      return [];
+    }
+
+    const actualTargets = getRebalanceTargetsByDomain(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        actualConfig.rebalanceTargets ?? {},
+      ),
+    );
+    const { rebalanceTargets } = resolveAndValidateRebalanceConfig(
+      this.multiProvider,
+      this.chainName,
+      expectedConfig,
+    );
+    const expectedTargets = getRebalanceTargetsByDomain(rebalanceTargets);
+
+    const targetsToAddByDomain = objMap(expectedTargets, (domain, targets) => {
+      const actual = actualTargets[domain] ?? new Set();
+      return Array.from(difference(targets, actual));
+    });
+
+    return Object.entries(targetsToAddByDomain).flatMap(([domain, toAdd]) =>
+      toAdd.map((target) => ({
+        chainId: this.chainId,
+        annotation: `Adding rebalance target "${target}" for domain ${domain} on token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+        to: this.args.addresses.deployedTokenRoute,
+        data: CrossCollateralRouter__factory.createInterface().encodeFunctionData(
+          'addRebalanceTarget(uint32,bytes32)',
+          [domain, target],
+        ),
+      })),
+    );
+  }
+
+  createRemoveRebalanceTargetsTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isCrossCollateralTokenConfig(expectedConfig) ||
+      !isCrossCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    const actualTargets = getRebalanceTargetsByDomain(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        actualConfig.rebalanceTargets ?? {},
+      ),
+    );
+    const { rebalanceTargets } = resolveAndValidateRebalanceConfig(
+      this.multiProvider,
+      this.chainName,
+      expectedConfig,
+    );
+    const expectedTargets = getRebalanceTargetsByDomain(rebalanceTargets);
+
+    const targetsToRemoveByDomain = objMap(actualTargets, (domain, targets) => {
+      const expected = expectedTargets[domain] ?? new Set();
+      return Array.from(difference(targets, expected));
+    });
+
+    return Object.entries(targetsToRemoveByDomain).flatMap(
+      ([domain, toRemove]) =>
+        toRemove.map((target) => ({
+          chainId: this.chainId,
+          annotation: `Removing rebalance target "${target}" for domain ${domain} on token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+          to: this.args.addresses.deployedTokenRoute,
+          data: CrossCollateralRouter__factory.createInterface().encodeFunctionData(
+            'removeRebalanceTarget(uint32,bytes32)',
+            [domain, target],
+          ),
+        })),
+    );
+  }
+
+  createSetRecipientsUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isCrossCollateralTokenConfig(expectedConfig) ||
+      !isCrossCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.rebalanceRecipients) {
+      return [];
+    }
+
+    const actualRecipients = getRebalanceRecipientsByDomain(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        actualConfig.rebalanceRecipients ?? {},
+      ),
+    );
+    const { rebalanceRecipients } = resolveAndValidateRebalanceConfig(
+      this.multiProvider,
+      this.chainName,
+      expectedConfig,
+    );
+    const expectedRecipients =
+      getRebalanceRecipientsByDomain(rebalanceRecipients);
+
+    const recipientsToSetByDomain = objDiff(
+      expectedRecipients,
+      actualRecipients,
+    );
+
+    return Object.entries(recipientsToSetByDomain).map(
+      ([domain, recipient]) => ({
+        chainId: this.chainId,
+        annotation: `Setting rebalance recipient "${recipient}" for domain ${domain} on token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+        to: this.args.addresses.deployedTokenRoute,
+        data: CrossCollateralRouter__factory.createInterface().encodeFunctionData(
+          'setRecipient(uint32,bytes32)',
+          [domain, recipient],
+        ),
+      }),
+    );
+  }
+
+  createRemoveRecipientsTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isCrossCollateralTokenConfig(expectedConfig) ||
+      !isCrossCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    const actualRecipients = getRebalanceRecipientsByDomain(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        actualConfig.rebalanceRecipients ?? {},
+      ),
+    );
+    const { rebalanceRecipients } = resolveAndValidateRebalanceConfig(
+      this.multiProvider,
+      this.chainName,
+      expectedConfig,
+    );
+    const expectedRecipients =
+      getRebalanceRecipientsByDomain(rebalanceRecipients);
+
+    const recipientDomainsToRemove = Array.from(
+      difference(
+        new Set(Object.keys(actualRecipients)),
+        new Set(Object.keys(expectedRecipients)),
+      ),
+    );
+
+    return recipientDomainsToRemove.map((domain) => ({
+      chainId: this.chainId,
+      annotation: `Removing rebalance recipient for domain ${domain} on token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+      to: this.args.addresses.deployedTokenRoute,
+      data: CrossCollateralRouter__factory.createInterface().encodeFunctionData(
+        'removeRecipient(uint32)',
+        [domain],
+      ),
+    }));
+  }
+
+  /**
+   * Revokes legacy standing ERC20 allowances for bridges that remain allowlisted
+   * after an in-place upgrade.
+   *
+   * Pre-atomic-rebalancing routers granted `type(uint256).max` to every enrolled
+   * bridge in `_addBridge` (the collateral token) and, via the legacy
+   * `approvedTokens` grant path, to arbitrary tokens. After upgrading, bridges that
+   * are removed have their allowance revoked on-chain by `_removeBridge`, and
+   * newly-added bridges never received a legacy allowance. Bridges that REMAIN
+   * allowlisted, however, keep those stale max allowances until the next rebalance.
+   * This method emits txs that set the collateral token AND any configured
+   * `approvedTokens` allowances back to zero so an allowlisted bridge has no
+   * out-of-band transferFrom power over the router balance.
+   *
+   * `approveTokenForBridge` only has revoke semantics on the new implementation;
+   * on legacy impls the same selector GRANTS max. Revoke txs are therefore emitted
+   * unless the router is on a legacy impl that is not being upgraded this run, so
+   * they always execute against the new revoke-semantics impl — whether this run
+   * upgrades it in place or it was already upgraded (which keeps cleanup retryable
+   * if an earlier run upgraded but its revoke txs never executed).
+   */
+  async createRevokeStaleBridgeAllowancesTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+    upgradeScheduled: boolean,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    if (
+      !isMovableCollateralTokenConfig(expectedConfig) ||
+      !isMovableCollateralTokenConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (!expectedConfig.allowedRebalancingBridges) {
+      return [];
+    }
+
+    // `approveTokenForBridge` only revokes on the new implementation; on a legacy
+    // impl the same selector GRANTS max. Skip only when the router is on a legacy
+    // impl and is NOT being upgraded this run — emitting there would re-create the
+    // allowance. Otherwise the revoke executes against the new impl: either because
+    // this run upgrades it in place, or because it is already upgraded. The latter
+    // keeps cleanup retryable if a prior run upgraded but its revoke txs never
+    // executed; the non-zero on-chain allowance check below filters out routers
+    // with nothing stale left to clear.
+    if (
+      !actualConfig.contractVersion ||
+      (bridgeApprovalGrantsMaxAllowance(actualConfig.contractVersion) &&
+        !upgradeScheduled)
+    ) {
+      return [];
+    }
+
+    const provider = this.multiProvider.getProvider(this.chainId);
+
+    // The collateral token backing the router. Native routes (address(0)) have no
+    // ERC20 collateral, but may still carry stale `approvedTokens` grants.
+    const collateralToken = await MovableCollateralRouter__factory.connect(
+      this.args.addresses.deployedTokenRoute,
+      provider,
+    ).token();
+
+    // Bridge addresses currently allowlisted on-chain (across all domains).
+    // Allowances are keyed by (router, bridge) and are domain-agnostic, so we match
+    // bridges by address rather than per domain — this catches a bridge moved between
+    // domains, whose stale allowance a per-domain comparison would miss.
+    const actualBridges = new Set<Address>();
+    for (const bridges of Object.values(
+      getAllowedRebalancingBridgesByDomain(
+        resolveRouterMapConfig(
+          this.multiProvider,
+          actualConfig.allowedRebalancingBridges ?? {},
+        ),
+      ),
+    )) {
+      for (const bridge of bridges) {
+        actualBridges.add(bridge);
+      }
+    }
+
+    // For each bridge that remains allowlisted (present in both configs by address),
+    // the tokens whose stale legacy allowance must be revoked: the collateral token
+    // plus any `approvedTokens` the legacy grant path could have approved. Removed
+    // bridges are revoked on-chain by `_removeBridge`; newly added bridges never held
+    // a legacy allowance. `actualConfig` does not derive approvedTokens, so the
+    // expected config is the signal of what was granted; each candidate is gated on a
+    // non-zero on-chain allowance below.
+    const tokensByBridge = new Map<Address, Set<Address>>();
+    for (const bridgeConfigs of Object.values(
+      resolveRouterMapConfig(
+        this.multiProvider,
+        expectedConfig.allowedRebalancingBridges,
+      ),
+    )) {
+      for (const { bridge, approvedTokens } of bridgeConfigs) {
+        const normalizedBridge = normalizeAddressEvm(bridge);
+        if (!actualBridges.has(normalizedBridge)) {
+          continue;
+        }
+        const tokens =
+          tokensByBridge.get(normalizedBridge) ?? new Set<Address>();
+        if (!isZeroishAddress(collateralToken)) {
+          tokens.add(normalizeAddressEvm(collateralToken));
+        }
+        for (const token of approvedTokens ?? []) {
+          tokens.add(normalizeAddressEvm(token));
+        }
+        tokensByBridge.set(normalizedBridge, tokens);
+      }
+    }
+
+    const revokeTxs: AnnotatedEV5Transaction[] = [];
+    for (const [bridge, tokensToRevoke] of tokensByBridge) {
+      for (const token of tokensToRevoke) {
+        const allowance = await IERC20__factory.connect(
+          token,
+          provider,
+        ).allowance(this.args.addresses.deployedTokenRoute, bridge);
+
+        if (allowance.isZero()) {
+          continue;
+        }
+
+        revokeTxs.push({
+          chainId: this.chainId,
+          annotation: `Revoking legacy bridge allowance for token "${token}" and bridge "${bridge}" on "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+          to: this.args.addresses.deployedTokenRoute,
+          data: MovableCollateralRouter__factory.createInterface().encodeFunctionData(
+            'approveTokenForBridge(address,address)',
+            [token, bridge],
+          ),
+        });
+      }
+    }
+
+    return revokeTxs;
+  }
+
+  createAddRemoteOutputAssetsTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isEverclearTokenBridgeConfig(expectedConfig) ||
+      !isEverclearTokenBridgeConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    const actualOutputAssets = resolveRouterMapConfig(
+      this.multiProvider,
+      actualConfig.outputAssets,
+    );
+    const expectedOutputAssets = resolveRouterMapConfig(
+      this.multiProvider,
+      expectedConfig.outputAssets,
+    );
+
+    const outputAssetsToAdd = objDiff(
+      expectedOutputAssets,
+      actualOutputAssets,
+      (address, address2) =>
+        addressToBytes32(address) === addressToBytes32(address2),
+    );
+    if (isObjEmpty(outputAssetsToAdd)) {
+      return [];
+    }
+
+    const assets = Object.entries(outputAssetsToAdd).map(
+      ([domainId, outputAsset]): {
+        destination: number;
+        outputAsset: string;
+      } => ({
+        destination: parseInt(domainId),
+        outputAsset: addressToBytes32(outputAsset),
+      }),
+    );
+
+    return [
+      {
+        chainId: this.multiProvider.getEvmChainId(this.chainId),
+        to: this.args.addresses.deployedTokenRoute,
+        annotation: `Adding "${Object.keys(assets)}" output assets for token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+        data: EverclearTokenBridge__factory.createInterface().encodeFunctionData(
+          'setOutputAssetsBatch((uint32,bytes32)[])',
+          [assets],
+        ),
+      },
+    ];
+  }
+
+  createRemoveRemoteOutputAssetsTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isEverclearTokenBridgeConfig(expectedConfig) ||
+      !isEverclearTokenBridgeConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    const actualOutputAssets = resolveRouterMapConfig(
+      this.multiProvider,
+      actualConfig.outputAssets,
+    );
+    const expectedOutputAssets = resolveRouterMapConfig(
+      this.multiProvider,
+      expectedConfig.outputAssets,
+    );
+
+    const outputAssetsToRemove = Array.from(
+      difference(
+        new Set(objKeys(actualOutputAssets)),
+        new Set(objKeys(expectedOutputAssets)),
+      ),
+    );
+
+    if (outputAssetsToRemove.length === 0) {
+      return [];
+    }
+
+    const assets = outputAssetsToRemove.map(
+      (
+        domainId,
+      ): {
+        destination: number;
+        outputAsset: string;
+      } => ({
+        destination: domainId,
+        outputAsset: ZERO_ADDRESS_HEX_32,
+      }),
+    );
+
+    return [
+      {
+        chainId: this.multiProvider.getEvmChainId(this.chainId),
+        to: this.args.addresses.deployedTokenRoute,
+        annotation: `Removing "${outputAssetsToRemove}" output assets from token "${this.args.addresses.deployedTokenRoute}" on chain "${this.chainName}"`,
+        data: EverclearTokenBridge__factory.createInterface().encodeFunctionData(
+          'setOutputAssetsBatch((uint32,bytes32)[])',
+          [assets],
+        ),
+      },
+    ];
+  }
+
+  createUpdateEverclearFeeParamsTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isEverclearTokenBridgeConfig(expectedConfig) ||
+      !isEverclearTokenBridgeConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    if (
+      deepEquals(
+        expectedConfig.everclearFeeParams,
+        actualConfig.everclearFeeParams,
+      )
+    ) {
+      return [];
+    }
+
+    const resolvedEverclearExpectedFeeConfig = resolveRouterMapConfig(
+      this.multiProvider,
+      expectedConfig.everclearFeeParams,
+    );
+    const resolvedActualEverclearFeeConfig = resolveRouterMapConfig(
+      this.multiProvider,
+      actualConfig.everclearFeeParams,
+    );
+
+    const feesToSet = objFilter(
+      resolvedEverclearExpectedFeeConfig,
+      (
+        domainId,
+        currentDomainConfig,
+      ): currentDomainConfig is EverclearCollateralTokenConfig['everclearFeeParams'][number] => {
+        return (
+          isNullish(resolvedActualEverclearFeeConfig[Number(domainId)]) ||
+          !deepEquals(
+            currentDomainConfig,
+            resolvedActualEverclearFeeConfig[Number(domainId)],
+          )
+        );
+      },
+    );
+
+    return Object.entries(feesToSet).map(([domainId, feeConfig]) => {
+      const { deadline, fee, signature } = feeConfig;
+
+      // Deadline is in seconds
+      const humanReadableDeadline = new Date(deadline * 1000).toISOString();
+      return {
+        annotation: `Setting Everclear fee params with deadline "${humanReadableDeadline}" for domain "${domainId}" on token "${this.args.addresses.deployedTokenRoute}" and chain "${this.chainName}"`,
+        chainId: this.multiProvider.getEvmChainId(this.chainName),
+        to: this.args.addresses.deployedTokenRoute,
+        data: EverclearTokenBridge__factory.createInterface().encodeFunctionData(
+          'setFeeParams',
+          [domainId, fee, deadline, signature],
+        ),
+      };
+    });
+  }
+
+  createRemoveEverclearFeeParamsTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isEverclearTokenBridgeConfig(expectedConfig) ||
+      !isEverclearTokenBridgeConfig(actualConfig)
+    ) {
+      return [];
+    }
+
+    const resolvedEverclearExpectedFeeConfig = resolveRouterMapConfig(
+      this.multiProvider,
+      expectedConfig.everclearFeeParams,
+    );
+    const resolvedActualEverclearFeeConfig = resolveRouterMapConfig(
+      this.multiProvider,
+      actualConfig.everclearFeeParams,
+    );
+
+    const outputAssetsToRemove = Array.from(
+      difference(
+        new Set(objKeys(resolvedActualEverclearFeeConfig)),
+        new Set(objKeys(resolvedEverclearExpectedFeeConfig)),
+      ),
+    );
+
+    if (outputAssetsToRemove.length === 0) {
+      return [];
+    }
+
+    return outputAssetsToRemove.map((domainId) => {
+      return {
+        annotation: `Removing Everclear fee params for domain "${domainId}" on token "${this.args.addresses.deployedTokenRoute}" and chain "${this.chainName}"`,
+        chainId: this.multiProvider.getEvmChainId(this.chainName),
+        to: this.args.addresses.deployedTokenRoute,
+        data: EverclearTokenBridge__factory.createInterface().encodeFunctionData(
+          'setFeeParams',
+          // Setting default values to reset the config for the provided domain
+          [domainId, 0, 0, '0x'],
+        ),
+      };
+    });
+  }
+
+  /**
+   * Create a transaction to update the remote routers for the Warp Route contract.
+   *
+   * @param actualConfig - The on-chain router configuration, including the remoteRouters array.
+   * @param expectedConfig - The expected token router configuration.
+   * @returns A array with a single Ethereum transaction that need to be executed to enroll the routers
+   */
+  createSetDestinationGasUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    // OFT contracts don't have GasRouter interface — no destination gas config
+    if (isOftTokenConfig(expectedConfig)) {
+      return [];
+    }
+    const updateTransactions: AnnotatedEV5Transaction[] = [];
+    if (!expectedConfig.destinationGas) {
+      return [];
+    }
+
+    assert(actualConfig.destinationGas, 'actualDestinationGas is undefined');
+    assert(
+      expectedConfig.destinationGas,
+      'expectedDestinationGas is undefined',
+    );
+
+    // Only set gas for domains that will have routers enrolled after the update.
+    // For CrossCollateralRouter configs, also include domains from crossCollateralRouters.
+    const resolvedExpectedRemoteRouters = resolveRouterMapConfig(
+      this.multiProvider,
+      expectedConfig.remoteRouters ?? {},
+    );
+    const expectedRouterDomains = new Set(
+      Object.keys(resolvedExpectedRemoteRouters).map(Number),
+    );
+
+    // Include MC-enrolled router domains
+    if (
+      isCrossCollateralTokenConfig(expectedConfig) &&
+      expectedConfig.crossCollateralRouters
+    ) {
+      const localDomain = this.multiProvider.getDomainId(this.chainName);
+      const resolvedEnrolled = resolveRouterMapConfig(
+        this.multiProvider,
+        expectedConfig.crossCollateralRouters,
+      );
+      for (const domain of Object.keys(resolvedEnrolled).map(Number)) {
+        if (domain === localDomain) continue;
+        expectedRouterDomains.add(domain);
+      }
+    }
+
+    if (
+      expectedRouterDomains.size === 0 &&
+      Object.keys(expectedConfig.destinationGas).length > 0
+    ) {
+      throw new Error(
+        `destinationGas is set but remoteRouters and crossCollateralRouters are empty. ` +
+          `Cannot configure gas for domains without corresponding router enrollments.`,
+      );
+    }
+
+    const actualDestinationGas = resolveRouterMapConfig(
+      this.multiProvider,
+      actualConfig.destinationGas,
+    );
+    const expectedDestinationGas = resolveRouterMapConfig(
+      this.multiProvider,
+      expectedConfig.destinationGas,
+    );
+
+    // Filter to only domains that will have routers enrolled
+    const filteredExpectedGas = Object.fromEntries(
+      Object.entries(expectedDestinationGas).filter(([domain]) =>
+        expectedRouterDomains.has(Number(domain)),
+      ),
+    );
+
+    // Filter actual gas to the same domains for comparison
+    const filteredActualGas = Object.fromEntries(
+      Object.entries(actualDestinationGas).filter(([domain]) =>
+        expectedRouterDomains.has(Number(domain)),
+      ),
+    );
+
+    if (!deepEquals(filteredActualGas, filteredExpectedGas)) {
+      // Convert { 1: 2, 2: 3, ... } to [{ 1: 2 }, { 2: 3 }]
+      const gasRouterConfigs: {
+        domain: BigNumberish;
+        gas: BigNumberish;
+      }[] = [];
+      objMap(filteredExpectedGas, (domain: Domain, gas: string) => {
+        gasRouterConfigs.push({
+          domain,
+          gas,
+        });
+      });
+
+      const contractToUpdate = GasRouter__factory.connect(
+        this.args.addresses.deployedTokenRoute,
+        this.multiProvider.getProvider(this.domainId),
+      );
+
+      updateTransactions.push({
+        chainId: this.chainId,
+        annotation: `Setting destination gas for ${this.args.addresses.deployedTokenRoute} on ${this.args.chain}`,
+        to: contractToUpdate.address,
+        data: contractToUpdate.interface.encodeFunctionData(
+          'setDestinationGas((uint32,uint256)[])',
+          [gasRouterConfigs],
+        ),
+      });
+    }
+    return updateTransactions;
+  }
+
+  /**
+   * Create transactions to update an existing ISM config, or deploy a new ISM and return a tx to setInterchainSecurityModule
+   *
+   * @param actualConfig - The on-chain router configuration, including the ISM configuration, and address.
+   * @param expectedConfig - The expected token router configuration, including the ISM configuration.
+   * @returns Ethereum transaction that need to be executed to update the ISM configuration.
+   */
+  async createIsmUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+    opaqueHybridAddress?: Address,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    const updateTransactions: AnnotatedEV5Transaction[] = [];
+    if (!expectedConfig.interchainSecurityModule) {
+      return [];
+    }
+
+    const actualDeployedIsm = derivedIsmAddress(actualConfig);
+
+    // Try to update (may also deploy) Ism with the expected config
+    const {
+      deployedIsm: expectedDeployedIsm,
+      updateTransactions: ismUpdateTransactions,
+    } = await this.deployOrUpdateIsm(
+      actualConfig,
+      expectedConfig,
+      opaqueHybridAddress,
+    );
+
+    // If an ISM is updated in-place, push the update txs
+    updateTransactions.push(...ismUpdateTransactions);
+
+    // If a new ISM is deployed, push the setInterchainSecurityModule tx
+    if (!eqAddress(actualDeployedIsm, expectedDeployedIsm)) {
+      const contractToUpdate = MailboxClient__factory.connect(
+        this.args.addresses.deployedTokenRoute,
+        this.multiProvider.getProvider(this.domainId),
+      );
+
+      updateTransactions.push({
+        chainId: this.chainId,
+        annotation: `Setting ISM for Warp Route to ${expectedDeployedIsm}`,
+        to: contractToUpdate.address,
+        data: contractToUpdate.interface.encodeFunctionData(
+          'setInterchainSecurityModule',
+          [expectedDeployedIsm],
+        ),
+      });
+    }
+
+    return updateTransactions;
+  }
+
+  async createHookUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    return this.createHookAndPredicateUpdateTxs(actualConfig, expectedConfig);
+  }
+
+  /**
+   * Deploys hook updates and predicate wrapper together so the post-update hook address
+   * is available to deployAndConfigure without a stale on-chain read.
+   */
+  async createHookAndPredicateUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+    opaqueHybridAddress?: Address,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    let hookTransactions: AnnotatedEV5Transaction[] = [];
+    let newHookAddress: Address | undefined;
+
+    // Explicit type annotation narrows away the undefined that TypeScript infers
+    // from the RouterConfig & DerivedMailboxClientConfig intersection.
+    const actualHook: DerivedHookConfig | string = actualConfig.hook;
+
+    // Predicate removal: on-chain wrapper exists but expected config omits it.
+    // When the user provides an explicit hook that differs from the underlying hook
+    // (predicate stripped), the hook-diff path generates the setHook to the new hook.
+    // Otherwise (no hook, or a stale aggregation from a warp read), the
+    // needsPredicateRemoval block below clears the hook to zero so the router uses the
+    // mailbox default — the user who removed predicateWrapper without supplying a
+    // replacement hook wants the default behavior restored, not the underlying sub-hook
+    // silently preserved.
+    const actualPredicateWrapper =
+      'predicateWrapper' in actualConfig
+        ? actualConfig.predicateWrapper
+        : undefined;
+    const expectedPredicateWrapper =
+      'predicateWrapper' in expectedConfig
+        ? expectedConfig.predicateWrapper
+        : undefined;
+    const needsPredicateRemoval =
+      actualPredicateWrapper != null && !expectedPredicateWrapper;
+    const needsDelayedFlowRemoval =
+      typeof expectedConfig.hook === 'string' &&
+      isZeroishAddress(expectedConfig.hook) &&
+      typeof actualHook === 'object' &&
+      collectHybridHookNodes(actualHook).some(
+        ({ type }) => type === HookType.DELAYED_FLOW_ROUTER,
+      );
+
+    // Treat a zero-address hook the same as "no explicit hook": expandWarpDeployConfig
+    // sets hook: zeroAddress as a default when the user config omits the hook field.
+    // EvmHookModule.update(zeroAddress) returns [] early without updating deployedHook,
+    // so a zero-address target produces no setHook tx and the predicate removal branch
+    // would never be reached. Exclude zero addresses so needsPredicateRemoval can fire.
+    if (
+      expectedConfig.hook &&
+      (typeof expectedConfig.hook !== 'string' ||
+        !isZeroishAddress(expectedConfig.hook))
+    ) {
+      const proxyAdminAddress =
+        expectedConfig.proxyAdmin?.address ?? actualConfig.proxyAdmin?.address;
+      assert(proxyAdminAddress, 'ProxyAdmin address is undefined');
+
+      // The reader leaves the PREDICATE sub-hook inside actualConfig.hook
+      // (e.g. Agg([Predicate, IGP])). When expectedConfig is derived from
+      // actualConfig (e.g. during the enrollment step after initial deploy, OR
+      // during a read→edit→apply round-trip where the operator removed predicateWrapper
+      // but kept the hook field unchanged), expectedConfig.hook carries the same
+      // aggregation. Strip the predicate from BOTH sides so the hook diff sees the bare
+      // hook (e.g. IGP) on both sides and doesn't generate a spurious setHook.
+      // The needsPredicateRemoval block below then fires to clear the hook to zero.
+      const shouldStripHookForComparison =
+        !!expectedPredicateWrapper || needsPredicateRemoval;
+      const actualHookForComparison = shouldStripHookForComparison
+        ? stripPredicateSubHook(actualHook)
+        : actualHook;
+      const expectedHookForComparison =
+        shouldStripHookForComparison && expectedConfig.hook
+          ? stripPredicateSubHook(
+              expectedConfig.hook as DerivedHookConfig | string,
+            )
+          : expectedConfig.hook;
+
+      const result = await getEvmHookUpdateTransactions(
+        this.args.addresses.deployedTokenRoute,
+        {
+          actualConfig: actualHookForComparison,
+          expectedConfig: expectedHookForComparison,
+          ccipContractCache: this.ccipContractCache,
+          contractVerifier: this.contractVerifier,
+          evmChainName: this.chainName,
+          hookAndIsmFactories: extractIsmAndHookFactoryAddresses(
+            this.args.addresses,
+          ),
+          setHookFunctionCallEncoder: (addr: string) =>
+            MailboxClient__factory.createInterface().encodeFunctionData(
+              'setHook',
+              [addr],
+            ),
+          logger: this.logger,
+          mailbox: actualConfig.mailbox,
+          multiProvider: this.multiProvider,
+          proxyAdminAddress,
+          rateLimitedSender: this.args.addresses.deployedTokenRoute,
+          opaqueHybridAddresses: opaqueHybridAddress
+            ? [opaqueHybridAddress]
+            : undefined,
+        },
+      );
+      hookTransactions = result.transactions;
+      newHookAddress = result.newHookAddress;
+    }
+    // Predicate and delayed-flow removals clear the custom hook when no
+    // replacement was deployed. Delayed flow requires an explicit zero target;
+    // omission retains the existing hook like every ordinary update.
+    if ((needsPredicateRemoval || needsDelayedFlowRemoval) && !newHookAddress) {
+      const currentAddress =
+        typeof actualHook === 'string' ? actualHook : actualHook.address;
+      if (!isZeroishAddress(currentAddress)) {
+        this.logger.debug(
+          { chain: this.chainName },
+          'Removing custom hook: generating setHook(zero)',
+        );
+        hookTransactions.push({
+          annotation: needsDelayedFlowRemoval
+            ? 'Remove delayed-flow hook (router will use mailbox default)'
+            : 'Remove predicate wrapper: clear custom hook (router will use mailbox default)',
+          chainId: this.chainId,
+          to: this.args.addresses.deployedTokenRoute,
+          data: MailboxClient__factory.createInterface().encodeFunctionData(
+            'setHook',
+            [constants.AddressZero],
+          ),
+        });
+      }
+    }
+
+    const { transactions: predicateTransactions, deploysNewWrapper } =
+      await this.createPredicateWrapperUpdateTxs(
+        actualConfig,
+        expectedConfig,
+        newHookAddress,
+      );
+
+    // When predicate wrapper is being deployed, its setHook(aggregation) sets the final
+    // router hook and already incorporates newHookAddress inside the aggregation.
+    // Drop the intermediate setHook(newHookAddress) from hookTransactions to avoid a
+    // redundant write that would be immediately overwritten.
+    //
+    // IMPORTANT: only drop when a NEW wrapper is being deployed. The ownership-only
+    // path (deploysNewWrapper=false) must not suppress the hook update even though
+    // predicateTransactions is non-empty.
+    const effectiveHookTransactions =
+      hookTransactions.length > 0 && deploysNewWrapper
+        ? hookTransactions.filter(
+            (tx) =>
+              !(
+                tx.to &&
+                eqAddress(tx.to, this.args.addresses.deployedTokenRoute) &&
+                tx.data?.startsWith(
+                  MailboxClient__factory.createInterface().getSighash(
+                    'setHook',
+                  ),
+                )
+              ),
+          )
+        : hookTransactions;
+
+    return [...effectiveHookTransactions, ...predicateTransactions];
+  }
+
+  /**
+   * Searches the current on-chain hook tree for a PredicateRouterWrapper that
+   * matches by registry and policyId. Returns the wrapper address and its current
+   * on-chain owner when found, undefined otherwise.
+   *
+   * Uses unbounded recursion into aggregation hooks (consistent with
+   * EvmTokenAdapter.findPredicateWrapperInHook and EvmWarpRouteReader.findPredicateAddressInHook).
+   */
+  private async findDeployedPredicateWrapper(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedPredicateConfig: { predicateRegistry: string; policyId: string },
+  ): Promise<{ address: Address; onchainOwner: Address } | undefined> {
+    const hookAddress = derivedHookAddress(actualConfig);
+    if (!hookAddress || isZeroishAddress(hookAddress)) return undefined;
+
+    try {
+      const provider = this.multiProvider.getProvider(this.domainId);
+      return await this.searchPredicateInHook(
+        hookAddress,
+        provider,
+        expectedPredicateConfig,
+      );
+    } catch (error) {
+      this.logger.debug(
+        { chain: this.chainName, error },
+        'Error checking predicate wrapper deployment',
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * Recursively searches a hook tree for a matching PredicateRouterWrapper.
+   * Descends into StaticAggregationHook sub-hooks without depth limit.
+   */
+  private async searchPredicateInHook(
+    hookAddr: Address,
+    provider: providers.Provider,
+    expectedPredicateConfig: { predicateRegistry: string; policyId: string },
+  ): Promise<{ address: Address; onchainOwner: Address } | undefined> {
+    const match = await this.matchPredicateWrapper(
+      hookAddr,
+      provider,
+      expectedPredicateConfig,
+    );
+    if (match) return match;
+
+    let subHooks: string[];
+    try {
+      subHooks = await StaticAggregationHook__factory.connect(
+        hookAddr,
+        provider,
+      ).hooks('0x');
+    } catch {
+      // Any call failure means hookAddr is not a StaticAggregationHook.
+      // HyperlaneSmartProvider wraps CALL_EXCEPTION as "Invalid response from provider"
+      // with code: undefined, so checking error.code is insufficient.
+      return undefined;
+    }
+
+    for (const subHook of subHooks) {
+      const found = await this.searchPredicateInHook(
+        subHook,
+        provider,
+        expectedPredicateConfig,
+      );
+      if (found) return found;
+    }
+    return undefined;
+  }
+
+  /**
+   * Checks whether a single hook address is a PredicateRouterWrapper matching
+   * the warp route and expected config. Returns the match or undefined.
+   */
+  private async matchPredicateWrapper(
+    hookAddr: Address,
+    provider: providers.Provider,
+    expectedPredicateConfig: { predicateRegistry: string; policyId: string },
+  ): Promise<{ address: Address; onchainOwner: Address } | undefined> {
+    try {
+      const predicateWrapper = PredicateRouterWrapper__factory.connect(
+        hookAddr,
+        provider,
+      );
+
+      // Verify identity: warpRoute + hookType confirm it's a PredicateRouterWrapper
+      // for this route. Then compare registry + policyId so config rotations
+      // (e.g. changing compliance policy) trigger a redeploy rather than silently no-op.
+      const [
+        warpRoute,
+        hookType,
+        onchainRegistry,
+        onchainPolicyId,
+        onchainOwner,
+      ] = await Promise.all([
+        predicateWrapper.warpRoute(),
+        predicateWrapper.hookType(),
+        predicateWrapper.getRegistry(),
+        predicateWrapper.getPolicyID(),
+        predicateWrapper.owner(),
+      ]);
+
+      if (
+        eqAddress(warpRoute, this.args.addresses.deployedTokenRoute) &&
+        hookType === OnchainHookType.PREDICATE_ROUTER_WRAPPER &&
+        eqAddress(onchainRegistry, expectedPredicateConfig.predicateRegistry) &&
+        onchainPolicyId === expectedPredicateConfig.policyId
+      ) {
+        return { address: hookAddr, onchainOwner };
+      }
+    } catch {
+      // Any call failure means hookAddr is not a PredicateRouterWrapper.
+      // HyperlaneSmartProvider wraps CALL_EXCEPTION as "Invalid response from provider"
+      // with code: undefined, so checking error.code === 'CALL_EXCEPTION' is insufficient.
+      return undefined;
+    }
+    return undefined;
+  }
+
+  /**
+   * Check if predicate wrapper is already deployed with fully matching config
+   * (registry, policyId, and owner).
+   *
+   * @param actualConfig - The on-chain router configuration.
+   * @param expectedPredicateConfig - The expected predicate wrapper configuration.
+   * @returns True if wrapper is deployed with all fields matching, false otherwise.
+   */
+  async isPredicateWrapperDeployed(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedPredicateConfig: {
+      predicateRegistry: string;
+      policyId: string;
+      owner: string;
+    },
+  ): Promise<boolean> {
+    const found = await this.findDeployedPredicateWrapper(
+      actualConfig,
+      expectedPredicateConfig,
+    );
+    return (
+      found !== undefined &&
+      eqAddress(found.onchainOwner, expectedPredicateConfig.owner)
+    );
+  }
+
+  /**
+   * Create transactions to deploy predicate wrapper and update hook.
+   *
+   * @param actualConfig - The on-chain router configuration.
+   * @param expectedConfig - The expected token router configuration.
+   * @returns transactions to execute and whether a new wrapper is being deployed.
+   *   deploysNewWrapper=true means the predicate emits its own setHook(aggregation)
+   *   that supersedes any hook update in the same batch.
+   */
+  async createPredicateWrapperUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+    pendingHookAddress?: Address,
+  ): Promise<{
+    transactions: AnnotatedEV5Transaction[];
+    deploysNewWrapper: boolean;
+  }> {
+    // Only proceed if expectedConfig has predicateWrapper
+    if (
+      !('predicateWrapper' in expectedConfig) ||
+      !expectedConfig.predicateWrapper
+    ) {
+      return { transactions: [], deploysNewWrapper: false };
+    }
+
+    const predicateWrapperConfig: PredicateWrapperConfig =
+      PredicateWrapperConfigSchema.parse(expectedConfig.predicateWrapper);
+
+    // Check if a wrapper matching by registry+policyId already exists on-chain.
+    // If so, only a transferOwnership tx is needed (not a full redeploy).
+    const existingWrapper = await this.findDeployedPredicateWrapper(
+      actualConfig,
+      predicateWrapperConfig,
+    );
+
+    if (existingWrapper) {
+      if (
+        eqAddress(existingWrapper.onchainOwner, predicateWrapperConfig.owner)
+      ) {
+        this.logger.debug(
+          { chain: this.chainName },
+          'Predicate wrapper already deployed with matching config, skipping',
+        );
+        return { transactions: [], deploysNewWrapper: false };
+      }
+
+      // Owner changed — generate a transferOwnership tx without redeploying.
+      this.logger.debug(
+        { chain: this.chainName, wrapper: existingWrapper.address },
+        'Predicate wrapper owner changed, generating transferOwnership transaction',
+      );
+      const transferOwnershipTx = await PredicateRouterWrapper__factory.connect(
+        existingWrapper.address,
+        this.multiProvider.getProvider(this.chainName),
+      ).populateTransaction.transferOwnership(predicateWrapperConfig.owner);
+      return {
+        transactions: [
+          {
+            ...transferOwnershipTx,
+            chainId: this.chainId,
+            annotation: `Transferring predicate wrapper ownership to ${predicateWrapperConfig.owner}`,
+          },
+        ],
+        deploysNewWrapper: false,
+      };
+    }
+
+    const staticAggregationHookFactory =
+      this.args.addresses.staticAggregationHookFactory;
+    if (!staticAggregationHookFactory) {
+      throw new Error(
+        `staticAggregationHookFactory not found for ${this.chainName}. Ensure proxy factories are deployed.`,
+      );
+    }
+
+    const signer = this.multiProvider.getSigner(this.chainName);
+    const factory = StaticAggregationHookFactory__factory.connect(
+      staticAggregationHookFactory,
+      signer,
+    );
+
+    const predicateDeployer = new PredicateWrapperDeployer(
+      this.multiProvider,
+      factory,
+      this.logger,
+    );
+
+    // Deploy predicate wrapper and get addresses.
+    // Pass token type to deploy the appropriate wrapper.
+    // Pass pendingHookAddress (if any) so deployAndConfigure uses the post-update hook
+    // instead of reading the stale on-chain value when hook and predicate wrapper are
+    // both being changed in the same update() call.
+    const result = await predicateDeployer.deployAndConfigure(
+      this.chainName,
+      this.args.addresses.deployedTokenRoute,
+      predicateWrapperConfig,
+      expectedConfig.type,
+      pendingHookAddress,
+    );
+
+    this.logger.info(
+      {
+        chain: this.chainName,
+        wrapper: result.wrapperAddress,
+        aggregationHook: result.aggregationHookAddress,
+      },
+      'Predicate wrapper deployed, returning setHook transaction',
+    );
+
+    return {
+      transactions: [
+        {
+          annotation:
+            'Set aggregation hook wrapping PredicateRouterWrapper on warp route',
+          chainId: this.chainId,
+          ...result.setHookTx,
+        },
+      ],
+      deploysNewWrapper: true,
+    };
+  }
+
+  createFeeHookUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (isOftTokenConfig(expectedConfig)) return [];
+
+    const expectedFeeHook = expectedConfig.feeHook;
+    const actualFeeHook = actualConfig.feeHook;
+
+    // No change needed
+    if (!expectedFeeHook && !actualFeeHook) return [];
+    // Unset in expected config → leave the on-chain feeHook unchanged.
+    // Clearing an existing feeHook requires an explicit address(0) in the config.
+    if (!expectedFeeHook && actualFeeHook) return [];
+    if (
+      expectedFeeHook &&
+      actualFeeHook &&
+      eqAddress(expectedFeeHook, actualFeeHook)
+    )
+      return [];
+
+    const newFeeHook = expectedFeeHook ?? constants.AddressZero;
+    return [
+      {
+        chainId: this.chainId,
+        annotation: `Setting feeHook to ${newFeeHook}`,
+        to: this.args.addresses.deployedTokenRoute,
+        data: TokenRouter__factory.createInterface().encodeFunctionData(
+          'setFeeHook',
+          [newFeeHook],
+        ),
+      },
+    ];
+  }
+
+  /**
+   * Create transactions to update token fee configuration.
+   *
+   * @param actualConfig - The on-chain router configuration.
+   * @param expectedConfig - The expected token router configuration.
+   * @returns Ethereum transactions that need to be executed to update the token fee.
+   *
+   * @remarks
+   * The returned transactions may include both `setFeeRecipient` (gated by the
+   * token-router owner) and fee-contract config calls (gated by the fee-contract
+   * owner). When routing these to a dedicated `feeSubmitter`, that submitter
+   * must own both the token router and the fee contract.
+   */
+  async createTokenFeeUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+    tokenReaderParams?: Partial<TokenFeeReaderParams>,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    if (!expectedConfig.tokenFee) {
+      if (actualConfig.tokenFee) {
+        return [
+          {
+            annotation: 'Removing fee recipient...',
+            chainId: this.chainId,
+            to: this.args.addresses.deployedTokenRoute,
+            data: TokenRouter__factory.createInterface().encodeFunctionData(
+              'setFeeRecipient(address)',
+              [constants.AddressZero],
+            ),
+          },
+        ];
+      }
+      return [];
+    }
+
+    const routerAddress = this.args.addresses.deployedTokenRoute;
+    const resolvedTokenFee = await resolveTokenFeeAddress(
+      expectedConfig.tokenFee,
+      routerAddress,
+      expectedConfig,
+      this.multiProvider.getProvider(this.chainId),
+    );
+
+    const currentTokenFee = actualConfig.tokenFee;
+
+    if (!currentTokenFee) {
+      this.logger.info('No existing token fee found, creating new one');
+
+      const expandedExpectedConfig = await EvmTokenFeeModule.expandConfig({
+        config: resolvedTokenFee,
+        multiProvider: this.multiProvider,
+        chainName: this.chainName,
+      });
+
+      const tokenFeeModule = await EvmTokenFeeModule.create({
+        multiProvider: this.multiProvider,
+        chain: this.chainName,
+        config: expandedExpectedConfig,
+        contractVerifier: this.contractVerifier,
+      });
+      const { deployedFee } = tokenFeeModule.serialize();
+
+      // Check if fee recipient is already set correctly on-chain
+      const tokenRouter = TokenRouter__factory.connect(
+        routerAddress,
+        this.multiProvider.getProvider(this.chainId),
+      );
+      const currentFeeRecipient = await tokenRouter
+        .feeRecipient()
+        .catch((error) => {
+          this.logger.warn(
+            `Failed to read feeRecipient, defaulting to generate setFeeRecipient tx`,
+            error,
+          );
+          return constants.AddressZero;
+        });
+
+      if (eqAddress(currentFeeRecipient, deployedFee)) {
+        return [];
+      }
+
+      return [
+        {
+          annotation: 'Setting new routing fee...',
+          chainId: this.chainId,
+          to: this.args.addresses.deployedTokenRoute,
+          data: TokenRouter__factory.createInterface().encodeFunctionData(
+            'setFeeRecipient(address)',
+            [deployedFee],
+          ),
+        },
+      ];
+    }
+
+    this.logger.info('Updating existing token fee configuration');
+
+    const tokenFeeModule = new EvmTokenFeeModule(
+      this.multiProvider,
+      {
+        chain: this.chainName,
+        config: currentTokenFee,
+        addresses: {
+          deployedFee: currentTokenFee.address,
+        },
+      },
+      this.contractVerifier,
+    );
+
+    // For CCR fee updates, forward the on-chain enrolled router keys as hints so the
+    // reader can observe orphan feeContracts entries not present in the target config.
+    // Without these hints, the removal loop in EvmTokenFeeModule.update() never sees
+    // stale (dest, router) entries and the on-chain pointer stays wired.
+    let effectiveTokenReaderParams = tokenReaderParams;
+    if (
+      isCrossCollateralTokenConfig(actualConfig) &&
+      actualConfig.crossCollateralRouters &&
+      resolvedTokenFee.type === TokenFeeType.CrossCollateralRoutingFee
+    ) {
+      const onchainRoutersByDomain = resolveRouterMapConfig(
+        this.multiProvider,
+        actualConfig.crossCollateralRouters,
+      );
+      effectiveTokenReaderParams = {
+        ...tokenReaderParams,
+        crossCollateralRouters: mergeCrossCollateralRouters(
+          tokenReaderParams?.crossCollateralRouters,
+          onchainRoutersByDomain,
+        ),
+      };
+    }
+
+    const updateTransactions = await tokenFeeModule.update(
+      resolvedTokenFee,
+      effectiveTokenReaderParams,
+    );
+    const { deployedFee } = tokenFeeModule.serialize();
+
+    // Only call setFeeRecipient if the fee recipient address has changed
+    if (!eqAddress(currentTokenFee.address, deployedFee)) {
+      updateTransactions.push({
+        annotation: 'Updating routing fee...',
+        chainId: this.chainId,
+        to: this.args.addresses.deployedTokenRoute,
+        data: TokenRouter__factory.createInterface().encodeFunctionData(
+          'setFeeRecipient(address)',
+          [deployedFee],
+        ),
+      });
+    }
+    return updateTransactions;
+  }
+
+  /**
+   * Transfer ownership of an existing Warp route with a given config.
+   *
+   * @param actualConfig - The on-chain router configuration.
+   * @param expectedConfig - The expected token router configuration.
+   * @returns Ethereum transaction that need to be executed to update the owner.
+   */
+  createOwnershipUpdateTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    return transferOwnershipTransactions(
+      this.multiProvider.getEvmChainId(this.args.chain),
+      this.args.addresses.deployedTokenRoute,
+      actualConfig,
+      expectedConfig,
+      `${expectedConfig.type} Warp Route`,
+    );
+  }
+
+  /**
+   * Updates or deploys the ISM using the provided configuration.
+   *
+   * @returns Object with deployedIsm address, and update Transactions
+   */
+  async deployOrUpdateIsm(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+    opaqueHybridAddress?: Address,
+  ): Promise<{
+    deployedIsm: Address;
+    updateTransactions: AnnotatedEV5Transaction[];
+  }> {
+    assert(expectedConfig.interchainSecurityModule, 'Ism derived incorrectly');
+
+    if (
+      typeof expectedConfig.interchainSecurityModule === 'string' &&
+      isZeroishAddress(expectedConfig.interchainSecurityModule)
+    ) {
+      return {
+        deployedIsm: expectedConfig.interchainSecurityModule,
+        updateTransactions: [],
+      };
+    }
+
+    // Always override recipient for any RateLimitedIsm node — it must be the
+    // token address.  Any user-supplied value is silently wrong (it would wire
+    // the ISM to the wrong chain), so we always set it from the deployed token
+    // route.  Handles both top-level and nested (e.g. inside aggregation) nodes.
+    // Thread the owner through so that an omitted ism.owner in expectedConfig
+    // doesn't look like an owner diff to EvmIsmModule.update (which would redeploy
+    // the ISM and reset the rate-limit bucket).
+    // Primary default: the warp-route owner (matches deploy path in token/deploy.ts).
+    // Fallback: the current on-chain ISM owner (same-type, same-owner in-place update).
+    let expectedIsm = expectedConfig.interchainSecurityModule;
+    if (typeof expectedIsm === 'object') {
+      const actualIsm = actualConfig.interchainSecurityModule;
+      const onChainOwner =
+        typeof actualIsm === 'object' && 'owner' in actualIsm
+          ? actualIsm.owner
+          : undefined;
+      const defaultOwner =
+        expectedConfig.owner ??
+        (typeof onChainOwner === 'string' ? onChainOwner : undefined);
+
+      if (ismTreeContainsRateLimited(expectedIsm)) {
+        expectedIsm = setRateLimitedIsmRecipient(
+          expectedIsm,
+          this.args.addresses.deployedTokenRoute,
+          defaultOwner,
+        );
+      }
+
+      // Hybrid hook/ISMs need the paired warp router, which in warp-route
+      // context is always this token — configs routinely omit it (it is only
+      // required for standalone ISM deploys). Injected independently of the
+      // owner: an unresolvable owner would otherwise leave `warpRouter`
+      // missing and the update would plan against an incomplete config.
+      // `remoteIsms` is deferred: cross-chain enrollment needs every chain's
+      // instance address, so it is reconciled by a separate pass that must
+      // stay its only writer.
+      if (ismTreeContainsHybridHookIsm(expectedIsm)) {
+        expectedIsm = completeHybridIsmNodes(
+          expectedIsm,
+          this.args.addresses.deployedTokenRoute,
+          { type: DelayedFlowRemoteIsmsSourceType.Deferred },
+          defaultOwner,
+          this.multiProvider,
+        );
+      }
+    }
+
+    const ismModule = new EvmIsmModule(
+      this.multiProvider,
+      {
+        chain: this.args.chain,
+        config: actualConfig.interchainSecurityModule,
+        addresses: {
+          ...this.args.addresses,
+          mailbox: actualConfig.mailbox,
+          deployedIsm: derivedIsmAddress(actualConfig),
+        },
+      },
+      this.ccipContractCache,
+      this.contractVerifier,
+    );
+    this.logger.info(
+      `Comparing target ISM config with ${this.args.chain} chain`,
+    );
+    const updateTransactions = await ismModule.update(
+      expectedIsm,
+      opaqueHybridAddress ? [opaqueHybridAddress] : [],
+    );
+    const { deployedIsm } = ismModule.serialize();
+
+    return { deployedIsm, updateTransactions };
+  }
+
+  /**
+   * Creates a transaction to upgrade the Warp Route implementation if the package version is below specified version.
+   *
+   * @param actualConfig - The current on-chain configuration
+   * @param expectedConfig - The expected configuration
+   * @returns An array of transactions to upgrade the implementation if needed
+   */
+  async upgradeWarpRouteImplementationTx(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): Promise<AnnotatedEV5Transaction[]> {
+    const updateTransactions: AnnotatedEV5Transaction[] = [];
+
+    assert(
+      expectedConfig.type !== TokenType.unknown,
+      'Cannot upgrade warp route with unknown token type',
+    );
+
+    // Older contracts without PACKAGE_VERSION fall back to a legacy version in
+    // EvmWarpRouteReader.fetchPackageVersion.
+    assert(
+      actualConfig.contractVersion,
+      'Actual contract version is undefined',
+    );
+
+    // Only upgrade if the user specifies a version
+    if (!expectedConfig.contractVersion) {
+      return [];
+    }
+
+    const comparisonValue = compareVersions(
+      expectedConfig.contractVersion,
+      actualConfig.contractVersion,
+    );
+
+    // Expected version is lower than actual version, no upgrade is possible
+    if (comparisonValue === -1) {
+      throw new Error(
+        `Expected contract version ${expectedConfig.contractVersion} is lower than actual contract version ${actualConfig.contractVersion}`,
+      );
+    }
+    // Versions are the same, no upgrade needed
+    if (comparisonValue === 0) {
+      return [];
+    }
+
+    // You can only upgrade to the contract version (see `PackageVersioned`)
+    // defined by the @hyperlane-xyz/core package
+    assert(
+      contractVersionMatchesDependency(expectedConfig.contractVersion),
+      VERSION_ERROR_MESSAGE,
+    );
+
+    // Scale values are immutables baked into the implementation bytecode.
+    // Changing the effective scale during an upgrade would cause in-flight
+    // messages to be decoded with incorrect scaling.
+    assert(
+      scalesEqual(actualConfig.scale, expectedConfig.scale),
+      `Scale change detected during upgrade. ` +
+        `Changing scale on an existing deployment may cause in-flight messages to be decoded incorrectly.`,
+    );
+
+    this.logger.info(
+      `Upgrading Warp Route implementation on ${this.args.chain} from ${actualConfig.contractVersion} to ${expectedConfig.contractVersion}`,
+    );
+
+    const deployer = new HypERC20Deployer(this.multiProvider);
+    const constructorArgs = await deployer.constructorArgs(
+      this.chainName,
+      expectedConfig,
+    );
+    const tokenType = expectedConfig.type as DeployableTokenType;
+    const implementation = await deployer.deployContractWithName(
+      this.chainName,
+      tokenType,
+      hypERC20contracts[tokenType],
+      constructorArgs,
+      undefined,
+      false,
+    );
+
+    const provider = this.multiProvider.getProvider(this.domainId);
+    const proxyAddress = this.args.addresses.deployedTokenRoute;
+    const proxyAdminAddress = await proxyAdmin(provider, proxyAddress);
+
+    assert(
+      await isInitialized(provider, proxyAddress),
+      'Proxy is not initialized',
+    );
+
+    updateTransactions.push({
+      chainId: this.chainId,
+      annotation: `Upgrading Warp Route implementation on ${this.args.chain}`,
+      to: proxyAdminAddress,
+      data: ProxyAdmin__factory.createInterface().encodeFunctionData(
+        'upgrade',
+        [proxyAddress, implementation.address],
+      ),
+    });
+
+    return updateTransactions;
+  }
+
+  createSetMaxFeePpmTxs(
+    actualConfig: DerivedTokenRouterConfig,
+    expectedConfig: HypTokenRouterConfig,
+  ): AnnotatedEV5Transaction[] {
+    if (
+      !isCctpTokenConfig(expectedConfig) ||
+      expectedConfig.cctpVersion !== 'V2' ||
+      expectedConfig.maxFeeBps === undefined
+    ) {
+      return [];
+    }
+
+    const actualMaxFeeBps = isCctpTokenConfig(actualConfig)
+      ? actualConfig.maxFeeBps
+      : undefined;
+
+    // When upgrading across the CCTP_PPM_STORAGE_VERSION boundary, the
+    // pre-upgrade contract stores the fee in integer bps while the
+    // post-upgrade contract expects ppm. The reader normalises to bps so the
+    // values look equal, but the raw on-chain slot will be wrong after the
+    // proxy upgrade. Always emit setMaxFeePpm in this case.
+    const crossingPpmBoundary =
+      actualConfig.contractVersion &&
+      expectedConfig.contractVersion &&
+      compareVersions(actualConfig.contractVersion, CCTP_PPM_STORAGE_VERSION) <
+        0 &&
+      compareVersions(
+        expectedConfig.contractVersion,
+        CCTP_PPM_STORAGE_VERSION,
+      ) >= 0;
+
+    if (!crossingPpmBoundary && actualMaxFeeBps === expectedConfig.maxFeeBps) {
+      return [];
+    }
+
+    const maxFeePpm = Math.round(expectedConfig.maxFeeBps * 100);
+    return [
+      {
+        chainId: this.chainId,
+        annotation: `Setting maxFeePpm to ${maxFeePpm} on ${this.args.chain}`,
+        to: this.args.addresses.deployedTokenRoute,
+        data: TokenBridgeCctpV2__factory.createInterface().encodeFunctionData(
+          'setMaxFeePpm',
+          [maxFeePpm],
+        ),
+      },
+    ];
+  }
+
+  /**
+   * Deploys the Warp Route.
+   *
+   * @param chain - The chain to deploy the module on.
+   * @param config - The configuration for the token router.
+   * @param multiProvider - The multi-provider instance to use.
+   * @returns A new instance of the EvmERC20WarpHyperlaneModule.
+   */
+  static async create(params: {
+    chain: ChainNameOrId;
+    config: HypTokenRouterConfig;
+    multiProvider: MultiProvider;
+    ccipContractCache?: CCIPContractCache;
+    contractVerifier?: ContractVerifier;
+    proxyFactoryFactories: HyperlaneAddresses<ProxyFactoryFactories>;
+  }): Promise<EvmWarpModule> {
+    const {
+      chain,
+      config,
+      multiProvider,
+      ccipContractCache,
+      contractVerifier,
+      proxyFactoryFactories,
+    } = params;
+    const chainName = multiProvider.getChainName(chain);
+    const deployer = new HypERC20Deployer(multiProvider);
+    const deployedContracts = await deployer.deployContracts(chainName, config);
+
+    const warpModule = new EvmWarpModule(
+      multiProvider,
+      {
+        addresses: {
+          ...proxyFactoryFactories,
+          deployedTokenRoute: deployedContracts[config.type].address,
+        },
+        chain,
+        config,
+      },
+      ccipContractCache,
+      contractVerifier,
+    );
+
+    const actualConfig = await warpModule.read();
+    if (config.remoteRouters && !isObjEmpty(config.remoteRouters)) {
+      const enrollRemoteTxs =
+        await warpModule.createEnrollRemoteRoutersUpdateTxs(
+          actualConfig,
+          config,
+        ); // @TODO Remove when EvmWarpModule.create can be used
+      const onlyTxIndex = 0;
+      await multiProvider.sendTransaction(chain, enrollRemoteTxs[onlyTxIndex]);
+    }
+
+    if (
+      isMovableCollateralTokenConfig(config) &&
+      config.allowedRebalancers &&
+      config.allowedRebalancers.length !== 0
+    ) {
+      const addRebalancerTxs = await warpModule.createAddRebalancersUpdateTxs(
+        actualConfig,
+        config,
+      ); // @TODO Remove when EvmWarpModule.create can be used
+
+      for (const tx of addRebalancerTxs) {
+        await multiProvider.sendTransaction(chain, tx);
+      }
+    }
+
+    if (
+      isMovableCollateralTokenConfig(config) &&
+      config.allowedRebalancingBridges &&
+      !isObjEmpty(config.allowedRebalancingBridges)
+    ) {
+      const addBridgesTxs = await warpModule.createAddAllowedBridgesUpdateTxs(
+        actualConfig,
+        config,
+      ); // @TODO Remove when EvmWarpModule.create can be used
+
+      for (const tx of addBridgesTxs) {
+        await multiProvider.sendTransaction(chain, tx);
+      }
+    }
+
+    if (isEverclearTokenBridgeConfig(config)) {
+      const addRemoteOutputTokens = warpModule.createAddRemoteOutputAssetsTxs(
+        actualConfig,
+        config,
+      );
+
+      const updateEverclearFeeParamsTxs =
+        warpModule.createUpdateEverclearFeeParamsTxs(actualConfig, config);
+
+      const everclearTxs = [
+        ...addRemoteOutputTokens,
+        ...updateEverclearFeeParamsTxs,
+      ];
+
+      for (const tx of everclearTxs) {
+        await multiProvider.sendTransaction(chain, tx);
+      }
+    }
+
+    if (
+      isCrossCollateralTokenConfig(config) &&
+      config.crossCollateralRouters &&
+      Object.keys(config.crossCollateralRouters).length > 0
+    ) {
+      const enrollTxs = warpModule.createEnrollCrossCollateralRoutersTxs(
+        actualConfig,
+        config,
+      );
+
+      for (const tx of enrollTxs) {
+        await multiProvider.sendTransaction(chain, tx);
+      }
+    }
+
+    return warpModule;
+  }
+}

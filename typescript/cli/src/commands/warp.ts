@@ -3,32 +3,40 @@ import { stringify as yamlStringify } from 'yaml';
 import { type CommandModule } from 'yargs';
 
 import { RebalancerConfig, RebalancerService } from '@hyperlane-xyz/rebalancer';
+import { checkWarpRouteDeployConfig } from '@hyperlane-xyz/sdk';
 import {
-  type RawForkedChainConfigByChain,
-  RawForkedChainConfigByChainSchema,
-  expandVirtualWarpDeployConfig,
-  expandWarpDeployConfig,
-  getRouterAddressesFromWarpCoreConfig,
-} from '@hyperlane-xyz/sdk';
-import {
-  ProtocolType,
   assert,
   difference,
   intersection,
-  objFilter,
+  isEVMLike,
   rootLogger,
 } from '@hyperlane-xyz/utils';
 
-import { runWarpRouteCheck } from '../check/warp.js';
+import {
+  checkCrossCollateralWarpRoute,
+  runWarpIcaOwnerCheck,
+  runWarpRouteCheck,
+} from '../check/warp.js';
 import { createWarpRouteDeployConfig } from '../config/warp.js';
 import {
+  type CommandContext,
   type CommandModuleWithContext,
   type CommandModuleWithWarpApplyContext,
   type CommandModuleWithWarpDeployContext,
   type CommandModuleWithWriteContext,
 } from '../context/types.js';
-import { runWarpRouteApply, runWarpRouteDeploy } from '../deploy/warp.js';
-import { runForkCommand } from '../fork/fork.js';
+import {
+  runWarpRouteApply,
+  runWarpRouteCombine,
+  runWarpRouteDeploy,
+} from '../deploy/warp.js';
+import { runWarpRouteBalances } from '../balances/warp.js';
+import { runWarpRouteFees } from '../fees/warp.js';
+import {
+  type ForkConfigByChain,
+  ForkConfigByChainSchema,
+  runForkCommand,
+} from '../fork/fork.js';
 import {
   errorRed,
   log,
@@ -36,7 +44,7 @@ import {
   logCommandHeader,
   logGreen,
 } from '../logger.js';
-import { getWarpRouteConfigsByCore, runWarpRouteRead } from '../read/warp.js';
+import { runWarpRouteRead } from '../read/warp.js';
 import { sendTestTransfer } from '../send/transfer.js';
 import { ExtendedChainSubmissionStrategySchema } from '../submitters/types.js';
 import {
@@ -45,6 +53,7 @@ import {
   removeTrailingSlash,
   writeYamlOrJson,
 } from '../utils/files.js';
+import { getOrderedWarpSendChains } from '../utils/warp-send.js';
 import {
   filterWarpConfigsToMatchingChains,
   getWarpConfigs,
@@ -58,12 +67,12 @@ import {
   forkCommandOptions,
   outputFileCommandOption,
   strategyCommandOption,
-  symbolCommandOption,
-  warpCoreConfigCommandOption,
-  warpDeploymentConfigCommandOption,
+  stringArrayOptionConfig,
   warpRouteIdCommandOption,
 } from './options.js';
 import { type MessageOptionsArgTypes, messageSendOptions } from './send.js';
+import { altCommand } from './warp-alt.js';
+import { quoteCommand } from './warp-quote.js';
 
 /**
  * Parent command
@@ -73,11 +82,16 @@ export const warpCommand: CommandModule = {
   describe: 'Manage Hyperlane warp routes',
   builder: (yargs) =>
     yargs
+      .command(altCommand)
       .command(apply)
+      .command(balances)
       .command(check)
+      .command(combine)
       .command(deploy)
       .command(fork)
+      .command(getFees)
       .command(init)
+      .command(quoteCommand)
       .command(read)
       .command(rebalancer)
       .command(send)
@@ -88,28 +102,95 @@ export const warpCommand: CommandModule = {
   handler: () => log('Command required'),
 };
 
-const SELECT_WARP_ROUTE_BUILDER = {
-  config: warpDeploymentConfigCommandOption,
-  warpRouteId: {
-    ...warpRouteIdCommandOption,
-    demandOption: false,
-  },
-  warp: {
-    ...warpCoreConfigCommandOption,
-    demandOption: false,
-  },
-  symbol: {
-    ...symbolCommandOption,
-    demandOption: false,
-  },
+const WARP_ROUTE_OPTIONS = {
+  'warp-route-id': warpRouteIdCommandOption,
 } as const;
 
-type SelectWarpRouteBuilder = Partial<
-  Record<keyof typeof SELECT_WARP_ROUTE_BUILDER, string>
->;
+type WarpRouteOptions = {
+  warpRouteId?: string;
+};
+
+async function getWarpConfigsFromContextOrRegistry({
+  context,
+  warpRouteId,
+}: {
+  context: CommandContext;
+  warpRouteId?: string;
+}) {
+  if (context.warpCoreConfig && context.warpDeployConfig) {
+    return {
+      warpCoreConfig: context.warpCoreConfig,
+      warpDeployConfig: context.warpDeployConfig,
+      resolvedWarpRouteId: context.resolvedWarpRouteId ?? warpRouteId,
+    };
+  }
+
+  // If cache is partial, refresh both configs together to avoid mixing stale+fresh routes.
+  const requestedWarpRouteId = context.resolvedWarpRouteId ?? warpRouteId;
+  const fetchedConfigs = await getWarpConfigs({
+    context,
+    warpRouteId: requestedWarpRouteId,
+  });
+  const resolvedWarpRouteId =
+    fetchedConfigs.resolvedWarpRouteId ?? requestedWarpRouteId;
+  const { warpCoreConfig, warpDeployConfig } = fetchedConfigs;
+  context.warpCoreConfig = warpCoreConfig;
+  context.warpDeployConfig = warpDeployConfig;
+  context.resolvedWarpRouteId = resolvedWarpRouteId;
+
+  return {
+    warpCoreConfig,
+    warpDeployConfig,
+    resolvedWarpRouteId,
+  };
+}
+
+const balances: CommandModuleWithContext<
+  WarpRouteOptions & {
+    chains?: string[];
+    out?: string;
+    address?: string;
+    raw?: boolean;
+  }
+> = {
+  command: 'balances',
+  describe: 'Display token balances for each leg of a warp route',
+  builder: {
+    ...WARP_ROUTE_OPTIONS,
+    chains: stringArrayOptionConfig({
+      description: 'Filter to specific chains',
+      demandOption: false,
+    }),
+    out: outputFileCommandOption(
+      undefined,
+      false,
+      'Output file path (JSON or YAML)',
+    ),
+    address: addressCommandOption(
+      "User address to check balances for. When provided, shows the user's token balance on each chain instead of collateral/supply.",
+    ),
+    raw: {
+      type: 'boolean' as const,
+      description: 'Show balances in base units (without decimal formatting)',
+      default: false,
+    },
+  },
+  handler: async ({ context, warpRouteId, chains, out, address, raw }) => {
+    logCommandHeader('Hyperlane Warp Balances');
+    await runWarpRouteBalances({
+      context,
+      warpRouteId,
+      chains,
+      out,
+      address,
+      raw,
+    });
+    process.exit(0);
+  },
+};
 
 export const apply: CommandModuleWithWarpApplyContext<
-  SelectWarpRouteBuilder & {
+  WarpRouteOptions & {
     strategy?: string;
     receiptsDir: string;
     relay?: boolean;
@@ -118,7 +199,7 @@ export const apply: CommandModuleWithWarpApplyContext<
   command: 'apply',
   describe: 'Update Warp Route contracts',
   builder: {
-    ...SELECT_WARP_ROUTE_BUILDER,
+    ...WARP_ROUTE_OPTIONS,
     strategy: { ...strategyCommandOption, demandOption: false },
     'receipts-dir': {
       type: 'string',
@@ -147,37 +228,78 @@ export const apply: CommandModuleWithWarpApplyContext<
 
     await runWarpRouteApply({
       context,
-      // Already fetched in the resolveWarpApplyChains
       warpDeployConfig: context.warpDeployConfig,
       warpCoreConfig: context.warpCoreConfig,
       strategyUrl,
       receiptsDir,
       selfRelay: relay,
-      warpRouteId,
+      warpRouteId: context.resolvedWarpRouteId ?? warpRouteId,
     });
     process.exit(0);
   },
 };
 
-export const deploy: CommandModuleWithWarpDeployContext<SelectWarpRouteBuilder> =
-  {
-    command: 'deploy',
-    describe: 'Deploy Warp Route contracts',
-    builder: SELECT_WARP_ROUTE_BUILDER,
-    handler: async ({ context, warpRouteId, config }) => {
-      logCommandHeader(`Hyperlane Warp Route Deployment`);
+export const deploy: CommandModuleWithWarpDeployContext<WarpRouteOptions> = {
+  command: 'deploy',
+  describe: 'Deploy Warp Route contracts',
+  builder: WARP_ROUTE_OPTIONS,
+  handler: async ({ context, warpRouteId }) => {
+    logCommandHeader(`Hyperlane Warp Route Deployment`);
 
-      await runWarpRouteDeploy({
-        context,
-        // Already fetched in the resolveWarpRouteConfigChains
-        warpDeployConfig: context.warpDeployConfig,
-        warpRouteId,
-        warpDeployConfigFileName: config,
-      });
+    await runWarpRouteDeploy({
+      context,
+      warpDeployConfig: context.warpDeployConfig,
+      warpRouteId: context.resolvedWarpRouteId ?? warpRouteId,
+    });
 
-      process.exit(0);
+    process.exit(0);
+  },
+};
+
+const combine: CommandModuleWithWriteContext<{
+  routes: string;
+  'output-warp-route-id': string;
+}> = {
+  command: 'combine',
+  describe:
+    'Combine multiple CrossCollateralRouter warp routes, updating deploy configs with cross-route crossCollateralRouters',
+  builder: {
+    routes: {
+      type: 'string',
+      description:
+        'Comma-separated warp route IDs to combine (e.g., "USDC/eth-arb,USDT/eth-arb")',
+      demandOption: true,
     },
-  };
+    'output-warp-route-id': {
+      type: 'string',
+      description:
+        'Warp route ID for the merged WarpCoreConfig (e.g., MULTI/stableswap)',
+      demandOption: true,
+    },
+  },
+  handler: async ({ context, routes, 'output-warp-route-id': outputId }) => {
+    logCommandHeader('Hyperlane Warp Combine');
+
+    const routeIds = routes
+      .split(',')
+      .map((r) => r.trim())
+      .filter((r) => r.length > 0);
+    assert(
+      routeIds.length >= 2,
+      'At least 2 route IDs are required to combine',
+    );
+    assert(
+      outputId.trim().length > 0,
+      'Output warp route ID must be non-empty',
+    );
+    await runWarpRouteCombine({
+      context,
+      routeIds,
+      outputWarpRouteId: outputId,
+    });
+    process.exit(0);
+  },
+};
 
 export const init: CommandModuleWithContext<{
   advanced: boolean;
@@ -206,15 +328,16 @@ export const init: CommandModuleWithContext<{
 };
 
 export const read: CommandModuleWithContext<
-  SelectWarpRouteBuilder & {
+  WarpRouteOptions & {
     chain?: string;
     address?: string;
+    out?: string;
   }
 > = {
   command: 'read',
   describe: 'Derive the warp route config from onchain artifacts',
   builder: {
-    ...SELECT_WARP_ROUTE_BUILDER,
+    ...WARP_ROUTE_OPTIONS,
     chain: {
       ...chainCommandOption,
       demandOption: false,
@@ -223,32 +346,21 @@ export const read: CommandModuleWithContext<
       'Address of the router contract to read.',
       false,
     ),
+    out: outputFileCommandOption(),
   },
-  handler: async ({
-    context,
-    chain,
-    address,
-    config: configFilePath,
-    symbol,
-    warp,
-    warpRouteId,
-  }) => {
+  handler: async ({ context, chain, address, warpRouteId, out }) => {
     logCommandHeader('Hyperlane Warp Reader');
 
     const config = await runWarpRouteRead({
       context,
       chain,
       address,
-      symbol,
-      warpCoreConfigPath: warp,
       warpRouteId,
     });
 
-    if (configFilePath) {
-      writeYamlOrJson(configFilePath, config, 'yaml');
-      logGreen(
-        `✅ Warp route config written successfully to ${configFilePath}:\n`,
-      );
+    if (out) {
+      writeYamlOrJson(out, config, 'yaml');
+      logGreen(`✅ Warp route config written successfully to ${out}:\n`);
     } else {
       logGreen(`✅ Warp route config read successfully:\n`);
     }
@@ -257,21 +369,54 @@ export const read: CommandModuleWithContext<
   },
 };
 
+const getFees: CommandModuleWithContext<
+  WarpRouteOptions & {
+    amount?: string;
+  }
+> = {
+  command: 'get-fees',
+  describe: 'Show fees for each pairwise connection on a warp route',
+  builder: {
+    ...WARP_ROUTE_OPTIONS,
+    amount: {
+      type: 'string',
+      description: 'Amount for fee quotes (human-readable, e.g., "1.5")',
+      default: '1',
+    },
+  },
+  handler: async ({ context, warpRouteId, amount }) => {
+    logCommandHeader('Hyperlane Warp Route Fees');
+    await runWarpRouteFees({
+      context,
+      warpRouteId,
+      amount: amount!,
+    });
+    process.exit(0);
+  },
+};
+
 const send: CommandModuleWithWriteContext<
   MessageOptionsArgTypes &
-    SelectWarpRouteBuilder & {
+    WarpRouteOptions & {
       router?: string;
       amount: string;
       recipient?: string;
-      chains?: string;
+      chains?: string[];
       skipValidation?: boolean;
+      predicateApiKey?: string;
+      predicateApiUrl?: string;
+      attestation?: string;
+      sourceToken?: string;
+      destinationToken?: string;
+      feeQuotingUrl?: string;
+      feeQuotingApiKey?: string;
     }
 > = {
   command: 'send',
   describe: 'Send a test token transfer on a warp route',
   builder: {
     ...messageSendOptions,
-    ...SELECT_WARP_ROUTE_BUILDER,
+    ...WARP_ROUTE_OPTIONS,
     amount: {
       type: 'string',
       description: 'Amount to send (in smallest unit)',
@@ -279,18 +424,55 @@ const send: CommandModuleWithWriteContext<
     },
     recipient: {
       type: 'string',
-      description: 'Token recipient address (defaults to sender)',
+      description:
+        'Token recipient address. Required for non-EVM destinations. Defaults to destination signer for EVM destinations.',
     },
-    chains: {
-      type: 'string',
-      description: 'Comma separated list of chains to send messages to',
+    chains: stringArrayOptionConfig({
+      description: 'List of chains to send messages to',
       demandOption: false,
       conflicts: ['origin', 'destination'],
-    },
+    }),
     'skip-validation': {
       type: 'boolean',
       description: 'Skip transfer validation (e.g., collateral checks)',
       default: false,
+    },
+    'predicate-api-key': {
+      type: 'string',
+      description: 'Predicate API key for fetching attestations automatically',
+      default: process.env.PREDICATE_API_KEY,
+      conflicts: 'attestation',
+    },
+    'predicate-api-url': {
+      type: 'string',
+      description:
+        'Predicate API base URL (overrides default; useful for testing)',
+      default: process.env.PREDICATE_API_URL,
+      implies: 'predicate-api-key',
+    },
+    attestation: {
+      type: 'string',
+      description: 'Pre-obtained Predicate attestation (JSON string)',
+    },
+    'source-token': {
+      type: 'string',
+      description:
+        'Source token router address (for CrossCollateralRouter routes)',
+    },
+    'destination-token': {
+      type: 'string',
+      description:
+        'Destination token router address (for CrossCollateralRouter cross-stablecoin transfers)',
+    },
+    'fee-quoting-url': {
+      type: 'string',
+      description: 'Fee quoting service URL for offchain fee quotes',
+      default: process.env.FEE_QUOTING_URL,
+    },
+    'fee-quoting-api-key': {
+      type: 'string',
+      description: 'API key for the fee quoting service',
+      default: process.env.FEE_QUOTING_API_KEY,
     },
   },
   handler: async ({
@@ -300,21 +482,34 @@ const send: CommandModuleWithWriteContext<
     timeout,
     quick,
     relay,
-    symbol,
-    warp,
+    symbol: _symbol,
+    warp: _warp,
+    warpRouteId,
     amount,
     recipient,
     roundTrip,
-    chains: chainsAsString,
+    chains: chainsArg,
     skipValidation,
+    predicateApiKey,
+    predicateApiUrl,
+    attestation,
+    sourceToken,
+    destinationToken,
+    feeQuotingUrl,
+    feeQuotingApiKey,
   }) => {
-    const warpCoreConfig = await getWarpCoreConfigOrExit({
-      symbol,
-      warp,
-      context,
-    });
-    const chainsToSend = chainsAsString?.split(',').map((_) => _.trim());
-    let chains = chainsToSend || [];
+    const filterChains = [origin, destination, ...(chainsArg || [])]
+      .filter((v): v is string => Boolean(v))
+      .filter((v, i, a) => a.indexOf(v) === i);
+
+    const warpCoreConfig =
+      context.warpCoreConfig ??
+      (await getWarpCoreConfigOrExit({
+        warpRouteId,
+        context,
+        chains: filterChains.length > 0 ? filterChains : undefined,
+      }));
+    let chains = chainsArg?.length ? chainsArg : [];
 
     if (origin && destination) {
       chains.push(origin);
@@ -322,14 +517,12 @@ const send: CommandModuleWithWriteContext<
     }
 
     const supportedChains = new Set(
-      warpCoreConfig.tokens
-        .map((t) => t.chainName)
-        .sort((a, b) => a.localeCompare(b)),
+      warpCoreConfig.tokens.map((t) => t.chainName),
     );
 
     // Check if any of the chain selection through --chains or --origin & --destination are not in the warp core
     const unsupportedChains = difference(
-      new Set([...(chainsToSend || []), origin, destination].filter(Boolean)),
+      new Set([...(chainsArg || []), origin, destination].filter(Boolean)),
       supportedChains,
     );
     assert(
@@ -337,12 +530,34 @@ const send: CommandModuleWithWriteContext<
       `Chain(s) ${[...unsupportedChains].join(', ')} are not part of the warp route.`,
     );
 
-    chains =
-      chains.length === 0
-        ? [...supportedChains]
-        : [...intersection(new Set(chains), supportedChains)];
+    // When origin & destination are explicitly provided, preserve duplicates
+    // for same-chain transfers (e.g., origin=anvil2, destination=anvil2).
+    // Only deduplicate when using --chains or auto-selecting from config.
+    if (origin && destination) {
+      chains = [origin, destination];
+    } else {
+      const orderedDefaultChains = getOrderedWarpSendChains(
+        supportedChains,
+        context.multiProvider,
+      );
+
+      chains =
+        chains.length === 0
+          ? orderedDefaultChains
+          : [...intersection(new Set(chains), supportedChains)];
+    }
 
     if (roundTrip) {
+      // Round-trip requires all chains to be EVM-like since non-EVM chains
+      // become intermediate origins in the reversed path.
+      const nonEvmChains = chains.filter(
+        (chain) => !isEVMLike(context.multiProvider.getProtocol(chain)),
+      );
+      assert(
+        nonEvmChains.length === 0,
+        `--round-trip is not supported with non-EVM chains (${nonEvmChains.join(', ')}). ` +
+          `Non-EVM chains cannot be intermediate hop origins.`,
+      );
       // Appends the reverse of the array, excluding the 1st (e.g. [1,2,3] becomes [1,2,3,2,1])
       const reversed = [...chains].reverse().slice(1, chains.length + 1);
       chains = [...chains, ...reversed];
@@ -359,6 +574,13 @@ const send: CommandModuleWithWriteContext<
       skipWaitForDelivery: quick,
       selfRelay: relay,
       skipValidation,
+      predicateApiKey,
+      predicateApiUrl,
+      attestation,
+      sourceToken,
+      destinationToken,
+      feeQuotingUrl,
+      feeQuotingApiKey,
     });
     logGreen(
       `✅ Successfully sent messages for chains: ${chains.join(' ➡️ ')}`,
@@ -367,66 +589,108 @@ const send: CommandModuleWithWriteContext<
   },
 };
 
-export const check: CommandModuleWithContext<SelectWarpRouteBuilder> = {
+export const check: CommandModuleWithContext<
+  WarpRouteOptions & {
+    ica?: boolean;
+    origin?: string;
+    originOwner?: string;
+    chains?: string[];
+  }
+> = {
   command: 'check',
   describe:
     'Verifies that a warp route configuration matches the on chain configuration.',
-  builder: SELECT_WARP_ROUTE_BUILDER,
-  handler: async ({ context, symbol, warp, warpRouteId, config }) => {
+  builder: {
+    ...WARP_ROUTE_OPTIONS,
+    ica: {
+      type: 'boolean',
+      description:
+        'Check that destination chain owners match expected ICA addresses derived from origin chain owner',
+      default: false,
+    },
+    origin: {
+      type: 'string',
+      description:
+        'The origin chain to use for verification. Required when using --ica.',
+      implies: 'ica',
+    },
+    originOwner: {
+      type: 'string',
+      description:
+        'Override the origin owner address instead of reading from warp deploy config.',
+      implies: 'origin',
+    },
+    chains: stringArrayOptionConfig({
+      description:
+        'List of chains to check. Defaults to all chains except origin when using --ica.',
+      implies: 'ica',
+    }),
+  },
+  handler: async ({
+    context,
+    warpRouteId,
+    ica,
+    origin,
+    originOwner,
+    chains,
+  }) => {
     logCommandHeader('Hyperlane Warp Check');
 
-    let { warpCoreConfig, warpDeployConfig } = await getWarpConfigs({
-      context,
-      warpRouteId,
-      symbol,
-      warpDeployConfigPath: config,
-      warpCoreConfigPath: warp,
-    });
+    // CROSS route case: resolver set warpCoreConfig but not warpDeployConfig
+    // (combined CROSS routes have no deploy config of their own)
+    if (context.warpCoreConfig && !context.warpDeployConfig) {
+      assert(
+        !ica,
+        'Cannot perform ICA owner check for combined CROSS routes (no deploy config)',
+      );
+      assert(
+        context.resolvedWarpRouteId,
+        'resolvedWarpRouteId must be set for CROSS routes',
+      );
+      const result = await checkCrossCollateralWarpRoute({
+        context,
+        warpCoreConfig: context.warpCoreConfig,
+        warpRouteId: context.resolvedWarpRouteId,
+      });
+      await runWarpRouteCheck({ result });
+      process.exit(0);
+    }
+
+    let { warpCoreConfig, warpDeployConfig } =
+      await getWarpConfigsFromContextOrRegistry({
+        context,
+        warpRouteId,
+      });
+
+    // If --ica flag is set, run ICA owner check instead of the regular config check
+    // Note: ICA check uses full warpDeployConfig (not filtered) to support pre-deployed chains
+    if (ica) {
+      assert(origin, '--origin is required when using --ica');
+
+      await runWarpIcaOwnerCheck({
+        context,
+        warpDeployConfig,
+        origin,
+        originOwner,
+        chains: chains?.length ? chains : undefined,
+      });
+
+      process.exit(0);
+    }
 
     ({ warpCoreConfig, warpDeployConfig } = filterWarpConfigsToMatchingChains(
       warpDeployConfig,
       warpCoreConfig,
     ));
 
-    const deployedRoutersAddresses =
-      getRouterAddressesFromWarpCoreConfig(warpCoreConfig);
-
-    // Remove any non EVM chain configs to avoid the checker crashing
-    warpCoreConfig.tokens = warpCoreConfig.tokens.filter(
-      (config) =>
-        context.multiProvider.getProtocol(config.chainName) ===
-        ProtocolType.Ethereum,
-    );
-
-    // Get on-chain config
-    const onChainWarpConfig = await getWarpRouteConfigsByCore({
-      context,
+    const result = await checkWarpRouteDeployConfig({
+      multiProvider: context.multiProvider,
       warpCoreConfig,
-    });
-
-    // get virtual on-chain config
-    const expandedOnChainWarpConfig = await expandVirtualWarpDeployConfig({
-      multiProvider: context.multiProvider,
-      onChainWarpConfig,
-      deployedRoutersAddresses,
-    });
-
-    let expandedWarpDeployConfig = await expandWarpDeployConfig({
-      multiProvider: context.multiProvider,
-      altVmProviders: context.altVmProviders,
       warpDeployConfig,
-      deployedRoutersAddresses,
-      expandedOnChainWarpConfig,
     });
-    expandedWarpDeployConfig = objFilter(
-      expandedWarpDeployConfig,
-      (chain, _config): _config is any =>
-        context.multiProvider.getProtocol(chain) === ProtocolType.Ethereum,
-    );
 
     await runWarpRouteCheck({
-      onChainWarpConfig: expandedOnChainWarpConfig,
-      warpRouteConfig: expandedWarpDeployConfig,
+      result,
     });
 
     process.exit(0);
@@ -563,19 +827,16 @@ export const rebalancer: CommandModuleWithWriteContext<{
   },
 };
 
-export const verify: CommandModuleWithWriteContext<SelectWarpRouteBuilder> = {
+export const verify: CommandModuleWithWriteContext<WarpRouteOptions> = {
   command: 'verify',
   describe: 'Verify deployed contracts on explorers',
-  builder: SELECT_WARP_ROUTE_BUILDER,
-  handler: async ({ context, symbol, config, warp, warpRouteId }) => {
+  builder: WARP_ROUTE_OPTIONS,
+  handler: async ({ context, warpRouteId }) => {
     logCommandHeader('Hyperlane Warp Verify');
 
-    const { warpCoreConfig } = await getWarpConfigs({
+    const { warpCoreConfig } = await getWarpConfigsFromContextOrRegistry({
       context,
-      symbol,
       warpRouteId,
-      warpDeployConfigPath: config,
-      warpCoreConfigPath: warp,
     });
 
     return runVerifyWarpRoute({ context, warpCoreConfig });
@@ -583,44 +844,38 @@ export const verify: CommandModuleWithWriteContext<SelectWarpRouteBuilder> = {
 };
 
 const fork: CommandModuleWithContext<
-  SelectWarpRouteBuilder & {
+  WarpRouteOptions & {
     port?: number;
     'fork-config'?: string;
     kill: boolean;
   }
 > = {
   command: 'fork',
-  describe: 'Fork a Hyperlane chain on a compatible Anvil/Hardhat node',
+  describe:
+    'Fork warp route chains (Anvil for EVM, arc-anvil for Arc, surfpool for Sealevel) and replay governance transactions',
   builder: {
     ...forkCommandOptions,
-    ...SELECT_WARP_ROUTE_BUILDER,
+    ...WARP_ROUTE_OPTIONS,
   },
   handler: async ({
     context,
-    symbol,
     warpRouteId,
     port,
     kill,
-    warp,
-    config,
     forkConfig: forkConfigPath,
   }) => {
-    let forkConfig: RawForkedChainConfigByChain;
+    let forkConfig: ForkConfigByChain;
     if (forkConfigPath) {
-      forkConfig = RawForkedChainConfigByChainSchema.parse(
+      forkConfig = ForkConfigByChainSchema.parse(
         readYamlOrJson(forkConfigPath),
       );
     } else {
       forkConfig = {};
     }
 
-    // Get chains from warp deploy config
-    const { warpDeployConfig } = await getWarpConfigs({
+    const { warpDeployConfig } = await getWarpConfigsFromContextOrRegistry({
       context,
       warpRouteId,
-      symbol,
-      warpDeployConfigPath: config,
-      warpCoreConfigPath: warp,
     });
     const chainsToFork = new Set(Object.keys(warpDeployConfig));
     logBlue(

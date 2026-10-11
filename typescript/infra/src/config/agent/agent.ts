@@ -2,8 +2,11 @@ import {
   AgentChainMetadata,
   AgentSealevelPriorityFeeOracle,
   AgentSealevelTransactionSubmitter,
+  AgentSealevelUrReveal,
   AgentSignerAwsKey,
+  AgentSignerGcpKey,
   AgentSignerKeyType,
+  ChainMap,
   ChainName,
   RpcConsensusType,
 } from '@hyperlane-xyz/sdk';
@@ -12,16 +15,20 @@ import { ProtocolType, objMap } from '@hyperlane-xyz/utils';
 import { Contexts } from '../../../config/contexts.js';
 import { getChain } from '../../../config/registry.js';
 import { AgentChainNames, AgentRole, Role } from '../../roles.js';
-import { DeployEnvironment } from '../environment.js';
-import { HelmImageValues } from '../infrastructure.js';
+import type { DeployEnvironment } from '../deploy-environment.js';
+import type { HelmImageValues } from '../infrastructure.js';
 
-import {
+import type {
   BaseRelayerConfig,
   HelmRelayerChainValues,
   HelmRelayerValues,
 } from './relayer.js';
-import { BaseScraperConfig, HelmScraperValues } from './scraper.js';
-import {
+import type { BaseScraperConfig, HelmScraperValues } from './scraper.js';
+import type {
+  HelmScraperProxyValues,
+  ScraperProxyConfig,
+} from './scraper-proxy.js';
+import type {
   HelmValidatorValues,
   ValidatorBaseChainConfigMap,
 } from './validator.js';
@@ -35,10 +42,16 @@ export type DeepPartial<T> = T extends object
 // See rust/main/helm/values.yaml for the full list of options and their defaults.
 // This is the root object in the values file.
 export interface HelmRootAgentValues {
+  fullnameOverride?: string;
   image: HelmImageValues;
   hyperlane: HelmHyperlaneValues;
   nameOverride?: string;
   tolerations?: KubernetesToleration[];
+  nodeSelector?: Record<string, string>;
+  serviceAccount?: {
+    name?: string;
+    annotations?: Record<string, string>;
+  };
 }
 
 // See rust/main/helm/values.yaml for the full list of options and their defaults.
@@ -55,12 +68,12 @@ interface HelmHyperlaneValues {
   relayer?: HelmRelayerValues;
   relayerChains?: HelmRelayerChainValues[];
   scraper?: HelmScraperValues;
+  scraperProxy?: HelmScraperProxyValues;
 }
 
 // See rust/main/helm/values.yaml for the full list of options and their defaults.
 // This is at `.hyperlane.chains` in the values file.
-export interface HelmAgentChainOverride
-  extends DeepPartial<AgentChainMetadata> {
+export interface HelmAgentChainOverride extends DeepPartial<AgentChainMetadata> {
   name: AgentChainMetadata['name'];
 }
 
@@ -69,8 +82,10 @@ export interface RootAgentConfig extends AgentContextConfig {
   relayer?: AgentRoleConfig & BaseRelayerConfig;
   validators?: AgentRoleConfig & {
     chains: ValidatorBaseChainConfigMap;
+    websocketUrl?: string;
   };
   scraper?: AgentRoleConfig & BaseScraperConfig;
+  scraperProxy?: ScraperProxyConfig;
 }
 
 interface AgentEnvConfig {
@@ -83,6 +98,7 @@ export interface AgentContextConfig extends AgentEnvConfig {
   namespace: string;
   context: Contexts;
   aws?: AwsConfig;
+  gcp?: GcpConfig;
   // Roles to manage keys for
   rolesWithKeys: Role[];
   // Names of chains this context cares about (subset of environmentChainNames)
@@ -91,12 +107,14 @@ export interface AgentContextConfig extends AgentEnvConfig {
 }
 
 export interface SealevelAgentConfig {
+  maxSupportedTransactionVersionGetter?: (chain: ChainName) => 0 | 1;
   priorityFeeOracleConfigGetter?: (
     chain: ChainName,
   ) => AgentSealevelPriorityFeeOracle;
   transactionSubmitterConfigGetter?: (
     chain: ChainName,
   ) => AgentSealevelTransactionSubmitter;
+  urRevealConfigGetter?: (chain: ChainName) => AgentSealevelUrReveal;
 }
 
 // An ugly way to mark a URL as a the secret Helius URL when Helm templating
@@ -108,9 +126,13 @@ interface AgentRoleConfig {
   docker: DockerConfig;
   chainDockerOverrides?: Record<ChainName, Partial<DockerConfig>>;
   resources?: KubernetesResources;
+  // Optional per-chain overrides for resources (currently used for validator tiering).
+  chainResourceOverrides?: ChainMap<KubernetesResources>;
 
   // Agent-specific
   rpcConsensusType: RpcConsensusType;
+  fallbackHedgeDelayMillis?: number;
+  fallbackHedgeTimeoutMillis?: number;
   index?: IndexingConfig;
 }
 
@@ -132,19 +154,25 @@ export type RadixKeyConfig = {
   type: AgentSignerKeyType.Radix;
   suffix: string;
 };
+// Cloud KMS-backed key. `keyVersionName` is the full CryptoKeyVersion resource
+// name (GetPublicKey/AsymmetricSign require the version, not just the key).
+export type GcpKeyConfig = Required<AgentSignerGcpKey>;
 export type KeyConfig =
   | AwsKeyConfig
+  | GcpKeyConfig
   | HexKeyConfig
   | CosmosKeyConfig
   | StarknetKeyConfig
   | RadixKeyConfig;
-interface IndexingConfig {
-  from: number;
-  chunk: number;
-}
+type IndexingConfig = NonNullable<AgentChainMetadata['index']>;
 
 export interface AwsConfig {
   region: string;
+}
+
+export interface GcpConfig {
+  project: string;
+  location: string;
 }
 
 export interface DockerConfig {
@@ -176,6 +204,7 @@ export class RootAgentConfigHelper implements AgentContextConfig {
   namespace: string;
   runEnv: DeployEnvironment;
   aws?: AwsConfig;
+  gcp?: GcpConfig;
   rolesWithKeys: Role[];
   contextChainNames: AgentChainNames;
   environmentChainNames: ChainName[];
@@ -185,6 +214,7 @@ export class RootAgentConfigHelper implements AgentContextConfig {
     this.context = root.context;
     this.namespace = root.namespace;
     this.aws = root.aws;
+    this.gcp = root.gcp;
     this.runEnv = root.runEnv;
     this.rolesWithKeys = root.rolesWithKeys;
     this.contextChainNames = root.contextChainNames;
@@ -229,6 +259,14 @@ export abstract class AgentConfigHelper<
     }
     return this.agentRoleConfig.docker;
   }
+
+  // If the provided chain has a resource override, return it, otherwise the default.
+  resourcesForChain(chainName: ChainName): KubernetesResources | undefined {
+    return (
+      this.agentRoleConfig.chainResourceOverrides?.[chainName] ??
+      this.agentRoleConfig.resources
+    );
+  }
 }
 
 export const allAgentChainNames = (agentChainNames: AgentChainNames) => [
@@ -249,7 +287,7 @@ export function defaultChainSignerKeyConfig(chainName: ChainName): KeyConfig {
         );
       }
       return { type: AgentSignerKeyType.Cosmos, prefix: metadata.bech32Prefix };
-    case ProtocolType.Radix:
+    case ProtocolType.Radix: {
       // get the suffix based on the chain id
       let suffix: string;
       switch (metadata.chainId) {
@@ -263,11 +301,13 @@ export function defaultChainSignerKeyConfig(chainName: ChainName): KeyConfig {
           suffix = 'rdx';
       }
       return { type: AgentSignerKeyType.Radix, suffix: suffix };
+    }
     // Use starknet key for starknet & paradexsepolia
     case ProtocolType.Starknet: {
       return { type: AgentSignerKeyType.Starknet, legacy: false };
     }
-    // For Ethereum and Sealevel use a hex key
+    // For Ethereum, Tron, and Sealevel use a hex key
+    case ProtocolType.Tron:
     case ProtocolType.Ethereum:
     case ProtocolType.Sealevel:
     default:

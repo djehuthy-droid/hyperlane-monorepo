@@ -30,6 +30,7 @@ mockall::mock! {
         async fn tx_status(&self, tx: &Transaction) -> Result<TransactionStatus, LanderError>;
         async fn tx_ready_for_resubmission(&self, _tx: &Transaction) -> bool;
         async fn reverted_payloads(&self, tx: &Transaction) -> Result<Vec<PayloadDetails>, LanderError>;
+        async fn payload_delivered(&self, payload: &PayloadDetails) -> Result<bool, LanderError>;
         fn estimated_block_time(&self) -> &std::time::Duration;
         fn max_batch_size(&self) -> u32;
         fn update_vm_specific_metrics(&self, _tx: &Transaction, _metrics: &DispatcherMetrics);
@@ -37,6 +38,7 @@ mockall::mock! {
         async fn replace_tx(&self, _tx: &Transaction) -> Result<(), LanderError>;
         fn reprocess_txs_poll_rate(&self) -> Option<std::time::Duration>;
         async fn get_reprocess_txs(&self) -> Result<Vec<Transaction>, LanderError>;
+        async fn post_finalized(&self) -> Result<(), LanderError>;
     }
 }
 

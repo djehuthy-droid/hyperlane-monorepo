@@ -13,6 +13,7 @@ import {
 import {
   Address,
   Domain,
+  LazyAsync,
   Numberish,
   ProtocolType,
   addressToBytes32,
@@ -22,7 +23,7 @@ import {
 } from '@hyperlane-xyz/utils';
 
 import { BaseStarknetAdapter } from '../../app/MultiProtocolApp.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
 import { ChainName } from '../../types.js';
 import {
   getStarknetEtherContract,
@@ -48,11 +49,13 @@ export class StarknetTokenAdapter
   extends BaseStarknetAdapter
   implements ITokenAdapter<Call>
 {
-  private tokenContract?: Contract;
+  private readonly tokenContract = new LazyAsync(() =>
+    this.createContractInstance(),
+  );
 
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { tokenAddress: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -61,31 +64,30 @@ export class StarknetTokenAdapter
   // This function returns the Contract instance for the given token
   // If the contract is a Proxy: retrieves the implementation contract ABI and returns that Contract
   // If the contract is not a Proxy: returns the contract with the token address ABI
-  async getContractInstance(): Promise<Contract> {
-    if (this.tokenContract) {
-      return this.tokenContract;
-    }
+  getContractInstance(): Promise<Contract> {
+    return this.tokenContract.get();
+  }
 
+  private async createContractInstance(): Promise<Contract> {
     const provider = this.getProvider();
     const { abi } = await provider.getClassAt(this.addresses.tokenAddress);
-    const contractInstance = new Contract(
+    const contractInstance = new Contract({
       abi,
-      this.addresses.tokenAddress,
-      provider,
-    );
+      address: this.addresses.tokenAddress,
+      providerOrAccount: provider,
+    });
 
     if (contractInstance.get_implementation) {
       const { implementation } = await contractInstance.get_implementation();
       const contractClass = await provider.getClassByHash(implementation);
-      const implementationContract = new Contract(
-        contractClass.abi,
-        this.addresses.tokenAddress,
-        provider,
-      );
-      return (this.tokenContract = implementationContract);
+      const implementationContract = new Contract({
+        abi: contractClass.abi,
+        address: this.addresses.tokenAddress,
+        providerOrAccount: provider,
+      });
+      return implementationContract;
     }
 
-    this.tokenContract = contractInstance;
     return contractInstance;
   }
 
@@ -177,7 +179,7 @@ class BaseStarknetHypTokenAdapter
 
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { warpRouter: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -249,7 +251,7 @@ export class StarknetHypSyntheticAdapter
 {
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { warpRouter: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -319,11 +321,13 @@ export class StarknetHypSyntheticAdapter
 
 export class StarknetHypCollateralAdapter extends StarknetHypSyntheticAdapter {
   public readonly collateralContract: Contract;
-  protected wrappedTokenAddress?: Address;
+  protected readonly wrappedTokenAddress = new LazyAsync(() =>
+    this.loadWrappedTokenAddress(),
+  );
 
   constructor(
     chainName: ChainName,
-    multiProvider: MultiProtocolProvider,
+    multiProvider: MultiProviderAdapter,
     addresses: { warpRouter: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -334,12 +338,11 @@ export class StarknetHypCollateralAdapter extends StarknetHypSyntheticAdapter {
   }
 
   protected async getWrappedTokenAddress(): Promise<Address> {
-    if (!this.wrappedTokenAddress) {
-      this.wrappedTokenAddress = num.toHex64(
-        await this.collateralContract.get_wrapped_token(),
-      );
-    }
-    return this.wrappedTokenAddress!;
+    return this.wrappedTokenAddress.get();
+  }
+
+  protected async loadWrappedTokenAddress(): Promise<Address> {
+    return num.toHex64(await this.collateralContract.get_wrapped_token());
   }
 
   protected async getWrappedTokenAdapter(): Promise<StarknetTokenAdapter> {
@@ -383,7 +386,7 @@ export class StarknetHypNativeAdapter extends StarknetHypSyntheticAdapter {
 
   constructor(
     chainName: ChainName,
-    multiProvider: MultiProtocolProvider,
+    multiProvider: MultiProviderAdapter,
     addresses: { warpRouter: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -437,12 +440,11 @@ export class StarknetHypNativeAdapter extends StarknetHypSyntheticAdapter {
     const nonOption = new CairoOption(CairoOptionVariant.None);
     const amount = BigInt(weiAmountOrId.toString());
     const gasAmount = BigInt(interchainGas?.igpQuote.amount.toString() ?? '0');
-    const totalAmount = amount + gasAmount;
     return this.collateralContract.populateTransaction.transfer_remote(
       destination,
       cairo.uint256(addressToBytes32(recipient)),
       cairo.uint256(amount),
-      cairo.uint256(totalAmount),
+      cairo.uint256(gasAmount),
       nonOption,
       nonOption,
     );
@@ -455,7 +457,7 @@ export class StarknetHypFeeAdapter extends StarknetHypSyntheticAdapter {
 
   constructor(
     chainName: ChainName,
-    multiProvider: MultiProtocolProvider,
+    multiProvider: MultiProviderAdapter,
     addresses: { warpRouter: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -505,12 +507,11 @@ export class StarknetHypFeeAdapter extends StarknetHypSyntheticAdapter {
     const nonOption = new CairoOption(CairoOptionVariant.None);
     const amount = BigInt(weiAmountOrId.toString());
     const gasAmount = BigInt(interchainGas?.igpQuote.amount.toString() ?? '0');
-    const totalAmount = amount + gasAmount;
     return this.collateralContract.populateTransaction.transfer_remote(
       destination,
       cairo.uint256(addressToBytes32(recipient)),
       cairo.uint256(amount),
-      cairo.uint256(totalAmount),
+      cairo.uint256(gasAmount),
       nonOption,
       nonOption,
     );

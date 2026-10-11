@@ -1,4 +1,11 @@
-import { Address, ProtocolType, assert } from '@hyperlane-xyz/utils';
+import {
+  Address,
+  ProtocolType,
+  assert,
+  bytes32ToAddress,
+  formatStandardHookMetadata,
+  normalizeAddressEvm,
+} from '@hyperlane-xyz/utils';
 
 import {
   InterchainAccount,
@@ -15,7 +22,7 @@ import { CallData } from '../types.js';
 import { TxSubmitterInterface } from './TxSubmitterInterface.js';
 import { TxSubmitterType } from './TxSubmitterTypes.js';
 import { EvmIcaTxSubmitterProps } from './ethersV5/types.js';
-import { getSubmitter } from './submitterBuilderGetter.js';
+import type { SubmitterGetter } from './types.js';
 
 type EvmIcaTxSubmitterConstructorConfig = Omit<
   EvmIcaTxSubmitterProps,
@@ -24,9 +31,7 @@ type EvmIcaTxSubmitterConstructorConfig = Omit<
   originInterchainAccountRouter: Address;
 };
 
-export class EvmIcaTxSubmitter
-  implements TxSubmitterInterface<ProtocolType.Ethereum>
-{
+export class EvmIcaTxSubmitter implements TxSubmitterInterface<ProtocolType.Ethereum> {
   readonly txSubmitterType: TxSubmitterType =
     TxSubmitterType.INTERCHAIN_ACCOUNT;
 
@@ -41,6 +46,7 @@ export class EvmIcaTxSubmitter
     config: EvmIcaTxSubmitterProps,
     multiProvider: MultiProvider,
     coreAddressesByChain: Readonly<ChainMap<Record<string, string>>>,
+    getSubmitterFn: SubmitterGetter,
   ): Promise<EvmIcaTxSubmitter> {
     const interchainAccountRouterAddress: Address | undefined =
       config.originInterchainAccountRouter ??
@@ -50,7 +56,21 @@ export class EvmIcaTxSubmitter
       `Origin chain InterchainAccountRouter address not supplied and none found in the registry metadata for chain ${config.chain}`,
     );
 
-    const internalSubmitter = await getSubmitter<ProtocolType.Ethereum>(
+    // Canonicalize only the origin-side addresses up front so a config value
+    // with a valid shape but bad EIP-55 casing doesn't throw deep inside ethers
+    // mid-submission. The origin chain is EVM here (this is the EVM ICA
+    // submitter), so `owner` and the origin router are safe to normalize. The
+    // destination router and ISM live on the remote chain, whose protocol we do
+    // not assume is EVM, so they are passed through untouched.
+    const owner = normalizeAddressEvm(config.owner);
+    const originInterchainAccountRouter = normalizeAddressEvm(
+      interchainAccountRouterAddress,
+    );
+    const destinationInterchainAccountRouter =
+      config.destinationInterchainAccountRouter;
+    const interchainSecurityModule = config.interchainSecurityModule;
+
+    const internalSubmitter = await getSubmitterFn<ProtocolType.Ethereum>(
       multiProvider,
       config.internalSubmitter,
       coreAddressesByChain,
@@ -61,20 +81,22 @@ export class EvmIcaTxSubmitter
         multiProvider,
         config.chain,
         {
-          owner: config.owner,
+          owner,
           origin: config.chain,
-          localRouter: interchainAccountRouterAddress,
-          ismOverride: config.interchainSecurityModule,
+          localRouter: originInterchainAccountRouter,
+          ismOverride: interchainSecurityModule,
         },
         coreAddressesByChain,
       );
 
     return new EvmIcaTxSubmitter(
       {
-        owner: config.owner,
+        owner,
         chain: config.chain,
         destinationChain: config.destinationChain,
-        originInterchainAccountRouter: interchainAccountRouterAddress,
+        originInterchainAccountRouter,
+        destinationInterchainAccountRouter,
+        interchainSecurityModule,
       },
       internalSubmitter,
       multiProvider,
@@ -128,22 +150,41 @@ export class EvmIcaTxSubmitter
       },
     );
 
+    const refundAddress = bytes32ToAddress(this.config.owner);
+    const icaConfig = {
+      origin: this.config.chain,
+      owner: this.config.owner,
+      ismOverride: this.config.interchainSecurityModule,
+      routerOverride: this.config.destinationInterchainAccountRouter,
+      localRouter: this.config.originInterchainAccountRouter,
+    };
+    const gasLimit = await this.interchainAccountApp.estimateIcaHandleGas({
+      origin: this.config.chain,
+      destination: this.config.destinationChain,
+      innerCalls,
+      config: icaConfig,
+    });
+    const hookMetadata = formatStandardHookMetadata({
+      refundAddress,
+      gasLimit: gasLimit.toBigInt(),
+    });
+
     const icaTx = await this.interchainAccountApp.getCallRemote({
       chain: this.config.chain,
       destination: this.config.destinationChain,
       innerCalls,
-      config: {
-        origin: this.config.chain,
-        owner: this.config.owner,
-        ismOverride: this.config.interchainSecurityModule,
-        routerOverride: this.config.destinationInterchainAccountRouter,
-        localRouter: this.config.originInterchainAccountRouter,
-      },
+      config: icaConfig,
+      hookMetadata,
     });
 
     return this.submitter.submit({
       chainId: this.multiProvider.getDomainId(this.config.chain),
       ...icaTx,
+      // callRemote derives the ICA from msg.sender, so `from` must be the owner (not the
+      // populating signer) for file output to be self-describing. Live submitters are
+      // unaffected: MultiProvider.sendTransaction calls prepareTx with no `from`, which
+      // overwrites tx.from with getSignerAddress(chain).
+      from: bytes32ToAddress(this.config.owner),
     });
   }
 }

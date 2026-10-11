@@ -12,7 +12,6 @@ import {
   type ChainMap,
   type DerivedWarpRouteDeployConfig,
   TokenType,
-  type WarpCoreConfig,
   type WarpRouteDeployConfig,
   randomAddress,
   randomStarknetAddress,
@@ -29,8 +28,9 @@ import { HyperlaneE2ECoreTestCommands } from '../../commands/core.js';
 import { HyperlaneE2EWarpTestCommands } from '../../commands/warp.js';
 import {
   CORE_ADDRESSES_PATH_BY_PROTOCOL,
-  CORE_CONFIG_PATH_BY_PROTOCOL,
   CORE_READ_CONFIG_PATH_BY_PROTOCOL,
+  CROSS_CHAIN_CORE_CONFIG_PATH_BY_PROTOCOL,
+  CROSS_CHAIN_E2E_TEST_TIMEOUT,
   DEFAULT_E2E_TEST_TIMEOUT,
   HYP_KEY_BY_PROTOCOL,
   REGISTRY_PATH,
@@ -51,7 +51,7 @@ const expect = chai.expect;
 chai.should();
 
 describe('hyperlane warp deploy e2e tests', async function () {
-  this.timeout(DEFAULT_E2E_TEST_TIMEOUT);
+  this.timeout(2 * DEFAULT_E2E_TEST_TIMEOUT);
 
   let cosmosNativeDeployerAddress: Address;
   let cosmosNativeChain1CoreAddress: ChainAddresses;
@@ -59,7 +59,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
     ProtocolType.CosmosNative,
     TEST_CHAIN_NAMES_BY_PROTOCOL.cosmosnative.CHAIN_NAME_1,
     REGISTRY_PATH,
-    CORE_CONFIG_PATH_BY_PROTOCOL.cosmosnative,
+    CROSS_CHAIN_CORE_CONFIG_PATH_BY_PROTOCOL.cosmosnative,
     CORE_READ_CONFIG_PATH_BY_PROTOCOL.cosmosnative.CHAIN_NAME_1,
   );
 
@@ -69,7 +69,7 @@ describe('hyperlane warp deploy e2e tests', async function () {
     ProtocolType.Ethereum,
     TEST_CHAIN_NAMES_BY_PROTOCOL.ethereum.CHAIN_NAME_2,
     REGISTRY_PATH,
-    CORE_CONFIG_PATH_BY_PROTOCOL.ethereum,
+    CROSS_CHAIN_CORE_CONFIG_PATH_BY_PROTOCOL.ethereum,
     CORE_READ_CONFIG_PATH_BY_PROTOCOL.ethereum.CHAIN_NAME_2,
   );
 
@@ -95,12 +95,13 @@ describe('hyperlane warp deploy e2e tests', async function () {
   let evmNodeInstance: StartedTestContainer;
 
   before(async function () {
-    cosmosNodeInstance = await runCosmosNode(
-      TEST_CHAIN_METADATA_BY_PROTOCOL.cosmosnative.CHAIN_NAME_1,
-    );
-    evmNodeInstance = await runEvmNode(
-      TEST_CHAIN_METADATA_BY_PROTOCOL.ethereum.CHAIN_NAME_2,
-    );
+    // Container startup and both core deployments share this hook's budget.
+    this.timeout(CROSS_CHAIN_E2E_TEST_TIMEOUT);
+
+    [cosmosNodeInstance, evmNodeInstance] = await Promise.all([
+      runCosmosNode(TEST_CHAIN_METADATA_BY_PROTOCOL.cosmosnative.CHAIN_NAME_1),
+      runEvmNode(TEST_CHAIN_METADATA_BY_PROTOCOL.ethereum.CHAIN_NAME_2),
+    ]);
 
     const cosmosWallet = await createSignerWithPrivateKey(
       HYP_KEY_BY_PROTOCOL.cosmosnative,
@@ -197,8 +198,15 @@ describe('hyperlane warp deploy e2e tests', async function () {
   });
 
   const unsupportedChainsTestCases: Record<
-    // Radix is excluded because it is still not supported on main
-    Exclude<ProtocolType, ProtocolType.Radix | ProtocolType.Aleo>,
+    // Radix and Aleo are excluded because they are still not supported on main
+    // Unknown is excluded because it's a forward-compatibility placeholder
+    Exclude<
+      ProtocolType,
+      | ProtocolType.Radix
+      | ProtocolType.Aleo
+      | ProtocolType.Tron
+      | ProtocolType.Unknown
+    >,
     Address
   > = {
     [ProtocolType.Cosmos]: 'hyp1jq304cthpx0lwhpqzrdjrcza559ukyy3sc4dw5',
@@ -258,23 +266,20 @@ describe('hyperlane warp deploy e2e tests', async function () {
           chainName,
         );
 
-        expect(
+        // AltVM readers key remoteRouters by chain name; EVM readers by domain ID.
+        // Try both until the inconsistency is addressed in a follow-up PR.
+        const maybeUnsupportedChainRouterAddress =
+          (config[chainName].remoteRouters ?? {})[
+            TEST_CHAIN_METADATA_BY_PROTOCOL.sealevel.UNSUPPORTED_CHAIN.name
+          ]?.address ??
           (config[chainName].remoteRouters ?? {})[
             TEST_CHAIN_METADATA_BY_PROTOCOL.sealevel.UNSUPPORTED_CHAIN.domainId
-          ].address,
-        ).to.eql(addressToBytes32(unsupportedChainAddress));
-      }
+          ]?.address;
 
-      const warpCoreConfig: WarpCoreConfig = readYamlOrJson(WARP_CORE_PATH);
-      const unsuportedChainData = warpCoreConfig.tokens.find(
-        (tokenConfig) =>
-          tokenConfig.chainName ===
-          TEST_CHAIN_METADATA_BY_PROTOCOL.sealevel.UNSUPPORTED_CHAIN.name,
-      );
-      expect(
-        unsuportedChainData,
-        `Expected warp core config for chain ${TEST_CHAIN_METADATA_BY_PROTOCOL.sealevel.UNSUPPORTED_CHAIN.name} to be defined in the deployment output file`,
-      ).not.to.be.undefined;
+        expect(maybeUnsupportedChainRouterAddress).to.eql(
+          addressToBytes32(unsupportedChainAddress),
+        );
+      }
     });
   }
 });

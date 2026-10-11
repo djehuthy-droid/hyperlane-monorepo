@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # The script:
 # - uses the desired version of the solana cli for building programs
 # - resets the solana cli to the desired version after building programs
@@ -9,17 +11,17 @@
 # The first argument is the type of program to build
 PROGRAM_TYPE="${1:-all}"
 
-SOLANA_CLI_VERSION_FOR_BUILDING_PROGRAMS="1.14.20"
+source "$(dirname "${BASH_SOURCE[0]}")/toolchain.env"
 
 # The paths to the programs
-CORE_PROGRAM_PATHS=("mailbox" "ism/multisig-ism-message-id" "validator-announce" "hyperlane-sealevel-igp")
-TOKEN_PROGRAM_PATHS=("hyperlane-sealevel-token" "hyperlane-sealevel-token-collateral" "hyperlane-sealevel-token-native")
+CORE_PROGRAM_PATHS=("mailbox" "ism/multisig-ism-message-id" "ism/composite-ism" "ism/test-ism" "validator-announce" "hyperlane-sealevel-igp")
+TOKEN_PROGRAM_PATHS=("hyperlane-sealevel-token" "hyperlane-sealevel-token-collateral" "hyperlane-sealevel-token-cross-collateral" "hyperlane-sealevel-token-native" "hyperlane-sealevel-fee")
 
 build_program () {
     PROGRAM_PATH=$1
     log "Building $PROGRAM_PATH"
     pushd $PROGRAM_PATH
-    cargo build-sbf
+    cargo build-sbf --tools-version "$SBF_TOOLS_VERSION" -- --locked
     popd
 }
 
@@ -61,11 +63,18 @@ get_current_solana_cli_version () {
 
 set_solana_cli_version () {
     NEW_VERSION=$1
+    MAJOR_VERSION=$(echo $NEW_VERSION | cut -d. -f1)
 
-    if [ $NEW_VERSION == $SOLANA_CLI_VERSION_FOR_BUILDING_PROGRAMS ]; then
-        ./install-solana-1.14.20.sh
+    if [ "$MAJOR_VERSION" -ge 2 ] 2>/dev/null; then
+        # Agave CLI v2+: use agave-install if available, otherwise curl install
+        if command -v agave-install &> /dev/null; then
+            agave-install init $NEW_VERSION
+        else
+            sh -c "$(curl -sSfL https://release.anza.xyz/v$NEW_VERSION/install)"
+        fi
     else
-        sh -c "$(curl -sSfL https://release.anza.xyz/v$NEW_VERSION/install)"
+        # Pre-Agave (v1.x): use Solana Labs release
+        sh -c "$(curl -sSfL https://release.solana.com/v$NEW_VERSION/install)"
     fi
 }
 

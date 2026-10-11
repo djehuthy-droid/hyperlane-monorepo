@@ -1,0 +1,326 @@
+import {
+  ChainMap,
+  ChainSubmissionStrategy,
+  HypTokenRouterConfig,
+  IsmConfig,
+  IsmType,
+  TokenType,
+} from '@hyperlane-xyz/sdk';
+import { Address, assert } from '@hyperlane-xyz/utils';
+import { RouterConfigWithoutOwner } from '../../../../../src/config/warp.js';
+import { awIcas } from '../../governance/ica/aw.js';
+import { awProxyAdmins } from '../../governance/proxy-admin/aw.js';
+import { awSafes } from '../../governance/safe/aw.js';
+import {
+  WARP_FEES_TURNKEY_OWNER,
+  getWarpFeeOwner,
+} from '../../governance/utils.js';
+import { PAUSER, chainOwners } from '../../owners.js';
+import {
+  QUOTE_SIGNER,
+  SEALEVEL_WARP_ROUTE_HANDLER_GAS_AMOUNT,
+} from '../consts.js';
+import { usdtTokenAddresses } from '../tokens.js';
+import { WarpRouteIds } from '../warpIds.js';
+import {
+  getFixedRoutingFeeConfig,
+  getEclipseWarpStrategyConfig,
+  getRebalancingBridgesConfigFor,
+  getRebalancingUSDTConfigForChain,
+  scaleDownConfig,
+} from './utils.js';
+
+const contractVersion = '11.1.0';
+
+const chainTokenMetadata: Record<string, { name: string; symbol: string }> = {
+  ethereum: { name: 'Tether USD', symbol: 'USDT' },
+  tron: { name: 'Tether USD', symbol: 'USDT' },
+  bsc: { name: 'Tether USD', symbol: 'USDT' },
+  arbitrum: { name: 'USD₮0', symbol: 'USD₮0' },
+  solanamainnet: { name: 'USDT', symbol: 'USDT' },
+  eclipsemainnet: { name: 'USDT', symbol: 'USDT' },
+};
+
+const chainDecimals: Record<string, number> = {
+  ethereum: 6,
+  tron: 6,
+  arbitrum: 6,
+  solanamainnet: 6,
+  eclipsemainnet: 6,
+  bsc: 18,
+};
+
+const feeBps: Record<string, Record<string, number>> = {
+  ethereum: {
+    arbitrum: 3.1,
+    bsc: 15.0,
+    tron: 15.0,
+  },
+  arbitrum: {
+    ethereum: 6.4,
+    bsc: 15.0,
+    tron: 15.0,
+  },
+  bsc: {
+    ethereum: 15.0,
+    arbitrum: 15.0,
+    tron: 15.0,
+  },
+  tron: {
+    ethereum: 15.0,
+    arbitrum: 15.0,
+    bsc: 15.0,
+  },
+};
+
+// Convention: use the minimum decimals as the message encoding baseline.
+// The contract does not enforce this — each router independently applies its own scale.
+// We derive scales here so that all routers agree on the same message amount encoding.
+const MESSAGE_DECIMALS = Math.min(...Object.values(chainDecimals));
+
+// also including tron
+export const evmDeploymentChains = [
+  'ethereum',
+  'bsc',
+  'arbitrum',
+  'tron',
+] as const;
+
+export const nonEvmDeploymentChains = [
+  'eclipsemainnet',
+  'solanamainnet',
+] as const;
+
+const deploymentChains = [
+  ...evmDeploymentChains,
+  ...nonEvmDeploymentChains,
+] as const;
+
+export type DeploymentChain = (typeof deploymentChains)[number];
+
+// EVM chains with rebalancing support
+const rebalanceableCollateralChains = [
+  'ethereum',
+  'arbitrum',
+  'tron',
+] as const satisfies DeploymentChain[];
+
+const productionOwnersByChain: Record<DeploymentChain, string> = {
+  ethereum: awSafes.ethereum,
+  bsc: '0x269Af9E53192AF49a22ff47e30b89dE1375AE1fd', // ICA
+  arbitrum: '0xD2757Bbc28C80789Ed679f22Ac65597Cacf51A45', // ICA,
+  eclipsemainnet: chainOwners.eclipsemainnet.owner,
+  solanamainnet: chainOwners.solanamainnet.owner,
+  tron: awIcas.tron,
+};
+
+const PRODUCTION_PROGRAM_IDS = {
+  eclipsemainnet: '5g5ujyYUNvdydwyDVCpZwPpgYRqH5RYJRi156cxyE3me',
+  solanamainnet: 'Bk79wMjvpPCh5iQcCEjPWFcG1V2TfgdwaBsWBEYFYSNU', // Not yet enrolled
+};
+
+export interface EclipseUSDTWarpConfigOptions {
+  ownersByChain: Record<DeploymentChain, string>;
+  programIds: {
+    eclipsemainnet: string;
+    solanamainnet: string;
+  };
+  proxyAdmins: ChainMap<{ address?: string; owner: string }>;
+  /** When set, fee contracts use OffchainQuotedLinearFee with these signers */
+  quoteSigners?: string[];
+}
+
+// Per-EVM-leg inbound cap of ~$50k/day. The rate-limited ISM meters the message
+// amount, which is encoded in MESSAGE_DECIMALS (6) for every leg — including the
+// 18-decimal bsc leg, whose amount is scaled down to the 6-decimal message
+// baseline before dispatch — so the same value applies uniformly.
+// 50_000 * 1e6 = 50_000_000_000, rounded down to the nearest multiple of the
+// 1-day (86400s) window as the RateLimitedIsm requires: 49_999_939_200.
+const EVM_ISM_DAILY_MAX_CAPACITY = '49999939200';
+
+// 1-day refill window (seconds), matching the RateLimitedIsm default DURATION.
+const EVM_ISM_RATE_LIMIT_DURATION_SECONDS = 86_400n;
+
+// Aggregation ISM guarding each EVM leg (n-of-n, fail-closed):
+// 1. rateLimitedIsm — bounds a single-day drain, owned by the fast Turnkey key.
+// 2. pausableIsm — emergency stop, owned by the fast Turnkey key.
+// 3. defaultFallbackRoutingIsm — the actual verifier; empty domains fall back to
+//    the mailbox default ISM (preserving current verification), owned by the
+//    leg's governance owner.
+const getEvmInterchainSecurityModule = (
+  fallbackRoutingOwner: Address,
+): IsmConfig => ({
+  type: IsmType.AGGREGATION,
+  threshold: 3,
+  modules: [
+    {
+      type: IsmType.RATE_LIMITED,
+      maxCapacity: EVM_ISM_DAILY_MAX_CAPACITY,
+      duration: EVM_ISM_RATE_LIMIT_DURATION_SECONDS,
+      owner: PAUSER,
+    },
+    {
+      type: IsmType.PAUSABLE,
+      owner: PAUSER,
+      paused: false,
+    },
+    {
+      type: IsmType.FALLBACK_ROUTING,
+      domains: {},
+      owner: fallbackRoutingOwner,
+    },
+  ],
+});
+
+const getBaseEvmConfig = (
+  chain: DeploymentChain,
+  proxyAdmins: ChainMap<{ address?: string; owner: string }>,
+  legOwner: Address,
+  quoteSigners?: string[],
+) => {
+  const proxyAdmin = proxyAdmins[chain];
+  assert(proxyAdmin, `Missing proxyAdmin for chain ${chain}`);
+  const decimals = chainDecimals[chain];
+  assert(decimals != null, `Decimals not defined for ${chain}`);
+  const destinations = evmDeploymentChains.filter((c) => c !== chain);
+  const destinationFeeBps = feeBps[chain];
+  assert(destinationFeeBps, `Missing destination fee bps for ${chain}`);
+  const isTron = chain === 'tron';
+  // Tron stays on LinearFee by design, matching USDT/eni (AW-675): its flat-fee
+  // reimbursement model is managed through Tron-native governance. OQLF is
+  // technically supported; every other EVM leg uses the Turnkey fee-owner key.
+  const routingFeeOwner = isTron
+    ? getWarpFeeOwner(chain)
+    : WARP_FEES_TURNKEY_OWNER;
+  const chainQuoteSigners = isTron ? undefined : quoteSigners;
+  return {
+    ...chainTokenMetadata[chain],
+    proxyAdmin,
+    contractVersion: chain === 'ethereum' ? contractVersion : undefined,
+    decimals,
+    tokenFee: getFixedRoutingFeeConfig(
+      routingFeeOwner,
+      destinations,
+      destinationFeeBps,
+      undefined,
+      chainQuoteSigners,
+    ),
+    interchainSecurityModule: getEvmInterchainSecurityModule(legOwner),
+    ...scaleDownConfig(decimals, MESSAGE_DECIMALS),
+  };
+};
+
+export const buildEclipseUSDTWarpConfig = async (
+  routerConfig: ChainMap<RouterConfigWithoutOwner>,
+  options: EclipseUSDTWarpConfigOptions,
+): Promise<ChainMap<HypTokenRouterConfig>> => {
+  const { ownersByChain, programIds, proxyAdmins, quoteSigners } = options;
+
+  const rebalancingConfigByChain = getRebalancingBridgesConfigFor(
+    rebalanceableCollateralChains,
+    [WarpRouteIds.USDTOft, WarpRouteIds.USDTOftLegacy],
+  );
+
+  const configs: Array<[DeploymentChain, HypTokenRouterConfig]> = [];
+
+  // Configure EVM collateral chains
+  const rebalanceableSet = new Set<string>(rebalanceableCollateralChains);
+
+  for (const chain of rebalanceableCollateralChains) {
+    const baseConfig = getRebalancingUSDTConfigForChain(
+      chain,
+      routerConfig,
+      ownersByChain,
+      rebalancingConfigByChain,
+    );
+    configs.push([
+      chain,
+      {
+        ...baseConfig,
+        ...getBaseEvmConfig(
+          chain,
+          proxyAdmins,
+          ownersByChain[chain],
+          quoteSigners,
+        ),
+      },
+    ]);
+  }
+
+  for (const chain of evmDeploymentChains.filter(
+    (c) => !rebalanceableSet.has(c),
+  )) {
+    const usdtToken = usdtTokenAddresses[chain];
+    assert(usdtToken, `USDT address not defined for ${chain}`);
+    configs.push([
+      chain,
+      {
+        ...getBaseEvmConfig(
+          chain,
+          proxyAdmins,
+          ownersByChain[chain],
+          quoteSigners,
+        ),
+        type: TokenType.collateral,
+        token: usdtToken,
+        owner: ownersByChain[chain],
+        mailbox: routerConfig[chain].mailbox,
+      },
+    ]);
+  }
+
+  // Configure non-evm chains
+  configs.push([
+    'eclipsemainnet',
+    {
+      ...chainTokenMetadata.eclipsemainnet,
+      type: TokenType.synthetic,
+      mailbox: routerConfig.eclipsemainnet.mailbox,
+      foreignDeployment: programIds.eclipsemainnet,
+      owner: ownersByChain.eclipsemainnet,
+      hook: 'Hs7KVBU67nBnWhDPZkEFwWqrFMUfJbmY2DQ4gmCZfaZp', // //core-addresses.ts SVM_CORE_ADDRESSES, eclipse igpProgramId
+      gas: SEALEVEL_WARP_ROUTE_HANDLER_GAS_AMOUNT,
+      decimals: chainDecimals.eclipsemainnet,
+    },
+  ]);
+
+  configs.push([
+    'solanamainnet',
+    {
+      ...chainTokenMetadata.solanamainnet,
+      type: TokenType.collateral,
+      token: usdtTokenAddresses.solanamainnet,
+      mailbox: routerConfig.solanamainnet.mailbox,
+      foreignDeployment: programIds.solanamainnet,
+      owner: ownersByChain.solanamainnet,
+      hook: 'BhNcatUDC2D5JTyeaqrdSukiVFsEHK7e3hVmKMztwefv', //core-addresses.ts SVM_CORE_ADDRESSES, solana igpProgramId
+      gas: SEALEVEL_WARP_ROUTE_HANDLER_GAS_AMOUNT,
+      decimals: chainDecimals.solanamainnet,
+    },
+  ]);
+
+  return Object.fromEntries(configs);
+};
+
+export const getEclipseUSDTWarpConfig = async (
+  routerConfig: ChainMap<RouterConfigWithoutOwner>,
+): Promise<ChainMap<HypTokenRouterConfig>> =>
+  buildEclipseUSDTWarpConfig(routerConfig, {
+    ownersByChain: productionOwnersByChain,
+    programIds: PRODUCTION_PROGRAM_IDS,
+    proxyAdmins: awProxyAdmins,
+    quoteSigners: [QUOTE_SIGNER],
+  });
+
+// Strategies
+export const getEclipseUSDTStrategyConfig = (): ChainSubmissionStrategy => {
+  // CAST: The CLI-specific file feeSubmitter is not represented by SDK types.
+  return getEclipseWarpStrategyConfig({
+    route: 'usdt',
+    evmChains: evmDeploymentChains,
+    nonEvmChains: nonEvmDeploymentChains,
+    turnkeyFeeChains: new Set(
+      evmDeploymentChains.filter((chain) => chain !== 'tron'),
+    ),
+  }) as unknown as ChainSubmissionStrategy;
+};

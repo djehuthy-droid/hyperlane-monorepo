@@ -10,7 +10,11 @@ no-entrypoint = []
 
 [dependencies]
 borsh.workspace = true
+# Required to allow dependencies `getrandom` but to preserve determinism required by programs, see
+# https://solana.com/news/rust-to-solana
+getrandom = { workspace = true, features = ["custom"] }
 solana-program.workspace = true
+solana-system-interface.workspace = true
 thiserror.workspace = true
 
 account-utils = { path = "../../libraries/account-utils" }
@@ -19,12 +23,14 @@ hyperlane-sealevel-mailbox = { path = "../mailbox", features = [
     "no-entrypoint",
 ] }
 hyperlane-core = { path = "../../../main/hyperlane-core" }
+package-versioned = { path = "../../libraries/package-versioned" }
 serializable-account-meta = { path = "../../libraries/serializable-account-meta" }
 
 [dev-dependencies]
 hex.workspace = true
 solana-program-test.workspace = true
 solana-sdk.workspace = true
+solana-system-interface.workspace = true
 hyperlane-test-utils = { path = "../../libraries/test-utils" }
 
 [lib]

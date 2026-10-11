@@ -7,7 +7,9 @@ edition = "2021"
 
 [dependencies]
 borsh.workspace = true
+hyperlane-core = { path = "../../../main/hyperlane-core" }
 solana-program.workspace = true
+spl-discriminator.workspace = true
 spl-type-length-value.workspace = true
 
 [lib]

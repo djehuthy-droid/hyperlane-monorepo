@@ -1,15 +1,6 @@
-import express from 'express';
 import { Counter, Registry } from 'prom-client';
 
-// Global register for offchain lookup metrics
-const register = new Registry();
-
-const requestCounter = new Counter({
-  name: 'hyperlane_offchain_lookup_server_http_requests',
-  help: 'Total number of HTTP offchain lookup requests',
-  labelNames: ['service', 'status_code'],
-  registers: [register],
-});
+import type { CcipApp } from '../http.js';
 
 /**
  * Error reasons for unhandled errors
@@ -37,35 +28,94 @@ export enum UnhandledErrorReason {
   UNKNOWN = 'unknown',
 }
 
-const unhandledErrorCounter = new Counter({
-  name: 'hyperlane_offchain_lookup_server_unhandled_errors',
-  help: 'Total number of unhandled errors',
-  labelNames: ['service', 'error_reason'],
-  registers: [register],
-});
+let requestCounter: Counter<string> | undefined;
+let unhandledErrorCounter: Counter<string> | undefined;
+let rateLimitedCounter: Counter<string> | undefined;
+
+export const RateLimitedMethod = {
+  GET: 'GET',
+  POST: 'POST',
+  OTHER: 'OTHER',
+} as const;
+
+export type RateLimitedMethod =
+  (typeof RateLimitedMethod)[keyof typeof RateLimitedMethod];
+
+export const RateLimitedRoute = {
+  Calls: '/calls',
+  CallsByCommitment: '/calls/:commitment',
+  Calldata: '/calldata',
+  CalldataByCommitment: '/calldata/:commitment',
+  Unknown: 'unknown',
+} as const;
+
+export type RateLimitedRoute =
+  (typeof RateLimitedRoute)[keyof typeof RateLimitedRoute];
+
+/**
+ * Initializes Prometheus metrics with the given registry.
+ * Must be called before using PrometheusMetrics.
+ */
+export function initializeMetrics(register: Registry): void {
+  requestCounter = new Counter({
+    name: 'hyperlane_offchain_lookup_server_http_requests',
+    help: 'Total number of HTTP offchain lookup requests',
+    labelNames: ['service', 'status_code'],
+    registers: [register],
+  });
+
+  unhandledErrorCounter = new Counter({
+    name: 'hyperlane_offchain_lookup_server_unhandled_errors',
+    help: 'Total number of unhandled errors',
+    labelNames: ['service', 'error_reason'],
+    registers: [register],
+  });
+
+  rateLimitedCounter = new Counter({
+    name: 'hyperlane_offchain_lookup_server_rate_limited_requests',
+    help: 'Total number of rate-limited requests',
+    labelNames: ['method', 'route'],
+    registers: [register],
+  });
+}
+
+export function registerLookupMetrics(
+  app: CcipApp,
+  enabledModules: readonly string[],
+): void {
+  app.addHook('onResponse', async (request, reply) => {
+    if (request.method === 'OPTIONS') return;
+    const path = request.raw.url?.split('?', 1)[0] ?? '';
+    const moduleName = enabledModules.find(
+      (name) => path === `/${name}` || path.startsWith(`/${name}/`),
+    );
+    if (moduleName) {
+      // TODO: add a success label to the metric, once we properly distinguish unhandled errors from handled errors
+      PrometheusMetrics.logLookupRequest(moduleName, reply.statusCode);
+    }
+  });
+}
 
 export const PrometheusMetrics = {
   logLookupRequest(service: string, statusCode: number) {
+    if (!requestCounter) {
+      throw new Error('Metrics not initialized. Call initializeMetrics first.');
+    }
     requestCounter.inc({ service, status_code: statusCode });
   },
   logUnhandledError(service: string, errorReason: UnhandledErrorReason) {
+    if (!unhandledErrorCounter) {
+      throw new Error('Metrics not initialized. Call initializeMetrics first.');
+    }
     unhandledErrorCounter.inc({
       service,
       error_reason: errorReason,
     });
   },
+  logRateLimited(method: RateLimitedMethod, route: RateLimitedRoute) {
+    if (!rateLimitedCounter) {
+      throw new Error('Metrics not initialized. Call initializeMetrics first.');
+    }
+    rateLimitedCounter.inc({ method, route });
+  },
 };
-
-export async function startPrometheusServer() {
-  const app = express();
-
-  app.get('/metrics', async (req, res) => {
-    res.set('Content-Type', register.contentType);
-    res.end(await register.metrics());
-  });
-
-  const port = parseInt(process.env.PROMETHEUS_PORT ?? '9090');
-  app.listen(port, () =>
-    console.log(`Prometheus server started on port ${port}`),
-  );
-}

@@ -43,7 +43,10 @@ use crate::{
     ethereum::{ethereum_termination_invariants::termination_invariants_met, start_anvil},
     invariants::post_startup_invariants,
     metrics::agent_balance_sum,
-    utils::{concat_path, make_static, stop_child, AgentHandles, ArbitraryData, TaskHandle},
+    utils::{
+        concat_path, make_static, start_postgres, stop_child, AgentHandles, ArbitraryData,
+        TaskHandle,
+    },
 };
 
 mod config;
@@ -69,6 +72,9 @@ mod starknet;
 
 #[cfg(feature = "radix")]
 mod radix;
+
+#[cfg(feature = "tron")]
+mod tron;
 
 pub static AGENT_LOGGING_DIR: Lazy<&Path> = Lazy::new(|| {
     let dir = Path::new("/tmp/test_logs");
@@ -101,6 +107,7 @@ const FAILED_MESSAGE_COUNT: u32 = 1;
 
 const RELAYER_METRICS_PORT: &str = "9092";
 const SCRAPER_METRICS_PORT: &str = "9093";
+const ETHEREUM_SCRAPER_METRICS_PORTS: [&str; 3] = [SCRAPER_METRICS_PORT, "9097", "9098"];
 
 pub const SUBMITTER_TYPE: SubmitterType = SubmitterType::Lander;
 
@@ -235,13 +242,7 @@ fn main() -> ExitCode {
         .hyp_env("CHAINS_TEST2_RPCCONSENSUSTYPE", "quorum")
         .hyp_env("CHAINS_TEST2_CUSTOMRPCURLS", "http://127.0.0.1:8545")
         .hyp_env("CHAINS_TEST3_RPCCONSENSUSTYPE", "quorum")
-        .hyp_env("CHAINS_TEST3_CUSTOMRPCURLS", "http://127.0.0.1:8545")
-        .hyp_env("METRICSPORT", SCRAPER_METRICS_PORT)
-        .hyp_env(
-            "DB",
-            "postgresql://postgres:47221c18c610@localhost:5432/postgres",
-        )
-        .hyp_env("CHAINSTOSCRAPE", "test1,test2,test3");
+        .hyp_env("CHAINS_TEST3_CUSTOMRPCURLS", "http://127.0.0.1:8545");
 
     let mut state = State::default();
 
@@ -277,14 +278,7 @@ fn main() -> ExitCode {
     let start_anvil = start_anvil(config.clone());
 
     log!("Running postgres db...");
-    let postgres = Program::new("docker")
-        .cmd("run")
-        .flag("rm")
-        .arg("name", "scraper-testnet-postgres")
-        .arg("env", "POSTGRES_PASSWORD=47221c18c610")
-        .arg("publish", "5432:5432")
-        .cmd("postgres:14")
-        .spawn("SQL", None);
+    let postgres = start_postgres();
     state.push_agent(postgres);
 
     build_main.join();
@@ -294,13 +288,38 @@ fn main() -> ExitCode {
     // spawn 1st validator before any messages have been sent to test empty mailbox
     state.push_agent(validator_envs.first().unwrap().clone().spawn("VL1", None));
 
-    sleep(Duration::from_secs(5));
+    crate::utils::wait_for_postgres();
 
-    log!("Init postgres db...");
-    Program::new(concat_path(AGENT_BIN_PATH, "init-db"))
-        .run()
-        .join();
-    state.push_agent(scraper_env.spawn("SCR", None));
+    // These logical domains share Anvil block hashes. The scraper schema identifies
+    // blocks globally by hash, so each logical chain needs its own database.
+    for ((chain, metrics_port), agent_name) in validator_origin_chains
+        .iter()
+        .zip(ETHEREUM_SCRAPER_METRICS_PORTS)
+        .zip(["SCR1", "SCR2", "SCR3"])
+    {
+        let database_url = format!("postgresql://postgres:47221c18c610@localhost:5432/{chain}");
+        log!("Init postgres db for {}...", chain);
+        Program::new("docker")
+            .cmd("exec")
+            .cmd("scraper-testnet-postgres")
+            .cmd("createdb")
+            .arg("username", "postgres")
+            .cmd(*chain)
+            .run()
+            .join();
+        Program::new(concat_path(AGENT_BIN_PATH, "init-db"))
+            .env("DATABASE_URL", &database_url)
+            .run()
+            .join();
+        state.push_agent(
+            scraper_env
+                .clone()
+                .hyp_env("DB", database_url)
+                .hyp_env("METRICSPORT", metrics_port)
+                .hyp_env("CHAINSTOSCRAPE", *chain)
+                .spawn(agent_name, None),
+        );
+    }
 
     // Send a message that's guaranteed to fail
     // "failMessageBody" hex value is 0x6661696c4d657373616765426f6479
@@ -588,28 +607,22 @@ fn relayer_restart_invariants_met() -> eyre::Result<bool> {
     let log_file_path = AGENT_LOGGING_DIR.join("RLY-output.log");
     let relayer_logfile = File::open(log_file_path).unwrap();
 
-    let line_filters = vec![RETRIEVED_MESSAGE_LOG, "CouldNotFetchMetadata"];
+    let no_metadata_message_count = restored_unavailable_metadata_count(&relayer_logfile);
 
     log!("Checking message statuses were retrieved from logs...");
-    let matched_logs = get_matching_lines(&relayer_logfile, vec![line_filters.clone()]);
-
-    let no_metadata_message_count = *matched_logs
-        .get(&line_filters)
-        .ok_or_else(|| eyre::eyre!("No logs matched line filters"))?;
-
     log!(
-        "CouldNotFetchMetadata log count found {}, expected {}",
+        "Unavailable metadata log count found {}, expected {}",
         no_metadata_message_count,
         ZERO_MERKLE_INSERTION_KATHY_MESSAGES
     );
     // These messages are never inserted into the merkle tree.
     // So these messages will never be deliverable and will always
-    // be in a CouldNotFetchMetadata state.
+    // have an unavailable metadata state.
     // When the relayer restarts, these messages' statuses should be
-    // retrieved from the database with CouldNotFetchMetadata status.
+    // retrieved from the database with an unavailable metadata status.
     if no_metadata_message_count < ZERO_MERKLE_INSERTION_KATHY_MESSAGES {
         log!(
-            "No metadata message count is {}, expected {}",
+            "Unavailable metadata message count is {}, expected {}",
             no_metadata_message_count,
             ZERO_MERKLE_INSERTION_KATHY_MESSAGES
         );
@@ -621,6 +634,57 @@ fn relayer_restart_invariants_met() -> eyre::Result<bool> {
     // Causing this invariant to be higher than expected
     assert!(no_metadata_message_count >= ZERO_MERKLE_INSERTION_KATHY_MESSAGES);
     Ok(true)
+}
+
+fn restored_unavailable_metadata_count(relayer_logfile: &File) -> u32 {
+    let could_not_fetch_filters = vec![RETRIEVED_MESSAGE_LOG, "CouldNotFetchMetadata"];
+    let metadata_refused_filters = vec![RETRIEVED_MESSAGE_LOG, "MessageMetadataRefused"];
+
+    let matched_logs = get_matching_lines(
+        relayer_logfile,
+        vec![
+            could_not_fetch_filters.clone(),
+            metadata_refused_filters.clone(),
+        ],
+    );
+
+    // Once the reorg flag is set, zero-merkle-insertion messages can move from
+    // CouldNotFetchMetadata to MessageMetadataRefused before the relayer restarts.
+    // Both states prove the message status was restored from the database.
+    matched_logs
+        .get(&could_not_fetch_filters)
+        .copied()
+        .unwrap_or_default()
+        + matched_logs
+            .get(&metadata_refused_filters)
+            .copied()
+            .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Seek, SeekFrom};
+
+    use super::*;
+
+    #[test]
+    fn counts_all_restored_unavailable_metadata_states() {
+        let mut log_file = tempfile::tempfile().unwrap();
+        writeln!(
+            log_file,
+            r#"status=Retry(CouldNotFetchMetadata) {RETRIEVED_MESSAGE_LOG}"#
+        )
+        .unwrap();
+        writeln!(
+            log_file,
+            r#"status=Retry(MessageMetadataRefused) {RETRIEVED_MESSAGE_LOG}"#
+        )
+        .unwrap();
+        writeln!(log_file, "CouldNotFetchMetadata without retrieval").unwrap();
+        log_file.seek(SeekFrom::Start(0)).unwrap();
+
+        assert_eq!(restored_unavailable_metadata_count(&log_file), 2);
+    }
 }
 
 /// Check relayer reused already built metadata
@@ -666,9 +730,6 @@ where
     while loop_invariant_fn() {
         log!("Checking e2e invariants...");
         sleep(loop_check_interval);
-        if !config.ci_mode {
-            continue;
-        }
         match condition_fn() {
             Ok(true) => {
                 // end condition reached successfully
@@ -681,7 +742,7 @@ where
                 log!("Error checking e2e invariants: {}", e);
             }
         }
-        if check_ci_timed_out(config.ci_mode_timeout, start_time) {
+        if config.ci_mode && check_ci_timed_out(config.ci_mode_timeout, start_time) {
             // we ran out of time
             log!("Error: CI timeout reached before invariants were met");
             return false;

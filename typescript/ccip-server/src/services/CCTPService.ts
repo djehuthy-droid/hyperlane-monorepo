@@ -1,5 +1,4 @@
 import { ethers } from 'ethers';
-import { Router } from 'express';
 import { Logger } from 'pino';
 import { z } from 'zod';
 
@@ -7,10 +6,15 @@ import {
   CctpService__factory,
   IMessageTransmitter__factory,
 } from '@hyperlane-xyz/core';
-import { MultiProvider } from '@hyperlane-xyz/sdk';
+import type { MultiProvider } from '@hyperlane-xyz/sdk/providers/MultiProvider';
 import { parseMessage } from '@hyperlane-xyz/utils';
 
-import { createAbiHandler } from '../utils/abiHandler.js';
+import type { CcipApp } from '../http.js';
+import {
+  ABI_ROUTE_OPTIONS,
+  type AbiRoute,
+  createAbiHandler,
+} from '../utils/abiHandler.js';
 import {
   PrometheusMetrics,
   UnhandledErrorReason,
@@ -22,17 +26,24 @@ import {
   ServiceConfigWithMultiProvider,
 } from './BaseService.js';
 import { CCTPAttestationService } from './CCTPAttestationService.js';
+import { findMatchingCircleMessage } from './cctpMessageMatcher.js';
 import { HyperlaneService } from './HyperlaneService.js';
 
+const messageTransmitterInterface =
+  IMessageTransmitter__factory.createInterface();
+const messageSentEvent =
+  messageTransmitterInterface.getEvent('MessageSent(bytes)');
+const messageSentTopic =
+  messageTransmitterInterface.getEventTopic(messageSentEvent);
+
 const EnvSchema = z.object({
-  HYPERLANE_EXPLORER_URL: z.string().url(),
-  CCTP_ATTESTATION_URL: z.string().url(),
+  HYPERLANE_EXPLORER_URL: z.url(),
+  CCTP_ATTESTATION_URL: z.url(),
   REGISTRY_URI: REGISTRY_URI_SCHEMA,
 });
 
 class CCTPService extends BaseService {
   // External Services
-  public router: Router;
   private hyperlaneService: HyperlaneService;
   private cctpAttestationService: CCTPAttestationService;
   private multiProvider: MultiProvider;
@@ -60,77 +71,132 @@ class CCTPService extends BaseService {
       this.config.serviceName,
       env.CCTP_ATTESTATION_URL,
     );
+  }
 
-    this.router = Router();
-
+  registerRoutes(app: CcipApp, prefix: string): void {
     // CCIP-read spec: GET /getCCTPAttestation/:sender/:callData.json
-    this.router.get(
-      '/getCctpAttestation/:sender/:callData.json',
+    app.get<AbiRoute>(
+      `${prefix}/getCctpAttestation/:sender/:callData.json`,
+      ABI_ROUTE_OPTIONS,
       createAbiHandler(
         CctpService__factory,
         'getCCTPAttestation',
-        this.getCCTPAttestation.bind(this),
+        (message: string, logger: Logger) =>
+          this.getCCTPAttestation(message, undefined, logger),
       ),
     );
 
     // CCIP-read spec: POST /getCctpAttestation
-    this.router.post(
-      '/getCctpAttestation',
-      createAbiHandler(
-        CctpService__factory,
-        'getCCTPAttestation',
-        this.getCCTPAttestation.bind(this),
-      ),
+    app.post<AbiRoute>(
+      `${prefix}/getCctpAttestation`,
+      ABI_ROUTE_OPTIONS,
+      async (request, reply) => {
+        const rawTxHash = request.body?.origin_tx_hash;
+        const originTxHash =
+          typeof rawTxHash === 'string' &&
+          ethers.utils.isHexString(rawTxHash, 32)
+            ? rawTxHash
+            : undefined;
+        return createAbiHandler(
+          CctpService__factory,
+          'getCCTPAttestation',
+          (message: string, logger: Logger) =>
+            this.getCCTPAttestation(message, originTxHash, logger),
+        )(request, reply);
+      },
     );
   }
 
   async getCCTPMessageFromReceipt(
     receipt: ethers.providers.TransactionReceipt,
+    hyperlaneMessage: string,
     messageId: string,
     logger: Logger,
   ) {
     logger.info(
-      {
-        transactionHash: receipt.transactionHash,
-      },
+      { transactionHash: receipt.transactionHash },
       'Extracting CCTP message from receipt',
     );
 
-    const iface = IMessageTransmitter__factory.createInterface();
-    const event = iface.events['MessageSent(bytes)'];
-
+    const allMessages: string[] = [];
     for (const receiptLog of receipt.logs) {
+      // Most receipt logs belong to other contracts. Avoid ABI lookup and
+      // exception allocation for events that cannot contain a CCTP message.
+      if (receiptLog.topics[0]?.toLowerCase() !== messageSentTopic) continue;
       try {
-        const parsedLog = iface.parseLog(receiptLog);
-        if (parsedLog.name === event.name) {
-          logger.info(
-            { cctpMessage: parsedLog.args.message },
-            'Found CCTP MessageSent event',
-          );
-          return parsedLog.args.message;
+        const parsedLog = messageTransmitterInterface.parseLog(receiptLog);
+        if (
+          parsedLog.name === messageSentEvent.name &&
+          typeof parsedLog.args.message === 'string'
+        ) {
+          allMessages.push(parsedLog.args.message);
         }
       } catch (_err) {
-        // This log is not from the events in our ABI
         continue;
       }
     }
 
+    if (allMessages.length === 0) {
+      logger.error(
+        {
+          transactionHash: receipt.transactionHash,
+          messageId,
+          error_reason: UnhandledErrorReason.CCTP_MESSAGE_SENT_NOT_FOUND,
+        },
+        'Unable to find MessageSent event in logs',
+      );
+      PrometheusMetrics.logUnhandledError(
+        this.config.serviceName,
+        UnhandledErrorReason.CCTP_MESSAGE_SENT_NOT_FOUND,
+      );
+      throw new Error('Unable to find MessageSent event in logs');
+    }
+
+    // Fast path: only one MessageSent in this tx, no disambiguation needed.
+    if (allMessages.length === 1) {
+      logger.info(
+        { cctpMessage: allMessages[0] },
+        'Found CCTP MessageSent event',
+      );
+      return allMessages[0];
+    }
+
+    // Multiple MessageSent events in the same tx — delegate to the matcher.
+    const parsedMsg = parseMessage(hyperlaneMessage);
+    const bodyBytes = ethers.utils.arrayify(parsedMsg.body);
+    const matched = findMatchingCircleMessage(
+      allMessages,
+      bodyBytes,
+      messageId,
+      parsedMsg.sender,
+    );
+
+    if (matched !== null) {
+      logger.info(
+        { cctpMessage: matched, messageId },
+        'Matched CCTP MessageSent event',
+      );
+      return matched;
+    }
+
     logger.error(
-      {
-        transactionHash: receipt.transactionHash,
-        messageId,
-        error_reason: UnhandledErrorReason.CCTP_MESSAGE_SENT_NOT_FOUND,
-      },
-      'Unable to find MessageSent event in logs',
+      { messageId, messageCount: allMessages.length },
+      'Could not match MessageSent to Hyperlane message',
     );
     PrometheusMetrics.logUnhandledError(
       this.config.serviceName,
       UnhandledErrorReason.CCTP_MESSAGE_SENT_NOT_FOUND,
     );
-    throw new Error('Unable to find MessageSent event in logs');
+    throw new Error(
+      `Could not match any of ${allMessages.length} MessageSent events to messageId ${messageId}`,
+    );
   }
 
-  async getCCTPAttestation(message: string, logger: Logger) {
+  async getCCTPAttestation(
+    message: string,
+    originTxHash: string | undefined,
+    logger: Logger,
+  ) {
     const log = this.addLoggerServiceContext(logger);
 
     log.info(
@@ -141,11 +207,20 @@ class CCTPService extends BaseService {
     const messageId: string = ethers.utils.keccak256(message);
     log.info({ messageId, hyperlaneMessage: message }, 'Generated message ID');
 
-    const txHash =
-      await this.hyperlaneService.getOriginTransactionHashByMessageId(
+    let txHash: string | undefined = originTxHash;
+
+    if (txHash) {
+      log.info({ txHash, messageId }, 'Using tx hash provided by relayer');
+    } else {
+      log.info(
+        { messageId },
+        'No tx hash from relayer, falling back to scraper lookup',
+      );
+      txHash = await this.hyperlaneService.getOriginTransactionHashByMessageId(
         messageId,
         log,
       );
+    }
 
     if (!txHash) {
       throw new Error(`Invalid transaction hash: ${txHash}`);
@@ -160,6 +235,7 @@ class CCTPService extends BaseService {
       .getTransactionReceipt(txHash);
     const cctpMessage = await this.getCCTPMessageFromReceipt(
       receipt,
+      message,
       messageId,
       log,
     );

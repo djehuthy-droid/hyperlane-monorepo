@@ -4,12 +4,10 @@ import path from 'path';
 import prompts from 'prompts';
 
 import { buildArtifact as coreBuildArtifact } from '@hyperlane-xyz/core/buildArtifact.js';
-import { HelloWorldDeployer } from '@hyperlane-xyz/helloworld';
 import {
   ChainMap,
   ContractVerifier,
   ExplorerLicenseType,
-  HypERC20Deployer,
   HyperlaneCCIPDeployer,
   HyperlaneCoreDeployer,
   HyperlaneDeployer,
@@ -17,6 +15,7 @@ import {
   HyperlaneIgpDeployer,
   HyperlaneIsmFactory,
   HyperlaneProxyFactoryDeployer,
+  IcaRouterType,
   InterchainAccount,
   InterchainAccountConfig,
   InterchainAccountDeployer,
@@ -29,11 +28,10 @@ import { inCIMode, objFilter, objMap } from '@hyperlane-xyz/utils';
 import { writeYaml } from '@hyperlane-xyz/utils/fs';
 
 import { Contexts } from '../config/contexts.js';
-import { core as coreConfig } from '../config/environments/mainnet3/core.js';
+import { getCore as getCoreConfig } from '../config/environments/mainnet3/core.js';
 import { DEFAULT_OFFCHAIN_LOOKUP_ISM_URLS } from '../config/environments/utils.js';
 import { getEnvAddresses } from '../config/registry.js';
-import { getWarpConfig } from '../config/warp.js';
-import { chainsToSkip } from '../src/config/chain.js';
+import { chainsToSkip, minimalIcaChains } from '../src/config/chain.js';
 import { DeployCache, deployWithArtifacts } from '../src/deployment/deploy.js';
 import { TestQuerySenderDeployer } from '../src/deployment/testcontracts/testquerysender.js';
 import {
@@ -54,7 +52,6 @@ import {
   withConcurrentDeploy,
   withContext,
   withFork,
-  withKnownWarpRouteId,
   withModule,
   withWritePlan,
 } from './agent-utils.js';
@@ -69,16 +66,11 @@ async function main() {
     buildArtifactPath,
     chains,
     concurrentDeploy,
-    warpRouteId,
     writePlan,
   } = await withContext(
     withConcurrentDeploy(
       withWritePlan(
-        withChains(
-          withModule(
-            withFork(withKnownWarpRouteId(withBuildArtifactPath(getArgs()))),
-          ),
-        ),
+        withChains(withModule(withFork(withBuildArtifactPath(getArgs())))),
       ),
     ),
   ).argv;
@@ -149,21 +141,6 @@ async function main() {
       concurrentDeploy,
       60 * 60 * 1000, // 60 minutes
     );
-  } else if (module === Modules.WARP) {
-    if (!warpRouteId) {
-      throw new Error('Warp route ID is required for WARP module');
-    }
-    const ismFactory = HyperlaneIsmFactory.fromAddressesMap(
-      getAddresses(envConfig.environment, Modules.PROXY_FACTORY),
-      multiProvider,
-    );
-    config = await getWarpConfig(multiProvider, envConfig, warpRouteId);
-    deployer = new HypERC20Deployer(
-      multiProvider,
-      ismFactory,
-      contractVerifier,
-      concurrentDeploy,
-    );
   } else if (module === Modules.INTERCHAIN_GAS_PAYMASTER) {
     config = envConfig.igp;
     deployer = new HyperlaneIgpDeployer(
@@ -175,15 +152,20 @@ async function main() {
     const { core } = await getHyperlaneCore(environment, multiProvider);
     config = objMap(
       core.getRouterConfig(envConfig.owners) as ChainMap<RouterConfig>,
-      (_, routerConfig): InterchainAccountConfig => {
+      (chain, routerConfig): InterchainAccountConfig => {
+        const isMinimal = minimalIcaChains.includes(chain);
         return {
           ...routerConfig,
-          commitmentIsm: {
-            type: IsmType.OFFCHAIN_LOOKUP,
-            owner: routerConfig.owner,
-            ownerOverrides: routerConfig.ownerOverrides,
-            urls: DEFAULT_OFFCHAIN_LOOKUP_ISM_URLS,
-          },
+          ...(isMinimal
+            ? { routerType: IcaRouterType.MINIMAL }
+            : {
+                commitmentIsm: {
+                  type: IsmType.OFFCHAIN_LOOKUP,
+                  owner: routerConfig.owner,
+                  ownerOverrides: routerConfig.ownerOverrides,
+                  urls: DEFAULT_OFFCHAIN_LOOKUP_ISM_URLS,
+                },
+              }),
         };
       },
     );
@@ -231,15 +213,6 @@ async function main() {
       contractVerifier,
       concurrentDeploy,
     );
-  } else if (module === Modules.HELLO_WORLD) {
-    const { core } = await getHyperlaneCore(environment, multiProvider);
-    config = core.getRouterConfig(envConfig.owners);
-    deployer = new HelloWorldDeployer(
-      multiProvider,
-      undefined,
-      contractVerifier,
-      concurrentDeploy,
-    );
   } else if (module === Modules.HOOK) {
     const ismFactory = HyperlaneIsmFactory.fromAddressesMap(
       getAddresses(environment, Modules.PROXY_FACTORY),
@@ -254,7 +227,7 @@ async function main() {
     );
     // Config is intended to be changed for ad-hoc use cases:
     config = {
-      ethereum: coreConfig.ethereum.defaultHook,
+      ethereum: getCoreConfig().ethereum.defaultHook,
     };
   } else if (module === Modules.CCIP) {
     if (environment !== 'mainnet3') {
@@ -318,10 +291,15 @@ async function main() {
       });
     }
 
+    const confirmChainCount =
+      chains && chains.length > 0
+        ? chains.filter((chain) => !chainsToSkip.includes(chain)).length
+        : Object.keys(config).length;
+
     const { value: confirmed } = await prompts({
       type: 'confirm',
       name: 'value',
-      message: `Confirm you want to deploy this ${module} configuration to ${environment}? (${Object.keys(config).length} chains)`,
+      message: `Confirm you want to deploy this ${module} configuration to ${environment}? (${confirmChainCount} chains)`,
       initial: false,
     });
     if (!confirmed) {

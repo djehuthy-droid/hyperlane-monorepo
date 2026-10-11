@@ -69,15 +69,6 @@ export const rcMultisigIsmConfigs: ChainMap<MultisigConfig> = {
       },
     ],
   },
-  moonbeam: {
-    threshold: 1,
-    validators: [
-      {
-        address: '0x0df7140811e309dc69638352545151ebb9d5e0fd',
-        alias: AW_VALIDATOR_ALIAS,
-      },
-    ],
-  },
   gnosis: {
     threshold: 1,
     validators: [
@@ -88,38 +79,11 @@ export const rcMultisigIsmConfigs: ChainMap<MultisigConfig> = {
     ],
   },
   // ----------------- Testnets -----------------
-  fuji: {
-    threshold: 1,
-    validators: [
-      {
-        address: '0xfc419f9ba3c56c55e28844ade491d428f5a77d55',
-        alias: AW_VALIDATOR_ALIAS,
-      },
-    ],
-  },
-  chiado: {
-    threshold: 1,
-    validators: [
-      {
-        address: '0x7572ffd8af1abc02cc1d234ac750d387fd6768a0',
-        alias: AW_VALIDATOR_ALIAS,
-      },
-    ],
-  },
   bsctestnet: {
     threshold: 1,
     validators: [
       {
         address: '0x6353c7402626054c824bd0eca721f82b725e2b4d',
-        alias: AW_VALIDATOR_ALIAS,
-      },
-    ],
-  },
-  scrollsepolia: {
-    threshold: 1,
-    validators: [
-      {
-        address: '0x50d939d66f114350f322eb8b2e9f01fbc401d4c9',
         alias: AW_VALIDATOR_ALIAS,
       },
     ],

@@ -5,6 +5,7 @@ import {
   TransactionManifest,
 } from '@radixdlt/radix-engine-toolkit';
 
+import { ChainMetadataForAltVM } from '@hyperlane-xyz/provider-sdk/chain';
 import { Annotated } from '@hyperlane-xyz/utils';
 
 export interface RadixSDKTransaction {
@@ -40,6 +41,7 @@ export interface RadixSDKOptions {
   rpcUrls: string[];
   gatewayUrls?: string[];
   packageAddress?: string;
+  chainMetadata: ChainMetadataForAltVM;
 }
 
 export interface MultisigIsmReq {
@@ -62,6 +64,54 @@ export enum RadixHookTypes {
   IGP = 'InterchainGasPaymaster',
   MERKLE_TREE = 'MerkleTreeHook',
 }
+
+export const RADIX_COMPONENT_NAMES = {
+  HYP_TOKEN: 'HypToken',
+} as const;
+
+export const RADIX_WARP_TOKEN_FIELD_NAMES = {
+  TOKEN_TYPE: 'token_type',
+  MAILBOX: 'mailbox',
+  ISM: 'ism',
+  ENROLLED_ROUTERS: 'enrolled_routers',
+  RESOURCE_MANAGER: 'resource_manager',
+  RECIPIENT: 'recipient',
+  GAS: 'gas',
+} as const;
+
+export const RadixWarpTokenType = {
+  COLLATERAL: 'Collateral',
+  SYNTHETIC: 'Synthetic',
+} as const;
+
+export type RadixWarpTokenType =
+  (typeof RadixWarpTokenType)[keyof typeof RadixWarpTokenType];
+
+export interface BaseRadixWarpTokenConfig<TType extends RadixWarpTokenType> {
+  owner: string;
+  mailbox: string;
+  interchainSecurityModule?: string;
+  remoteRouters: Record<number, { address: string }>;
+  destinationGas: Record<number, string>;
+  name?: string;
+  symbol?: string;
+  decimals?: number;
+  type: TType;
+}
+
+export interface RadixSyntheticWarpTokenConfig extends BaseRadixWarpTokenConfig<'Synthetic'> {
+  name: string;
+  symbol: string;
+  decimals: number;
+}
+
+export interface RadixCollateralWarpTokenConfig extends BaseRadixWarpTokenConfig<'Collateral'> {
+  token: string;
+}
+
+export type RadixWarpTokenConfig =
+  | RadixSyntheticWarpTokenConfig
+  | RadixCollateralWarpTokenConfig;
 
 export interface RadixElement {
   kind: string;

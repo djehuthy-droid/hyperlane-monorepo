@@ -1,9 +1,39 @@
 import { expect } from 'chai';
 import { ethers } from 'ethers';
 
-import { AggregationIsmConfigSchema, IsmType } from './types.js';
+import { ZERO_ADDRESS_HEX_32, assert } from '@hyperlane-xyz/utils';
+
+import { RATE_LIMIT_DEFAULT_DURATION_SECONDS } from '../types.js';
+
+import {
+  AggregationIsmConfigSchema,
+  BlacklistIsmConfigSchema,
+  type CompositeIsmConfig,
+  CompositeIsmConfigSchema,
+  CompositeIsmNodeType,
+  DelayedFlowRouterHookIsmConfigSchema,
+  IsmConfigSchema,
+  IsmType,
+  MAX_SAFE_UINT48,
+  ModuleType,
+  RateLimitedIsmConfigSchema,
+  RoutingMessageIdMultisigIsmConfigSchema,
+  NetFlowRateLimitedHookIsmConfigSchema,
+  ismTypeToModuleType,
+} from './types.js';
 
 const SOME_ADDRESS = ethers.Wallet.createRandom().address;
+const OTHER_ADDRESS = ethers.Wallet.createRandom().address;
+
+// Composite ISM (Sealevel-only) wire fields have distinct formats from the
+// generic EVM-style addresses above: owner/relayer/mailbox/fallbackIsm are
+// base58 Sealevel pubkeys, and recipient is a 32-byte (64 hex char) H256.
+const SEALEVEL_ADDRESS = '9bRSUPjfS3xS6n5EfkJzHFTRDa4AHLda8BU2pP4HoWnf';
+const OTHER_SEALEVEL_ADDRESS = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const SEALEVEL_ZERO_ADDRESS = '1'.repeat(32);
+const H256_ADDRESS = '0x' + '5'.repeat(64);
+const H256_ZERO = '0x' + '0'.repeat(64);
+
 describe('AggregationIsmConfigSchema refine', () => {
   it('should require threshold to be below modules length', () => {
     const IsmConfig = {
@@ -15,5 +45,1442 @@ describe('AggregationIsmConfigSchema refine', () => {
 
     IsmConfig.threshold = 0;
     expect(AggregationIsmConfigSchema.safeParse(IsmConfig).success).to.be.true;
+  });
+});
+
+/** Wraps `hybrid` in the minimal composition the union accepts. */
+function compliantAggregation(hybrid: unknown) {
+  return {
+    type: IsmType.AGGREGATION,
+    threshold: 2,
+    modules: [{ type: IsmType.TRUSTED_RELAYER, relayer: SOME_ADDRESS }, hybrid],
+  };
+}
+
+describe('hybrid hook/ISM composition (IsmConfigSchema)', () => {
+  const hybrids = [
+    {
+      type: IsmType.NET_FLOW_RATE_LIMITED,
+      warpRouter: SOME_ADDRESS,
+      thresholdBps: 500,
+      duration: 86400n,
+      owner: OTHER_ADDRESS,
+    },
+    {
+      type: IsmType.DELAYED_FLOW_ROUTER,
+      warpRouter: SOME_ADDRESS,
+      thresholdBps: 500,
+      maxDelay: 3600,
+      duration: 86400n,
+      owner: OTHER_ADDRESS,
+    },
+  ];
+
+  for (const hybrid of hybrids) {
+    describe(hybrid.type, () => {
+      it('accepts an exhaustive aggregation with an authenticating sibling', () => {
+        expect(IsmConfigSchema.safeParse(compliantAggregation(hybrid)).success)
+          .to.be.true;
+      });
+
+      it('rejects standalone use', () => {
+        expect(IsmConfigSchema.safeParse(hybrid).success).to.be.false;
+      });
+
+      it('rejects a non-exhaustive aggregation', () => {
+        const nonExhaustive = {
+          ...compliantAggregation(hybrid),
+          threshold: 1,
+        };
+        expect(IsmConfigSchema.safeParse(nonExhaustive).success).to.be.false;
+      });
+
+      it('rejects an exhaustive aggregation with no authenticating sibling', () => {
+        const unauthenticated = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [
+            { type: IsmType.PAUSABLE, owner: OTHER_ADDRESS, paused: false },
+            hybrid,
+          ],
+        };
+        expect(IsmConfigSchema.safeParse(unauthenticated).success).to.be.false;
+      });
+
+      it('rejects a routing target even under an authenticated aggregation', () => {
+        const routed = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [
+            { type: IsmType.TRUSTED_RELAYER, relayer: SOME_ADDRESS },
+            {
+              type: IsmType.ROUTING,
+              owner: OTHER_ADDRESS,
+              domains: { test2: hybrid },
+            },
+          ],
+        };
+        expect(IsmConfigSchema.safeParse(routed).success).to.be.false;
+      });
+
+      it('does not accept a bare address as the authenticating sibling', () => {
+        const addressSibling = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [SOME_ADDRESS, hybrid],
+        };
+        expect(IsmConfigSchema.safeParse(addressSibling).success).to.be.false;
+      });
+
+      it('points a bare-address sibling at declaring the deployed ISM by type', () => {
+        const addressSibling = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [SOME_ADDRESS, hybrid],
+        };
+        const result = IsmConfigSchema.safeParse(addressSibling);
+        assert(
+          !result.success,
+          'expected a bare-address sibling to be rejected',
+        );
+        const messages = result.error.issues.map((issue) => issue.message);
+        expect(
+          messages.some(
+            (message) =>
+              message.includes('bare address does not count') &&
+              message.includes('static multisig'),
+          ),
+          `expected a workaround hint, got: ${messages.join(' | ')}`,
+        ).to.be.true;
+      });
+
+      it('omits the bare-address hint when every sibling is declared by type', () => {
+        const unauthenticated = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [
+            { type: IsmType.PAUSABLE, owner: OTHER_ADDRESS, paused: false },
+            hybrid,
+          ],
+        };
+        const result = IsmConfigSchema.safeParse(unauthenticated);
+        assert(
+          !result.success,
+          'expected an unauthenticated aggregation to be rejected',
+        );
+        expect(
+          result.error.issues.every(
+            (issue) => !issue.message.includes('bare address does not count'),
+          ),
+        ).to.be.true;
+      });
+
+      const offchainLookup = {
+        type: IsmType.OFFCHAIN_LOOKUP,
+        urls: ['https://example.com/{sender}/{data}'],
+        owner: OTHER_ADDRESS,
+      };
+
+      it('rejects an offchain lookup ISM as the only non-hybrid member', () => {
+        // CCIP_READ describes how a verifier is reached, not that it
+        // authenticates the message: the instance is deployed out of band and
+        // its verify may return true unconditionally, so accepting it here
+        // would admit an aggregation that authenticates nothing.
+        const withOffchainLookup = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [offchainLookup, hybrid],
+        };
+        expect(IsmConfigSchema.safeParse(withOffchainLookup).success).to.be
+          .false;
+      });
+
+      it('accepts an offchain lookup ISM beside a real authenticator', () => {
+        const withAuthenticator = {
+          type: IsmType.AGGREGATION,
+          threshold: 3,
+          modules: [
+            { type: IsmType.TRUSTED_RELAYER, relayer: SOME_ADDRESS },
+            offchainLookup,
+            hybrid,
+          ],
+        };
+        const result = IsmConfigSchema.safeParse(withAuthenticator);
+        assert(
+          result.success,
+          'expected a typed offchain lookup sibling to parse',
+        );
+        assert(
+          typeof result.data !== 'string' &&
+            result.data.type === IsmType.AGGREGATION,
+          'expected an aggregation config',
+        );
+        expect(result.data.modules[1]).to.deep.equal(offchainLookup);
+      });
+
+      it('accepts authentication supplied by an enclosing exhaustive aggregation', () => {
+        const nested = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [
+            { type: IsmType.TRUSTED_RELAYER, relayer: SOME_ADDRESS },
+            { type: IsmType.AGGREGATION, threshold: 1, modules: [hybrid] },
+          ],
+        };
+        expect(IsmConfigSchema.safeParse(nested).success).to.be.true;
+      });
+
+      it('rejects an authenticator that its own nested aggregation can outvote', () => {
+        // agg(2)[ agg(1)[multisig, pausable], hybrid ]: the relayer supplies
+        // metadata for the unpaused pausable alone, which satisfies the inner
+        // threshold without ever running the multisig, so the outer
+        // aggregation is met by a branch that authenticates nothing.
+        const outvotableAuthenticator = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [
+            {
+              type: IsmType.AGGREGATION,
+              threshold: 1,
+              modules: [
+                {
+                  type: IsmType.MESSAGE_ID_MULTISIG,
+                  validators: [SOME_ADDRESS],
+                  threshold: 1,
+                },
+                { type: IsmType.PAUSABLE, owner: OTHER_ADDRESS, paused: false },
+              ],
+            },
+            hybrid,
+          ],
+        };
+        expect(IsmConfigSchema.safeParse(outvotableAuthenticator).success).to.be
+          .false;
+      });
+
+      it('accepts a nested aggregation whose threshold forces the authenticator to run', () => {
+        // Same shape, inner threshold raised to 2: no subset of the inner
+        // members satisfies it without the multisig.
+        const nonOutvotableAuthenticator = {
+          type: IsmType.AGGREGATION,
+          threshold: 2,
+          modules: [
+            {
+              type: IsmType.AGGREGATION,
+              threshold: 2,
+              modules: [
+                {
+                  type: IsmType.MESSAGE_ID_MULTISIG,
+                  validators: [SOME_ADDRESS],
+                  threshold: 1,
+                },
+                { type: IsmType.PAUSABLE, owner: OTHER_ADDRESS, paused: false },
+              ],
+            },
+            hybrid,
+          ],
+        };
+        expect(IsmConfigSchema.safeParse(nonOutvotableAuthenticator).success).to
+          .be.true;
+      });
+
+      interface SiblingCase {
+        name: string;
+        sibling: unknown;
+        authenticates: boolean;
+      }
+
+      // One row per ISM type that could plausibly stand in as the hybrid's
+      // authenticating sibling. `authenticates: false` rows are the types whose
+      // authority is not fixed by the SDK deploy path (see
+      // AUTHENTICATING_ISM_TYPES).
+      const siblingCases: SiblingCase[] = [
+        {
+          name: IsmType.MERKLE_ROOT_MULTISIG,
+          sibling: {
+            type: IsmType.MERKLE_ROOT_MULTISIG,
+            validators: [SOME_ADDRESS],
+            threshold: 1,
+          },
+          authenticates: true,
+        },
+        {
+          name: IsmType.MESSAGE_ID_MULTISIG,
+          sibling: {
+            type: IsmType.MESSAGE_ID_MULTISIG,
+            validators: [SOME_ADDRESS],
+            threshold: 1,
+          },
+          authenticates: true,
+        },
+        {
+          name: IsmType.STORAGE_MERKLE_ROOT_MULTISIG,
+          sibling: {
+            type: IsmType.STORAGE_MERKLE_ROOT_MULTISIG,
+            validators: [SOME_ADDRESS],
+            threshold: 1,
+          },
+          authenticates: true,
+        },
+        {
+          name: IsmType.STORAGE_MESSAGE_ID_MULTISIG,
+          sibling: {
+            type: IsmType.STORAGE_MESSAGE_ID_MULTISIG,
+            validators: [SOME_ADDRESS],
+            threshold: 1,
+          },
+          authenticates: true,
+        },
+        {
+          name: IsmType.WEIGHTED_MERKLE_ROOT_MULTISIG,
+          sibling: {
+            type: IsmType.WEIGHTED_MERKLE_ROOT_MULTISIG,
+            validators: [{ signingAddress: SOME_ADDRESS, weight: 1e10 }],
+            thresholdWeight: 1e10,
+          },
+          authenticates: true,
+        },
+        {
+          name: IsmType.WEIGHTED_MESSAGE_ID_MULTISIG,
+          sibling: {
+            type: IsmType.WEIGHTED_MESSAGE_ID_MULTISIG,
+            validators: [{ signingAddress: SOME_ADDRESS, weight: 1e10 }],
+            thresholdWeight: 1e10,
+          },
+          authenticates: true,
+        },
+        {
+          name: IsmType.TRUSTED_RELAYER,
+          sibling: { type: IsmType.TRUSTED_RELAYER, relayer: SOME_ADDRESS },
+          authenticates: true,
+        },
+        {
+          // Deployed with `[bridge]` alone; `setAuthorizedHook` is a public
+          // one-shot initializer the deploy path never calls, so a third party
+          // can bind the fresh instance to a sender it controls.
+          name: IsmType.ARB_L2_TO_L1,
+          sibling: { type: IsmType.ARB_L2_TO_L1, bridge: SOME_ADDRESS },
+          authenticates: false,
+        },
+        {
+          // Resolved from the CCIP contract cache with no proof that its
+          // `authorizedHook` is bound at all — same initializer window.
+          name: IsmType.CCIP,
+          sibling: { type: IsmType.CCIP, originChain: 'test2' },
+          authenticates: false,
+        },
+        {
+          name: IsmType.MAILBOX_DEFAULT,
+          sibling: { type: IsmType.MAILBOX_DEFAULT },
+          authenticates: false,
+        },
+        {
+          name: IsmType.PAUSABLE,
+          sibling: {
+            type: IsmType.PAUSABLE,
+            owner: OTHER_ADDRESS,
+            paused: false,
+          },
+          authenticates: false,
+        },
+        {
+          name: IsmType.TEST_ISM,
+          sibling: { type: IsmType.TEST_ISM },
+          authenticates: false,
+        },
+      ];
+
+      for (const { name, sibling, authenticates } of siblingCases) {
+        it(`${authenticates ? 'accepts' : 'rejects'} an exhaustive aggregation whose only sibling is a ${name}`, () => {
+          const aggregation = {
+            type: IsmType.AGGREGATION,
+            threshold: 2,
+            modules: [sibling, hybrid],
+          };
+          expect(IsmConfigSchema.safeParse(aggregation).success).to.equal(
+            authenticates,
+          );
+        });
+      }
+    });
+  }
+});
+
+describe('NetFlowRateLimitedHookIsmConfigSchema', () => {
+  const valid = {
+    type: IsmType.NET_FLOW_RATE_LIMITED,
+    warpRouter: SOME_ADDRESS,
+    thresholdBps: 500,
+    duration: 86400n,
+    owner: OTHER_ADDRESS,
+  };
+
+  it('parses a NET_FLOW_RATE_LIMITED standalone via its own schema, but only in a compliant aggregation via the union', () => {
+    // The node schema itself is permissive; composition is enforced by the
+    // top-level union, which rejects an unauthenticated/standalone hybrid.
+    expect(NetFlowRateLimitedHookIsmConfigSchema.safeParse(valid).success).to.be
+      .true;
+    expect(IsmConfigSchema.safeParse(valid).success).to.be.false;
+    expect(IsmConfigSchema.safeParse(compliantAggregation(valid)).success).to.be
+      .true;
+  });
+
+  it('parses a NET_FLOW_RATE_LIMITED without warpRouter (injected by the warp deploy machinery)', () => {
+    const withoutWarpRouter = { ...valid, warpRouter: undefined };
+    expect(
+      NetFlowRateLimitedHookIsmConfigSchema.safeParse(withoutWarpRouter)
+        .success,
+    ).to.be.true;
+  });
+
+  it('rejects a zero duration on a NET_FLOW_RATE_LIMITED', () => {
+    const invalid = { ...valid, duration: 0n };
+    expect(NetFlowRateLimitedHookIsmConfigSchema.safeParse(invalid).success).to
+      .be.false;
+    expect(IsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('requires thresholdBps strictly below 100% (reject mode)', () => {
+    const atBound = { ...valid, thresholdBps: 9999 };
+    expect(NetFlowRateLimitedHookIsmConfigSchema.safeParse(atBound).success).to
+      .be.true;
+
+    const fullBps = { ...valid, thresholdBps: 10000 };
+    expect(NetFlowRateLimitedHookIsmConfigSchema.safeParse(fullBps).success).to
+      .be.false;
+  });
+});
+
+describe('DelayedFlowRouterHookIsmConfigSchema', () => {
+  const ROUTER_20_BYTE = '0xDEaDbeEfdEAdbeEfDeadBEeFdeadbeefDeAdbEEf';
+  const ROUTER_32_BYTE_UPPER = ethers.utils.hexZeroPad(ROUTER_20_BYTE, 32);
+  const ROUTER_BYTES32_NORMALIZED = ROUTER_32_BYTE_UPPER.toLowerCase();
+
+  const valid = {
+    type: IsmType.DELAYED_FLOW_ROUTER,
+    warpRouter: SOME_ADDRESS,
+    thresholdBps: 500,
+    maxDelay: 3600,
+    duration: 86400n,
+    owner: OTHER_ADDRESS,
+  };
+
+  it('parses a DELAYED_FLOW_ROUTER standalone via its own schema, but only in a compliant aggregation via the union', () => {
+    expect(DelayedFlowRouterHookIsmConfigSchema.safeParse(valid).success).to.be
+      .true;
+    expect(IsmConfigSchema.safeParse(valid).success).to.be.false;
+    expect(IsmConfigSchema.safeParse(compliantAggregation(valid)).success).to.be
+      .true;
+  });
+
+  it('enforces the operational maxDelay bound', () => {
+    expect(
+      DelayedFlowRouterHookIsmConfigSchema.safeParse({
+        ...valid,
+        maxDelay: MAX_SAFE_UINT48,
+      }).success,
+    ).to.be.true;
+    expect(
+      DelayedFlowRouterHookIsmConfigSchema.safeParse({
+        ...valid,
+        maxDelay: MAX_SAFE_UINT48 + 1,
+      }).success,
+    ).to.be.false;
+  });
+
+  it('parses a DELAYED_FLOW_ROUTER without warpRouter (injected by the warp deploy machinery)', () => {
+    const withoutWarpRouter = { ...valid, warpRouter: undefined };
+    expect(
+      DelayedFlowRouterHookIsmConfigSchema.safeParse(withoutWarpRouter).success,
+    ).to.be.true;
+  });
+
+  it('permits a 100% thresholdBps (delay mode) but nothing above', () => {
+    const fullBps = { ...valid, thresholdBps: 10000 };
+    expect(DelayedFlowRouterHookIsmConfigSchema.safeParse(fullBps).success).to
+      .be.true;
+
+    const aboveFullBps = { ...valid, thresholdBps: 10001 };
+    expect(DelayedFlowRouterHookIsmConfigSchema.safeParse(aboveFullBps).success)
+      .to.be.false;
+  });
+
+  it('rejects a zero duration on a DELAYED_FLOW_ROUTER', () => {
+    const invalid = { ...valid, duration: 0n };
+    expect(DelayedFlowRouterHookIsmConfigSchema.safeParse(invalid).success).to
+      .be.false;
+  });
+
+  it('normalizes 20-byte and mixed-case 32-byte remote routers to lowercase bytes32', () => {
+    const config = {
+      ...valid,
+      remoteIsms: { test2: ROUTER_20_BYTE, test3: ROUTER_32_BYTE_UPPER },
+    };
+    const parsed = DelayedFlowRouterHookIsmConfigSchema.parse(config);
+    expect(parsed.remoteIsms).to.deep.equal({
+      test2: ROUTER_BYTES32_NORMALIZED,
+      test3: ROUTER_BYTES32_NORMALIZED,
+    });
+  });
+
+  it('rejects remote router values that are neither 20 nor 32 bytes', () => {
+    for (const badValue of ['0x1234', '0x' + 'a'.repeat(63), 'deadbeef']) {
+      const invalid = { ...valid, remoteIsms: { test2: badValue } };
+      expect(DelayedFlowRouterHookIsmConfigSchema.safeParse(invalid).success).to
+        .be.false;
+    }
+  });
+
+  it('rejects zero remote routers', () => {
+    for (const badValue of [
+      ethers.constants.AddressZero,
+      ethers.utils.hexZeroPad(ethers.constants.AddressZero, 32),
+    ]) {
+      const invalid = { ...valid, remoteIsms: { test2: badValue } };
+      expect(DelayedFlowRouterHookIsmConfigSchema.safeParse(invalid).success).to
+        .be.false;
+    }
+  });
+
+  it('accepts a non-EVM bytes32 remote router', () => {
+    const nonEvmRouter = '0x' + '1'.repeat(24) + ROUTER_20_BYTE.slice(2);
+    const parsed = DelayedFlowRouterHookIsmConfigSchema.parse({
+      ...valid,
+      remoteIsms: { test2: nonEvmRouter },
+    });
+    expect(parsed.remoteIsms).to.deep.equal({
+      test2: nonEvmRouter.toLowerCase(),
+    });
+  });
+});
+
+describe('ModuleType', () => {
+  // Must match solidity/contracts/interfaces/IInterchainSecurityModule.sol's
+  // Types enum exactly (COMPOSITE is Sealevel-only, no Solidity counterpart —
+  // matches rust/main/hyperlane-core's ModuleType instead).
+  it('has explicit values matching IInterchainSecurityModule.sol', () => {
+    expect(ModuleType.UNUSED).to.equal(0);
+    expect(ModuleType.ROUTING).to.equal(1);
+    expect(ModuleType.AGGREGATION).to.equal(2);
+    expect(ModuleType.LEGACY_MULTISIG).to.equal(3);
+    expect(ModuleType.MERKLE_ROOT_MULTISIG).to.equal(4);
+    expect(ModuleType.MESSAGE_ID_MULTISIG).to.equal(5);
+    expect(ModuleType.NULL).to.equal(6);
+    expect(ModuleType.CCIP_READ).to.equal(7);
+    expect(ModuleType.ARB_L2_TO_L1).to.equal(8);
+    expect(ModuleType.WEIGHTED_MERKLE_ROOT_MULTISIG).to.equal(9);
+    expect(ModuleType.WEIGHTED_MESSAGE_ID_MULTISIG).to.equal(10);
+    expect(ModuleType.OP_L2_TO_L1).to.equal(11);
+    expect(ModuleType.POLYMER).to.equal(12);
+    expect(ModuleType.COMPOSITE).to.equal(13);
+  });
+
+  it('maps IsmType.COMPOSITE to ModuleType.COMPOSITE', () => {
+    expect(ismTypeToModuleType(IsmType.COMPOSITE)).to.equal(
+      ModuleType.COMPOSITE,
+    );
+  });
+});
+
+describe('RoutingMessageIdMultisigIsmConfigSchema', () => {
+  const VALIDATOR_A = '0x' + 'a'.repeat(40);
+  const VALIDATOR_B = '0x' + 'b'.repeat(40);
+  const base = {
+    type: IsmType.ROUTING_MESSAGE_ID_MULTISIG,
+    owner: SEALEVEL_ADDRESS,
+    domains: {
+      ethereum: { validators: [VALIDATOR_A, VALIDATOR_B], threshold: 2 },
+      test2: { validators: [VALIDATOR_A], threshold: 1 },
+    },
+  };
+
+  it('maps to ModuleType.MESSAGE_ID_MULTISIG', () => {
+    expect(ismTypeToModuleType(IsmType.ROUTING_MESSAGE_ID_MULTISIG)).to.equal(
+      ModuleType.MESSAGE_ID_MULTISIG,
+    );
+  });
+
+  interface ValidatorsIssueCase {
+    name: string;
+    validators: unknown;
+    threshold?: number;
+    issues: { path: (string | number)[]; message: string }[];
+  }
+  const THRESHOLD_ISSUE = {
+    path: ['domains', 'ethereum', 'threshold'],
+    message:
+      'Threshold must be between 1 and the number of validators (inclusive)',
+  };
+  const validatorsIssueCases: ValidatorsIssueCase[] = [
+    {
+      name: 'threshold 0',
+      validators: [VALIDATOR_A],
+      threshold: 0,
+      issues: [THRESHOLD_ISSUE],
+    },
+    {
+      name: 'a threshold greater than the validator count',
+      validators: [VALIDATOR_A],
+      threshold: 2,
+      issues: [THRESHOLD_ISSUE],
+    },
+    {
+      name: 'duplicate validators differing by case',
+      validators: ['0x' + 'ab'.repeat(20), '0x' + 'AB'.repeat(20)],
+      issues: [
+        {
+          path: ['domains', 'ethereum', 'validators'],
+          message: `Duplicate validator address: 0x${'AB'.repeat(20)}`,
+        },
+      ],
+    },
+    {
+      name: 'an empty validator set',
+      validators: [],
+      issues: [
+        {
+          path: ['domains', 'ethereum', 'validators'],
+          message: 'At least one validator is required',
+        },
+        {
+          path: ['domains', 'ethereum', 'threshold'],
+          message:
+            'Threshold must be between 1 and the number of validators (inclusive)',
+        },
+      ],
+    },
+    {
+      name: 'a non-array validator set',
+      validators: VALIDATOR_A,
+      issues: [
+        {
+          path: ['domains', 'ethereum', 'validators'],
+          message: 'Invalid input: expected array, received string',
+        },
+      ],
+    },
+    {
+      name: 'a bad validator address',
+      validators: ['0x1234'],
+      issues: [
+        {
+          path: ['domains', 'ethereum', 'validators', 0],
+          message: 'must be a 20-byte (0x + 40 hex chars) address',
+        },
+      ],
+    },
+  ];
+  for (const c of validatorsIssueCases) {
+    it(`reports the exact issue for ${c.name}`, () => {
+      const result = RoutingMessageIdMultisigIsmConfigSchema.safeParse({
+        ...base,
+        domains: {
+          ethereum: {
+            validators: c.validators,
+            threshold: c.threshold ?? 1,
+          },
+        },
+      });
+      assert(!result.success, 'expected the config to be rejected');
+      expect(
+        result.error.issues.map((i) => ({ path: i.path, message: i.message })),
+      ).to.deep.equal(c.issues);
+    });
+  }
+
+  it('parses via the schema and the top-level IsmConfigSchema union', () => {
+    const direct = RoutingMessageIdMultisigIsmConfigSchema.safeParse(base);
+    expect(direct.success).to.be.true;
+    if (direct.success) {
+      expect(direct.data.domains.ethereum.threshold).to.equal(2);
+    }
+    expect(IsmConfigSchema.safeParse(base).success).to.be.true;
+  });
+
+  interface OwnerCase {
+    name: string;
+    owner: string;
+  }
+  const ownerCases: OwnerCase[] = [
+    { name: 'a base58 Sealevel owner', owner: SEALEVEL_ADDRESS },
+    {
+      name: 'the reader renounced-owner sentinel',
+      owner: ZERO_ADDRESS_HEX_32,
+    },
+  ];
+  for (const c of ownerCases) {
+    it(`parses ${c.name}`, () => {
+      const result = RoutingMessageIdMultisigIsmConfigSchema.safeParse({
+        ...base,
+        owner: c.owner,
+      });
+      assert(result.success, 'expected the config to parse');
+      expect(result.data.owner).to.equal(c.owner);
+    });
+  }
+});
+
+describe('CompositeIsmConfigSchema', () => {
+  const sample: CompositeIsmConfig = {
+    type: IsmType.COMPOSITE,
+    owner: SEALEVEL_ADDRESS,
+    root: {
+      type: CompositeIsmNodeType.AGGREGATION,
+      threshold: 2,
+      subIsms: [
+        {
+          type: CompositeIsmNodeType.TRUSTED_RELAYER,
+          relayer: SEALEVEL_ADDRESS,
+        },
+        {
+          type: CompositeIsmNodeType.ROUTING,
+          domains: {
+            solanamainnet: { type: CompositeIsmNodeType.TEST, accept: true },
+          },
+        },
+        {
+          type: CompositeIsmNodeType.AMOUNT_ROUTING,
+          threshold: '1000000',
+          lower: { type: CompositeIsmNodeType.PAUSABLE, paused: false },
+          upper: {
+            type: CompositeIsmNodeType.RATE_LIMITED,
+            maxCapacity: '86400',
+            mailbox: SEALEVEL_ADDRESS,
+            recipient: H256_ADDRESS,
+          },
+        },
+      ],
+    },
+  };
+
+  it('parses a nested composite ISM tree', () => {
+    const result = CompositeIsmConfigSchema.safeParse(sample);
+    expect(result.success).to.be.true;
+  });
+
+  it('parses via the top-level IsmConfigSchema union', () => {
+    const result = IsmConfigSchema.safeParse(sample);
+    expect(result.success).to.be.true;
+    if (
+      result.success &&
+      typeof result.data === 'object' &&
+      result.data !== null &&
+      'type' in result.data
+    ) {
+      expect(result.data.type).to.equal(IsmType.COMPOSITE);
+    }
+  });
+
+  it('rejects an unknown node type', () => {
+    const invalid = {
+      ...sample,
+      root: { type: 'notARealNodeType', foo: 'bar' },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects an aggregation node with an out-of-range threshold', () => {
+    const tooHigh = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.AGGREGATION,
+        threshold: 5,
+        subIsms: [
+          {
+            type: CompositeIsmNodeType.TRUSTED_RELAYER,
+            relayer: SEALEVEL_ADDRESS,
+          },
+        ],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(tooHigh).success).to.be.false;
+
+    const tooLow = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.AGGREGATION,
+        threshold: 0,
+        subIsms: [
+          {
+            type: CompositeIsmNodeType.TRUSTED_RELAYER,
+            relayer: SEALEVEL_ADDRESS,
+          },
+        ],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(tooLow).success).to.be.false;
+  });
+
+  it('rejects a multisigMessageId node with duplicate validators', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.MULTISIG_MESSAGE_ID,
+        threshold: 1,
+        validators: [SOME_ADDRESS, '0x' + SOME_ADDRESS.slice(2).toUpperCase()],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects a multisigMessageId node with an out-of-range threshold', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.MULTISIG_MESSAGE_ID,
+        threshold: 3,
+        validators: [SOME_ADDRESS, OTHER_ADDRESS],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects a multisigMessageId node with a non-integer threshold', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.MULTISIG_MESSAGE_ID,
+        threshold: 1.5,
+        validators: [SOME_ADDRESS, OTHER_ADDRESS],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects a multisigMessageId node with a base58 pubkey as a validator', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.MULTISIG_MESSAGE_ID,
+        threshold: 1,
+        validators: [SEALEVEL_ADDRESS],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects a rateLimited node with a zero mailbox or zero recipient', () => {
+    const zeroMailbox = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.RATE_LIMITED,
+        maxCapacity: '86400',
+        mailbox: SEALEVEL_ZERO_ADDRESS,
+        recipient: H256_ADDRESS,
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(zeroMailbox).success).to.be.false;
+
+    const zeroRecipient = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.RATE_LIMITED,
+        maxCapacity: '86400',
+        mailbox: SEALEVEL_ADDRESS,
+        recipient: H256_ZERO,
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(zeroRecipient).success).to.be
+      .false;
+  });
+
+  it('accepts a rateLimited node with an omitted recipient', () => {
+    const omittedRecipient = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.RATE_LIMITED,
+        maxCapacity: '86400',
+        mailbox: SEALEVEL_ADDRESS,
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(omittedRecipient).success).to.be
+      .true;
+  });
+
+  it('accepts a rateLimited node nested under a routing domain with an omitted recipient', () => {
+    const omittedRecipient = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.ROUTING,
+        domains: {
+          ethereum: {
+            type: CompositeIsmNodeType.RATE_LIMITED,
+            maxCapacity: '86400',
+            mailbox: SEALEVEL_ADDRESS,
+          },
+        },
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(omittedRecipient).success).to.be
+      .true;
+  });
+
+  it('rejects a rateLimited node with maxCapacity above u64::MAX', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.RATE_LIMITED,
+        maxCapacity: (2n ** 64n).toString(),
+        mailbox: SEALEVEL_ADDRESS,
+        recipient: H256_ADDRESS,
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects an amountRouting node with threshold above u256::MAX', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.AMOUNT_ROUTING,
+        threshold: (2n ** 256n).toString(),
+        lower: { type: CompositeIsmNodeType.TEST, accept: true },
+        upper: { type: CompositeIsmNodeType.TEST, accept: false },
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects malformed decimal strings without throwing', () => {
+    for (const badValue of ['abc', '1.5', '', '-1', '0x10']) {
+      const invalid = {
+        ...sample,
+        root: {
+          type: CompositeIsmNodeType.RATE_LIMITED,
+          maxCapacity: badValue,
+          mailbox: SEALEVEL_ADDRESS,
+          recipient: H256_ADDRESS,
+        },
+      };
+      // The assertion itself is the regression check: safeParse must not
+      // throw for malformed input (BigInt(value) inside the schema's
+      // overflow refine would throw for non-digit strings if unguarded).
+      expect(() => CompositeIsmConfigSchema.safeParse(invalid)).to.not.throw();
+      expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+    }
+  });
+
+  it('rejects a multisigMessageId/aggregation threshold above u8::MAX', () => {
+    const validators = Array.from(
+      { length: 256 },
+      (_, i) => '0x' + (i + 1).toString(16).padStart(40, '0'),
+    );
+    const invalidMultisig = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.MULTISIG_MESSAGE_ID,
+        threshold: 256,
+        validators,
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalidMultisig).success).to.be
+      .false;
+
+    const invalidAggregation = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.AGGREGATION,
+        threshold: 256,
+        subIsms: [
+          {
+            type: CompositeIsmNodeType.TRUSTED_RELAYER,
+            relayer: SEALEVEL_ADDRESS,
+          },
+        ],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalidAggregation).success).to.be
+      .false;
+  });
+
+  it('rejects a trustedRelayer node with a zero relayer', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.TRUSTED_RELAYER,
+        relayer: SEALEVEL_ZERO_ADDRESS,
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects a trustedRelayer node with an EVM-style hex relayer', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.TRUSTED_RELAYER,
+        relayer: SOME_ADDRESS,
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects base58-alphabet strings that do not decode to a real 32-byte pubkey', () => {
+    // Both are valid base58 alphabet + within the naive 32-44 char length
+    // range, but neither actually decodes to a 32-byte public key.
+    const wrongAlphabetDensity = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.TRUSTED_RELAYER,
+        relayer: 'z'.repeat(32),
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(wrongAlphabetDensity).success).to
+      .be.false;
+
+    const wrongWidth = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.TRUSTED_RELAYER,
+        relayer: '1'.repeat(33),
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(wrongWidth).success).to.be.false;
+  });
+
+  it('rejects more than one routing/fallbackRouting node in the tree', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.AGGREGATION,
+        threshold: 1,
+        subIsms: [
+          { type: CompositeIsmNodeType.ROUTING, domains: {} },
+          {
+            type: CompositeIsmNodeType.FALLBACK_ROUTING,
+            fallbackIsm: SEALEVEL_ADDRESS,
+            domains: {},
+          },
+        ],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects a fallbackRouting node with a zero fallbackIsm', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.FALLBACK_ROUTING,
+        fallbackIsm: SEALEVEL_ZERO_ADDRESS,
+        domains: {},
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects fallbackRouting nested anywhere but last in an aggregation', () => {
+    const invalid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.AGGREGATION,
+        threshold: 2,
+        subIsms: [
+          {
+            type: CompositeIsmNodeType.FALLBACK_ROUTING,
+            fallbackIsm: SEALEVEL_ADDRESS,
+            domains: {},
+          },
+          {
+            type: CompositeIsmNodeType.TRUSTED_RELAYER,
+            relayer: SEALEVEL_ADDRESS,
+          },
+        ],
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(invalid).success).to.be.false;
+  });
+
+  it('rejects routing, fallbackRouting, or pausable nested inside a domain override', () => {
+    const nestedRouting = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.ROUTING,
+        domains: {
+          ethereum: { type: CompositeIsmNodeType.ROUTING, domains: {} },
+        },
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(nestedRouting).success).to.be
+      .false;
+
+    const nestedFallbackRouting = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.ROUTING,
+        domains: {
+          ethereum: {
+            type: CompositeIsmNodeType.FALLBACK_ROUTING,
+            fallbackIsm: SEALEVEL_ADDRESS,
+            domains: {},
+          },
+        },
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(nestedFallbackRouting).success).to
+      .be.false;
+
+    const nestedPausable = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.ROUTING,
+        domains: {
+          ethereum: { type: CompositeIsmNodeType.PAUSABLE, paused: false },
+        },
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(nestedPausable).success).to.be
+      .false;
+  });
+
+  it('accepts a domain override with an allowed nested type', () => {
+    const valid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.ROUTING,
+        domains: {
+          ethereum: {
+            type: CompositeIsmNodeType.MULTISIG_MESSAGE_ID,
+            validators: [SOME_ADDRESS, OTHER_ADDRESS],
+            threshold: 1,
+          },
+        },
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(valid).success).to.be.true;
+  });
+
+  it('accepts a second, distinct base58 pubkey for trustedRelayer', () => {
+    const valid = {
+      ...sample,
+      root: {
+        type: CompositeIsmNodeType.TRUSTED_RELAYER,
+        relayer: OTHER_SEALEVEL_ADDRESS,
+      },
+    };
+    expect(CompositeIsmConfigSchema.safeParse(valid).success).to.be.true;
+  });
+});
+
+describe('RateLimitedIsmConfigSchema duration default', () => {
+  const baseConfig = {
+    type: IsmType.RATE_LIMITED,
+    maxCapacity: '86400',
+  };
+
+  it('defaults duration to 1 day (86400s) when omitted', () => {
+    const result = RateLimitedIsmConfigSchema.safeParse(baseConfig);
+
+    assert(
+      result.success,
+      'expected RateLimitedIsmConfigSchema parse to succeed',
+    );
+    expect(result.data.duration).to.equal(RATE_LIMIT_DEFAULT_DURATION_SECONDS);
+  });
+
+  it('honors an explicitly provided duration', () => {
+    const result = RateLimitedIsmConfigSchema.safeParse({
+      ...baseConfig,
+      maxCapacity: '172800',
+      duration: 172800n,
+    });
+
+    assert(
+      result.success,
+      'expected RateLimitedIsmConfigSchema parse to succeed',
+    );
+    expect(result.data.duration).to.equal(172800n);
+  });
+});
+
+describe('BlacklistIsmConfigSchema composition', () => {
+  const blacklist = {
+    type: IsmType.BLACKLIST,
+    owner: SOME_ADDRESS,
+    blacklistedIds: [],
+  };
+  const blacklistWithoutIds = {
+    type: IsmType.BLACKLIST,
+    owner: SOME_ADDRESS,
+  };
+  const messageIdMultisig = {
+    type: IsmType.MESSAGE_ID_MULTISIG,
+    validators: [SOME_ADDRESS],
+    threshold: 1,
+  };
+  const merkleRootMultisig = {
+    type: IsmType.MERKLE_ROOT_MULTISIG,
+    validators: [OTHER_ADDRESS],
+    threshold: 1,
+  };
+
+  it('rejects a standalone blacklist ISM', () => {
+    const result = IsmConfigSchema.safeParse(blacklist);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('rejects a blacklist ISM as a routing domain target', () => {
+    const config = {
+      type: IsmType.ROUTING,
+      owner: SOME_ADDRESS,
+      domains: { ethereum: blacklist },
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('rejects a blacklist ISM under a non-exhaustive aggregation', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      modules: [messageIdMultisig, blacklist],
+      threshold: 1,
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('rejects a blacklist under an exhaustive aggregation nested in a non-exhaustive one', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      threshold: 1,
+      modules: [
+        messageIdMultisig,
+        {
+          type: IsmType.AGGREGATION,
+          modules: [messageIdMultisig, blacklist],
+          threshold: 2,
+        },
+      ],
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('accepts a blacklist in an exhaustive aggregation alongside a multisig', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      modules: [messageIdMultisig, blacklist],
+      threshold: 2,
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.true;
+  });
+
+  it('accepts an exhaustive aggregation of two blacklists', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      modules: [blacklist, blacklist],
+      threshold: 2,
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.true;
+  });
+
+  it('accepts a blacklist inside an exhaustive aggregation behind a routing domain', () => {
+    const config = {
+      type: IsmType.ROUTING,
+      owner: SOME_ADDRESS,
+      domains: {
+        ethereum: {
+          type: IsmType.AGGREGATION,
+          modules: [messageIdMultisig, blacklist],
+          threshold: 2,
+        },
+      },
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.true;
+  });
+
+  it('still parses a routing → aggregation tree without any blacklist', () => {
+    const config = {
+      type: IsmType.ROUTING,
+      owner: SOME_ADDRESS,
+      domains: {
+        ethereum: {
+          type: IsmType.AGGREGATION,
+          modules: [merkleRootMultisig, messageIdMultisig],
+          threshold: 2,
+        },
+      },
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.true;
+  });
+
+  it('rejects a blacklist as the lowerIsm of an amount routing ISM', () => {
+    const config = {
+      type: IsmType.AMOUNT_ROUTING,
+      lowerIsm: blacklist,
+      upperIsm: messageIdMultisig,
+      threshold: 1,
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('rejects a blacklist as the upperIsm of an amount routing ISM', () => {
+    const config = {
+      type: IsmType.AMOUNT_ROUTING,
+      lowerIsm: messageIdMultisig,
+      upperIsm: blacklist,
+      threshold: 1,
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('accepts a blacklist inside an exhaustive aggregation behind an amount routing target', () => {
+    const config = {
+      type: IsmType.AMOUNT_ROUTING,
+      lowerIsm: {
+        type: IsmType.AGGREGATION,
+        modules: [messageIdMultisig, blacklist],
+        threshold: 2,
+      },
+      upperIsm: messageIdMultisig,
+      threshold: 1,
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.true;
+  });
+
+  it('rejects a blacklist behind a routing domain under a non-exhaustive aggregation', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      threshold: 1,
+      modules: [
+        messageIdMultisig,
+        {
+          type: IsmType.ROUTING,
+          owner: SOME_ADDRESS,
+          domains: {
+            ethereum: {
+              type: IsmType.AGGREGATION,
+              modules: [messageIdMultisig, blacklist],
+              threshold: 2,
+            },
+          },
+        },
+      ],
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('rejects a blacklist behind an amount routing target under a non-exhaustive aggregation', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      threshold: 1,
+      modules: [
+        messageIdMultisig,
+        {
+          type: IsmType.AMOUNT_ROUTING,
+          lowerIsm: {
+            type: IsmType.AGGREGATION,
+            modules: [messageIdMultisig, blacklist],
+            threshold: 2,
+          },
+          upperIsm: messageIdMultisig,
+          threshold: 1,
+        },
+      ],
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('accepts a blacklist behind a routing domain under an exhaustive aggregation', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      threshold: 2,
+      modules: [
+        messageIdMultisig,
+        {
+          type: IsmType.ROUTING,
+          owner: SOME_ADDRESS,
+          domains: {
+            ethereum: {
+              type: IsmType.AGGREGATION,
+              modules: [messageIdMultisig, blacklist],
+              threshold: 2,
+            },
+          },
+        },
+      ],
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.true;
+  });
+
+  it('accepts a blacklist behind an amount routing target under an exhaustive aggregation', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      threshold: 2,
+      modules: [
+        messageIdMultisig,
+        {
+          type: IsmType.AMOUNT_ROUTING,
+          lowerIsm: {
+            type: IsmType.AGGREGATION,
+            modules: [messageIdMultisig, blacklist],
+            threshold: 2,
+          },
+          upperIsm: messageIdMultisig,
+          threshold: 1,
+        },
+      ],
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.true;
+  });
+
+  // A blacklist ISM is its entries; a config without them does not describe the
+  // deployment it names.
+  it('rejects a blacklist without blacklisted ids', () => {
+    const result = BlacklistIsmConfigSchema.safeParse(blacklistWithoutIds);
+
+    expect(result.success).to.be.false;
+  });
+
+  it('rejects a blacklist without blacklisted ids nested in an aggregation', () => {
+    const config = {
+      type: IsmType.AGGREGATION,
+      modules: [messageIdMultisig, blacklistWithoutIds],
+      threshold: 2,
+    };
+
+    const result = IsmConfigSchema.safeParse(config);
+
+    expect(result.success).to.be.false;
   });
 });

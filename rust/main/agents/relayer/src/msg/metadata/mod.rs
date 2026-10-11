@@ -6,6 +6,7 @@ mod message_builder;
 mod multisig;
 mod null_metadata;
 mod routing;
+mod sealevel_composite;
 
 pub(crate) use base::{
     AppContextClassifier, DefaultIsmCache, IsmAwareAppContextClassifier, IsmCacheConfig,
@@ -13,5 +14,7 @@ pub(crate) use base::{
     MetadataBuilder,
 };
 #[allow(unused_imports)]
-pub(crate) use base_builder::{BaseMetadataBuilder, BuildsBaseMetadata, IsmBuildMetricsParams};
+pub(crate) use base_builder::{
+    BaseMetadataBuilder, BuildsBaseMetadata, CheckpointSyncerPool, IsmBuildMetricsParams,
+};
 pub(crate) use message_builder::MessageMetadataBuilder;

@@ -1,3 +1,22 @@
+## [2.3.0] - 2026-07-20
+
+* chore: jun 5 deprecations (21 chains) (#8860)
+* feat(tron): migrate Tron agents from gRPC to HTTP API (#8370)
+* feat: index same chain ccr swaps (#8796)
+* feat: static interval override for idle indexing and validator checkpoint polling (#8989)
+* fix(scraper): retry dispatches on partial enrichment (#8891)
+* refactor(evm): remove evm tron techstack (#8408)
+* test(tron): agent e2e tests (#8427)
+
+## [2.1.0] - 2026-03-04
+
+* feat(agents): add chain configuration metrics (#8185)
+* feat(tron): add ethereum compatibility & tron aws signer (#8222)
+* feat: Store Raw Message Dispatches (#7714)
+* fix(scraper): Optimize message_view query performance
+* fix(scraper): Reorder message unique index to support origin-only queries (#7945)
+* fix(scraper): add retry logic to init-db database connection (#8068)
+
 ## [2.0.0] - 2026-01-06
 
 * chore: deprecate form, inevm, injective, mint, neutron, osmosis, svmbnb (#7646)

@@ -6,6 +6,7 @@ import {
   ChainGasOracleParams,
   ChainMap,
   ChainName,
+  ChainTechnicalStack,
   GasPriceConfig,
   ProtocolAgnositicGasOracleConfig,
   ProtocolAgnositicGasOracleConfigSchema,
@@ -21,6 +22,7 @@ import {
   assert,
   convertDecimals,
   fromWei,
+  isEVMLike,
   rootLogger,
   toWei,
 } from '@hyperlane-xyz/utils';
@@ -102,27 +104,36 @@ export const EXCHANGE_RATE_MARGIN_PCT = 50;
 // Gets the StorageGasOracleConfigWithTypicalCost for each remote chain for a particular local chain.
 // Accommodates small non-integer gas prices by scaling up the gas price
 // and scaling down the exchange rate by the same factor.
-function getLocalStorageGasOracleConfigOverride(
+// An optional fee token replaces only the local price/decimals; remotes retain
+// their native token prices, and the same margin/minimum USD cost still applies.
+export function getLocalStorageGasOracleConfigOverride(
   local: ChainName,
   remotes: ChainName[],
   tokenPrices: ChainMap<string>,
   gasPrices: ChainMap<GasPriceConfig>,
   getOverhead: (local: ChainName, remote: ChainName) => number,
   applyMinUsdCost: boolean,
+  onPrecisionFallback?: (ctx: { local: ChainName; remote: ChainName }) => void,
+  feeToken?: ChainGasOracleParams['nativeToken'],
 ): ChainMap<ProtocolAgnositicGasOracleConfigWithTypicalCost> {
   const localProtocolType = getChain(local).protocol;
   const localExchangeRateScale =
     getProtocolExchangeRateScale(localProtocolType);
-  const localNativeTokenDecimals = mustGetChainNativeToken(local).decimals;
+  const localNativeTokenDecimals =
+    feeToken?.decimals ?? mustGetChainNativeToken(local).decimals;
+  const localTokenUsdPrice = parseFloat(feeToken?.price ?? tokenPrices[local]);
 
   // Construct the gas oracle params for each remote chain
   const gasOracleParams = [local, ...remotes].reduce((agg, remote) => {
     agg[remote] = {
       gasPrice: gasPrices[remote],
-      nativeToken: {
-        price: tokenPrices[remote],
-        decimals: mustGetChainNativeToken(remote).decimals,
-      },
+      nativeToken:
+        remote === local && feeToken
+          ? feeToken
+          : {
+              price: tokenPrices[remote],
+              decimals: mustGetChainNativeToken(remote).decimals,
+            },
     };
     return agg;
   }, {} as ChainMap<ChainGasOracleParams>);
@@ -140,7 +151,6 @@ function getLocalStorageGasOracleConfigOverride(
       remoteProtocolType,
       getOverhead,
     );
-    const localTokenUsdPrice = parseFloat(tokenPrices[local]);
     const typicalIgpQuoteUsd = getUsdQuote(
       localTokenUsdPrice,
       localExchangeRateScale,
@@ -162,6 +172,30 @@ function getLocalStorageGasOracleConfigOverride(
     remote: ChainName,
     gasOracleConfig: ProtocolAgnositicGasOracleConfig,
   ): Parameters<typeof BigNumberJs>[0] => {
+    if (feeToken && isEVMLike(localProtocolType)) {
+      const { gasPrice, nativeToken } = gasOracleParams[remote];
+      // The SDK has already rounded/rebalanced the exchange rate. Recover the
+      // unrounded gasPrice * exchangeRate product from the snapshots, then
+      // compensate in gasPrice before checking the USD floor. This preserves
+      // the margin even for scaled rates >= 1 (e.g. 3.5352 rounded to 3).
+      const unroundedGasCost = new BigNumberJs(gasPrice.amount)
+        .times(new BigNumberJs(10).pow(gasPrice.decimals))
+        .times(nativeToken.price)
+        .times(100 + EXCHANGE_RATE_MARGIN_PCT)
+        .div(100)
+        .div(feeToken.price)
+        .times(
+          new BigNumberJs(10).pow(feeToken.decimals - nativeToken.decimals),
+        )
+        .times(localExchangeRateScale.toString());
+      gasOracleConfig = {
+        ...gasOracleConfig,
+        gasPrice: unroundedGasCost
+          .div(gasOracleConfig.tokenExchangeRate)
+          .integerValue(BigNumberJs.ROUND_CEIL)
+          .toFixed(0),
+      };
+    }
     if (!applyMinUsdCost) {
       return gasOracleConfig.gasPrice;
     }
@@ -172,7 +206,6 @@ function getLocalStorageGasOracleConfigOverride(
       getChain(remote).protocol,
       getOverhead,
     );
-    const localTokenUsdPrice = parseFloat(tokenPrices[local]);
     const typicalIgpQuoteUsd = getUsdQuote(
       localTokenUsdPrice,
       localExchangeRateScale,
@@ -233,6 +266,7 @@ function getLocalStorageGasOracleConfigOverride(
     exchangeRateMarginPct: EXCHANGE_RATE_MARGIN_PCT,
     gasPriceModifier,
     typicalCostGetter,
+    onPrecisionFallback,
   });
 }
 
@@ -245,6 +279,10 @@ export function getTypicalHandleGasAmount(
 
   if (remoteProtocolType === ProtocolType.Radix) {
     return 30_000_000;
+  }
+
+  if (remoteProtocolType === ProtocolType.Sealevel) {
+    return 300_000;
   }
 
   // A fairly arbitrary amount of gas used in a message's handle function,
@@ -267,6 +305,16 @@ function getMinUsdCost(local: ChainName, remote: ChainName): number {
   // By default, min cost is 20 cents
   let minUsdCost = 0.2;
 
+  // Break-even floor for messages to/from katana. Katana is polygoncdk with no
+  // getL1Fee predeploy, so tollkeeper models its delivery cost from a flat DA
+  // overhead plus the ~$0.03 per-message RPC cost; the prior $0.01 floor sat
+  // below that, running both katana lanes below break-even. $0.06 clears the
+  // modeled cost (~$0.05 base->katana, ~$0.041 katana->base) with headroom.
+  const katanaRoute = local === 'katana' || remote === 'katana';
+  if (katanaRoute) {
+    minUsdCost = 0.06;
+  }
+
   // For all SVM chains, min cost is 0.50 USD to cover rent needs
   if (getChain(remote).protocol === ProtocolType.Sealevel) {
     minUsdCost = Math.max(minUsdCost, 0.5);
@@ -276,32 +324,36 @@ function getMinUsdCost(local: ChainName, remote: ChainName): number {
     // mitosis
     mitosis: 0.1,
 
-    // For all SVM chains, min cost is 0.50 USD to cover rent needs
-    // For Ethereum L2s, we need to account for the L1 DA costs that
-    // aren't accounted for directly in the gas price.
-    ancient8: 0.5,
-    blast: 0.5,
-    mantapacific: 0.5,
-    polygonzkevm: 0.5,
+    // Tron uses an energy model, not gas. Delivery costs 80-110K energy
+    // ≈ 9-12 TRX ≈ $2.60-$3.50. Standard EVM gas math underestimates Tron costs.
+    tron: 4.0,
 
-    // Scroll is more expensive than the rest due to higher L1 fees
-    scroll: 1.5,
-    taiko: 0.5,
-    // For Solana, special min cost
-    solanamainnet: 1.2,
+    // skunkchain special
+    solanamainnet: 0.35,
+    // Ethereum floor ($0.12 -> $0.20). *->ethereum quotes are pinned to this floor; L1 gas rose to ~0.3 gwei (Sep 2026) and $0.12 ran 11 EVM lanes ~30% below break-even.
+    ethereum: 0.2,
+    arbitrum: 0.09,
+    // OP-stack L2 floors ($0.05 -> $0.10). These destinations pay an L1
+    // data-availability cost that is NOT in the L2 execution gasPrice, so only
+    // this floor covers it. That DA cost scales with L1 ETH gas (up materially
+    // vs the tokenPrices/gasPrices snapshot) and with validator-signature
+    // calldata size, which grew after the Aug-29 multisig change (#9371). At
+    // $0.05 the true cost (~$0.067 on the worst lane) exceeded the quote and
+    // these lanes ran below break-even; $0.10 restores the +50% target margin.
+    optimism: 0.1,
+    base: 0.1,
+    polygon: 0.05,
+    unichain: 0.1,
+    eclipsemainnet: 0.22,
   };
 
-  if (local === 'ethereum' && remote === 'solanamainnet') {
-    minUsdCost = 0.5;
-    remoteMinCostOverrides['solanamainnet'] = 0.9;
+  // Skip per-remote overrides on katana routes so the reduced floor isn't
+  // clobbered when sending from katana to a chain with a higher override.
+  if (katanaRoute) {
+    return minUsdCost;
   }
 
-  const override = remoteMinCostOverrides[remote];
-  if (override !== undefined) {
-    minUsdCost = Math.max(minUsdCost, override);
-  }
-
-  return minUsdCost;
+  return remoteMinCostOverrides[remote] ?? minUsdCost;
 }
 
 function getUsdQuote(
@@ -342,7 +394,7 @@ const FOREIGN_DEFAULT_OVERHEAD = 600_000;
 export function getOverhead(local: ChainName, remote: ChainName): number {
   const remoteProtocol = getChain(remote).protocol;
 
-  if (remoteProtocol === ProtocolType.Ethereum) {
+  if (isEVMLike(remoteProtocol)) {
     return multisigIsmVerificationCost(
       defaultMultisigConfigs[local].threshold,
       defaultMultisigConfigs[local].validators.length,
@@ -359,6 +411,28 @@ export function getOverhead(local: ChainName, remote: ChainName): number {
 
   // Default non-EVM overhead
   return FOREIGN_DEFAULT_OVERHEAD;
+}
+
+// Overhead with chain-specific multipliers for chains with non-standard gas usage.
+export function getOverheadWithOverrides(
+  local: ChainName,
+  remote: ChainName,
+): number {
+  let overhead = getOverhead(local, remote);
+
+  // Somnia gas usage is higher than the EVM and tends to give high
+  // estimates. We double the overhead to help account for this.
+  if (remote === 'somnia') {
+    overhead *= 2;
+  }
+
+  // ZkSync gas usage is different from the EVM and tends to give high
+  // estimates. We double the overhead to help account for this.
+  if (getChain(remote).technicalStack === ChainTechnicalStack.ZkSync) {
+    overhead *= 2;
+  }
+
+  return overhead;
 }
 
 // Gets the map of remote gas oracle configs for each local chain
@@ -384,31 +458,45 @@ export function getAllStorageGasOracleConfigs(
     }
   });
 
-  return chainNames
-    .filter((chain) => {
-      // For now, only support Ethereum and Sealevel chains.
-      // Cosmos chains should be supported in the future, but at the moment
-      // are more subject to loss of precision issues in the exchange rate,
-      // where we'd need to scale the gas price accordingly.
-      const protocol = getChain(chain).protocol;
-      return (
-        protocol === ProtocolType.Ethereum || protocol === ProtocolType.Sealevel
-      );
-    })
-    .reduce((agg, local) => {
-      const remotes = chainNames.filter((chain) => local !== chain);
-      return {
-        ...agg,
-        [local]: getLocalStorageGasOracleConfigOverride(
-          local,
-          remotes,
-          tokenPrices,
-          gasPrices,
-          getOverhead,
-          applyMinUsdCost,
-        ),
-      };
-    }, {}) as AllStorageGasOracleConfigs;
+  // Collect every local -> remote pair whose exchange rate underflowed and fell
+  // back to the on-chain minimum, so we can log a single summary line instead of
+  // one warning per pair (there can be dozens across the full chain matrix).
+  const flooredPairs = new Set<string>();
+  const onPrecisionFallback = ({
+    local,
+    remote,
+  }: {
+    local: ChainName;
+    remote: ChainName;
+  }) => flooredPairs.add(`${local} -> ${remote}`);
+
+  const configs = chainNames.reduce((agg, local) => {
+    const remotes = chainNames.filter((chain) => local !== chain);
+    return {
+      ...agg,
+      [local]: getLocalStorageGasOracleConfigOverride(
+        local,
+        remotes,
+        tokenPrices,
+        gasPrices,
+        getOverhead,
+        applyMinUsdCost,
+        onPrecisionFallback,
+      ),
+    };
+  }, {}) as AllStorageGasOracleConfigs;
+
+  if (flooredPairs.size > 0) {
+    rootLogger.warn(
+      `${flooredPairs.size} gas oracle pair(s) floored the token exchange rate to 1 after precision rebalance (expected for low-decimal fee tokens paying high-decimal remotes${
+        applyMinUsdCost
+          ? '; on-chain quote is backstopped by the min-USD-cost'
+          : ''
+      }): ${[...flooredPairs].join(', ')}`,
+    );
+  }
+
+  return configs;
 }
 
 // 5% threshold, adjust as needed

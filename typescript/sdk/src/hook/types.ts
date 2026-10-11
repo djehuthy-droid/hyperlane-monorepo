@@ -1,14 +1,30 @@
 import { z } from 'zod';
 
-import { Address, WithAddress } from '@hyperlane-xyz/utils';
+import {
+  Address,
+  WithAddress,
+  isAddressEvm,
+  isNullish,
+  isZeroishAddress,
+  rootLogger,
+} from '@hyperlane-xyz/utils';
 
-import { ProtocolAgnositicGasOracleConfigWithTypicalCostSchema } from '../gas/oracle/types.js';
-import { ZHash } from '../metadata/customZodTypes.js';
+import {
+  ProtocolAgnositicGasOracleConfigSchema,
+  ProtocolAgnositicGasOracleConfigWithTypicalCostSchema,
+} from '../gas/oracle/types.js';
+import { MAX_SAFE_UINT48, ZRouterBytes32 } from '../ism/types.js';
+import {
+  ZBigNumberish,
+  ZChainName,
+  ZHash,
+} from '../metadata/customZodTypes.js';
 import {
   ChainMap,
   OwnableConfig,
   OwnableSchema,
   PausableSchema,
+  RATE_LIMIT_DEFAULT_DURATION_SECONDS,
 } from '../types.js';
 
 // As found in IPostDispatchHook.sol
@@ -28,9 +44,17 @@ export enum OnchainHookType {
   OP_L2_TO_L1,
   MAILBOX_DEFAULT_HOOK,
   AMOUNT_ROUTING,
+  CCTP,
+  TIMELOCK_ROUTING,
+  PREDICATE_ROUTER_WRAPPER,
 }
 
 export const HookType = {
+  /**
+   * Retained for backwards compatibility with pre-deployed hooks that don't fit
+   * a named type. Excluded from `DeployableHookType` — cannot be deployed via
+   * `HyperlaneHookDeployer`. New code should use a specific named hook type.
+   */
   CUSTOM: 'custom',
   MERKLE_TREE: 'merkleTreeHook',
   INTERCHAIN_GAS_PAYMASTER: 'interchainGasPaymaster',
@@ -44,14 +68,48 @@ export const HookType = {
   ARB_L2_TO_L1: 'arbL2ToL1Hook',
   MAILBOX_DEFAULT: 'defaultHook',
   CCIP: 'ccipHook',
+  /**
+   * References a pre-deployed CCTP hook by address. Excluded from
+   * `DeployableHookType` — not deployed via `HyperlaneHookDeployer`; the
+   * `EvmHookModule.deploy` path just connects to `config.address`.
+   */
+  CCTP: 'cctpHook',
+  /**
+   * Rate-limits outbound token volume on the origin chain at dispatch time.
+   * Warp-route only. Not valid for core required/default hooks.
+   */
+  RATE_LIMITED: 'rateLimitedHook',
+  /**
+   * Hook view of the NetFlowRateLimitedHookIsm hybrid: one contract instance
+   * is installed as BOTH the hook and the ISM of a single warp router.
+   * Read-only on the hook side — deployed via the ISM config surface
+   * (IsmType.NET_FLOW_RATE_LIMITED) and referenced by address as the hook.
+   * Excluded from `DeployableHookType`.
+   */
+  NET_FLOW_RATE_LIMITED: 'netFlowRateLimitedHookIsm',
+  /**
+   * Hook view of the DelayedFlowRouterHookIsm hybrid (see
+   * NET_FLOW_RATE_LIMITED above; ISM-side type is
+   * IsmType.DELAYED_FLOW_ROUTER). Excluded from `DeployableHookType`.
+   */
+  DELAYED_FLOW_ROUTER: 'delayedFlowRouterHookIsm',
+  UNKNOWN: 'unknownHook',
+  PREDICATE: 'predicateHook',
 } as const;
 
 export type HookType = (typeof HookType)[keyof typeof HookType];
 
-export const HookTypeToContractNameMap: Record<
-  Exclude<HookType, typeof HookType.CUSTOM>,
-  string
-> = {
+export type DeployableHookType = Exclude<
+  HookType,
+  | typeof HookType.CUSTOM
+  | typeof HookType.PREDICATE
+  | typeof HookType.UNKNOWN
+  | typeof HookType.CCTP
+  | typeof HookType.NET_FLOW_RATE_LIMITED
+  | typeof HookType.DELAYED_FLOW_ROUTER
+>;
+
+export const HookTypeToContractNameMap: Record<DeployableHookType, string> = {
   [HookType.MERKLE_TREE]: 'merkleTreeHook',
   [HookType.INTERCHAIN_GAS_PAYMASTER]: 'interchainGasPaymaster',
   [HookType.AGGREGATION]: 'staticAggregationHook',
@@ -64,6 +122,7 @@ export const HookTypeToContractNameMap: Record<
   [HookType.ARB_L2_TO_L1]: 'arbL2ToL1Hook',
   [HookType.MAILBOX_DEFAULT]: 'defaultHook',
   [HookType.CCIP]: 'ccipHook',
+  [HookType.RATE_LIMITED]: 'rateLimitedHook',
 };
 
 export type MerkleTreeHookConfig = z.infer<typeof MerkleTreeSchema>;
@@ -71,17 +130,30 @@ export type IgpHookConfig = z.infer<typeof IgpSchema>;
 export type ProtocolFeeHookConfig = z.infer<typeof ProtocolFeeSchema>;
 export type PausableHookConfig = z.infer<typeof PausableHookSchema>;
 export type OpStackHookConfig = z.infer<typeof OpStackHookSchema>;
-export type ArbL2ToL1HookConfig = z.infer<typeof ArbL2ToL1HookSchema>;
+export type ArbL2ToL1HookConfig = {
+  type: typeof HookType.ARB_L2_TO_L1;
+  arbSys: string;
+  bridge?: string;
+  destinationChain: string;
+  childHook: HookConfig;
+};
 export type MailboxDefaultHookConfig = z.infer<typeof MailboxDefaultHookSchema>;
+export type RateLimitedHookConfig = z.infer<typeof RateLimitedHookSchema>;
 
 export type CCIPHookConfig = z.infer<typeof CCIPHookSchema>;
 // explicitly typed to avoid zod circular dependency
 export type AggregationHookConfig = {
   type: typeof HookType.AGGREGATION;
   hooks: Array<HookConfig>;
+  // Optional address of an already-deployed hook to recover instead of
+  // redeploying (mirrors the ISM derived-config schemas in ../ism/types.ts).
+  address?: Address;
 };
 export type RoutingHookConfig = OwnableConfig & {
   domains: ChainMap<HookConfig>;
+  // Optional address of an already-deployed hook to recover instead of
+  // redeploying (mirrors the ISM derived-config schemas in ../ism/types.ts).
+  address?: Address;
 };
 export type DomainRoutingHookConfig = RoutingHookConfig & {
   type: typeof HookType.ROUTING;
@@ -97,9 +169,49 @@ export type AmountRoutingHookConfig = {
   upperHook: HookConfig;
 };
 
-export type HookConfig = z.infer<typeof HookConfigSchema>;
+// Explicit (not z.infer) union: HookConfigSchema gets annotated with this type
+// below so downstream consumers reference this pre-computed type instead of
+// re-expanding the full union's structure on every use, which otherwise risks
+// TS2590 ("union too complex to represent") once the union is large enough.
+// Mirrors the same mitigation on IsmConfig in ../ism/types.ts.
+export type HookConfig =
+  | Address
+  | ProtocolFeeHookConfig
+  | PausableHookConfig
+  | OpStackHookConfig
+  | MerkleTreeHookConfig
+  | IgpHookConfig
+  | DomainRoutingHookConfig
+  | FallbackRoutingHookConfig
+  | AmountRoutingHookConfig
+  | AggregationHookConfig
+  | ArbL2ToL1HookConfig
+  | MailboxDefaultHookConfig
+  | CCIPHookConfig
+  | CctpHookConfig
+  | RateLimitedHookConfig
+  | NetFlowRateLimitedHookConfig
+  | DelayedFlowRouterHookConfig
+  | UnknownHookConfig
+  | PredicateHookConfig;
 
 export type DerivedHookConfig = WithAddress<Exclude<HookConfig, Address>>;
+
+export enum IgpVersion {
+  Legacy = 'legacy',
+  Latest = 'latest',
+}
+
+export const OFFCHAIN_QUOTED_IGP_VERSION = '11.3.0';
+
+const FeeTokenAddressSchema = z
+  .string()
+  .refine((feeToken) => isAddressEvm(feeToken), {
+    message: 'fee token must be an EVM address',
+  })
+  .refine((feeToken) => !isZeroishAddress(feeToken), {
+    message: 'fee token must not be the zero address',
+  });
 
 // Hook types that can be updated in-place
 export const MUTABLE_HOOK_TYPE: HookType[] = [
@@ -108,6 +220,7 @@ export const MUTABLE_HOOK_TYPE: HookType[] = [
   HookType.ROUTING,
   HookType.FALLBACK_ROUTING,
   HookType.PAUSABLE,
+  HookType.RATE_LIMITED,
 ];
 
 export const ProtocolFeeSchema = OwnableSchema.extend({
@@ -119,10 +232,22 @@ export const ProtocolFeeSchema = OwnableSchema.extend({
 
 export const MerkleTreeSchema = z.object({
   type: z.literal(HookType.MERKLE_TREE),
+  // Optional address of an already-deployed hook to recover instead of
+  // redeploying (mirrors the ISM derived-config schemas in ../ism/types.ts).
+  address: ZHash.optional(),
 });
+
+export const PredicateHookSchema = z.object({
+  type: z.literal(HookType.PREDICATE),
+  address: z.string(),
+});
+export type PredicateHookConfig = z.infer<typeof PredicateHookSchema>;
 
 export const PausableHookSchema = PausableSchema.extend({
   type: z.literal(HookType.PAUSABLE),
+  // Optional address of an already-deployed hook to recover instead of
+  // redeploying (mirrors the ISM derived-config schemas in ../ism/types.ts).
+  address: ZHash.optional(),
 });
 
 export const MailboxDefaultHookSchema = z.object({
@@ -135,72 +260,229 @@ export const OpStackHookSchema = OwnableSchema.extend({
   destinationChain: z.string(),
 });
 
-export const ArbL2ToL1HookSchema = z.object({
-  type: z.literal(HookType.ARB_L2_TO_L1),
-  arbSys: z
-    .string()
-    .describe(
-      'precompile for sending messages to L1, interface here: https://github.com/OffchainLabs/nitro-contracts/blob/90037b996509312ef1addb3f9352457b8a99d6a6/src/precompiles/ArbSys.sol#L12',
-    ),
-  bridge: z
-    .string()
-    .optional()
-    .describe(
-      'address of the bridge contract on L1, optional only needed for non @arbitrum/sdk chains',
-    ),
-  destinationChain: z.string(),
-  childHook: z.lazy((): z.ZodSchema => HookConfigSchema),
-});
+export const ArbL2ToL1HookSchema: z.ZodType<ArbL2ToL1HookConfig, unknown> =
+  z.lazy(() =>
+    z.object({
+      type: z.literal(HookType.ARB_L2_TO_L1),
+      arbSys: z
+        .string()
+        .describe(
+          'precompile for sending messages to L1, interface here: https://github.com/OffchainLabs/nitro-contracts/blob/90037b996509312ef1addb3f9352457b8a99d6a6/src/precompiles/ArbSys.sol#L12',
+        ),
+      bridge: z
+        .string()
+        .optional()
+        .describe(
+          'address of the bridge contract on L1, optional only needed for non @arbitrum/sdk chains',
+        ),
+      destinationChain: z.string(),
+      childHook: HookConfigSchema,
+    }),
+  );
 
 export const IgpSchema = OwnableSchema.extend({
   type: z.literal(HookType.INTERCHAIN_GAS_PAYMASTER),
   beneficiary: z.string(),
   oracleKey: z.string(),
-  overhead: z.record(z.number()),
-  oracleConfig: z.record(ProtocolAgnositicGasOracleConfigWithTypicalCostSchema),
+  overhead: z.record(z.string(), z.number()),
+  oracleConfig: z.record(
+    z.string(),
+    ProtocolAgnositicGasOracleConfigWithTypicalCostSchema,
+  ),
+  igpVersion: z.enum(IgpVersion).optional(),
+  quoteSigners: z.array(z.string()).optional(),
+  contractVersion: z.string().optional(),
+  // Per-fee-token gas oracles for ERC20-denominated interchain gas payments.
+  // Keyed by fee token address -> remote chain -> oracle config. Each fee token
+  // gets its own StorageGasOracle (the IGasOracle interface is keyed only by
+  // destination, so distinct exchange rates require distinct oracle instances).
+  // Optional and off by default; only wired when present and the IGP supports
+  // tokenGasOracles (>= OFFCHAIN_QUOTED_IGP_VERSION, non-legacy).
+  tokenOracleConfig: z
+    .record(
+      FeeTokenAddressSchema,
+      z.record(ZChainName, ProtocolAgnositicGasOracleConfigSchema),
+    )
+    .optional(),
 });
 
-export const DomainRoutingHookConfigSchema: z.ZodSchema<DomainRoutingHookConfig> =
-  z.lazy(() =>
-    OwnableSchema.extend({
-      type: z.literal(HookType.ROUTING),
-      domains: z.record(HookConfigSchema),
-    }),
-  );
+export const DomainRoutingHookConfigSchema: z.ZodType<
+  DomainRoutingHookConfig,
+  unknown
+> = z.lazy(() =>
+  OwnableSchema.extend({
+    type: z.literal(HookType.ROUTING),
+    domains: z.record(z.string(), HookConfigSchema),
+    address: ZHash.optional(),
+  }),
+);
 
-export const FallbackRoutingHookConfigSchema: z.ZodSchema<FallbackRoutingHookConfig> =
-  z.lazy(() =>
-    OwnableSchema.extend({
-      type: z.literal(HookType.FALLBACK_ROUTING),
-      domains: z.record(HookConfigSchema),
-      fallback: HookConfigSchema,
-    }),
-  );
+export const FallbackRoutingHookConfigSchema: z.ZodType<
+  FallbackRoutingHookConfig,
+  unknown
+> = z.lazy(() =>
+  OwnableSchema.extend({
+    type: z.literal(HookType.FALLBACK_ROUTING),
+    domains: z.record(z.string(), HookConfigSchema),
+    fallback: HookConfigSchema,
+    address: ZHash.optional(),
+  }),
+);
 
-export const AmountRoutingHookConfigSchema: z.ZodSchema<AmountRoutingHookConfig> =
-  z.lazy(() =>
-    z.object({
-      type: z.literal(HookType.AMOUNT_ROUTING),
-      threshold: z.number(),
-      lowerHook: HookConfigSchema,
-      upperHook: HookConfigSchema,
-    }),
-  );
+export const AmountRoutingHookConfigSchema: z.ZodType<
+  AmountRoutingHookConfig,
+  unknown
+> = z.lazy(() =>
+  z.object({
+    type: z.literal(HookType.AMOUNT_ROUTING),
+    threshold: z.number(),
+    lowerHook: HookConfigSchema,
+    upperHook: HookConfigSchema,
+  }),
+);
 
-export const AggregationHookConfigSchema: z.ZodSchema<AggregationHookConfig> =
-  z.lazy(() =>
-    z.object({
-      type: z.literal(HookType.AGGREGATION),
-      hooks: z.array(HookConfigSchema),
-    }),
-  );
+export const AggregationHookConfigSchema: z.ZodType<
+  AggregationHookConfig,
+  unknown
+> = z.lazy(() =>
+  z.object({
+    type: z.literal(HookType.AGGREGATION),
+    hooks: z.array(HookConfigSchema),
+    address: ZHash.optional(),
+  }),
+);
 
 export const CCIPHookSchema = z.object({
   type: z.literal(HookType.CCIP),
   destinationChain: z.string(),
 });
 
-export const HookConfigSchema = z.union([
+export const CctpHookSchema = z.object({
+  type: z.literal(HookType.CCTP),
+  address: ZHash,
+});
+export type CctpHookConfig = z.infer<typeof CctpHookSchema>;
+
+export const UnknownHookSchema = z.looseObject({
+  type: z.literal(HookType.UNKNOWN),
+});
+export type UnknownHookConfig = z.infer<typeof UnknownHookSchema>;
+
+export const RateLimitedHookSchema = OwnableSchema.extend({
+  type: z.literal(HookType.RATE_LIMITED),
+  maxCapacity: z
+    .string()
+    .regex(/^\d+$/, 'maxCapacity must be a base-10 integer string'),
+  /**
+   * Refill window in seconds — must match the on-chain immutable
+   * `DURATION`. Defaults to 1 day (86400s) when omitted, matching the
+   * previous hard-coded on-chain window.
+   */
+  duration: ZBigNumberish.default(RATE_LIMIT_DEFAULT_DURATION_SECONDS),
+})
+  .refine((val) => val.duration > 0n, {
+    message: 'duration must be greater than 0',
+    path: ['duration'],
+  })
+  .refine((val) => BigInt(val.maxCapacity) >= val.duration, {
+    message: 'maxCapacity must be at least duration',
+    path: ['maxCapacity'],
+  })
+  .transform((val) => {
+    const capacity = BigInt(val.maxCapacity);
+    const duration = val.duration;
+    if (capacity % duration !== 0n) {
+      const rounded = ((capacity / duration) * duration).toString();
+      rootLogger.warn(
+        `RateLimitedHook maxCapacity ${val.maxCapacity} is not divisible by duration ${val.duration}; rounding down to ${rounded}`,
+      );
+      return { ...val, maxCapacity: rounded };
+    }
+    return val;
+  });
+
+// Hook views of the warp-route hybrid hook/ISM contracts. Field shapes mirror
+// the ISM-side config schemas in ../ism/types.ts (same contract, two views),
+// including the bytes32 remote-router normalization and the duration refine.
+export const NetFlowRateLimitedHookConfigSchema = z
+  .object({
+    type: z.literal(HookType.NET_FLOW_RATE_LIMITED),
+    warpRouter: ZHash.optional(),
+    thresholdBps: z.number().int().min(0).max(9999),
+    duration: ZBigNumberish,
+    owner: ZHash.optional(),
+  })
+  .refine((val) => val.duration > 0n, {
+    message: 'duration must be greater than 0',
+    path: ['duration'],
+  });
+export type NetFlowRateLimitedHookConfig = z.infer<
+  typeof NetFlowRateLimitedHookConfigSchema
+>;
+
+export const DelayedFlowRouterHookConfigSchema = OwnableSchema.extend({
+  type: z.literal(HookType.DELAYED_FLOW_ROUTER),
+  warpRouter: ZHash.optional(),
+  thresholdBps: z.number().int().min(0).max(10000),
+  /** Cap on any single message's wait, in seconds. */
+  maxDelay: z.number().int().nonnegative().max(MAX_SAFE_UINT48),
+  duration: ZBigNumberish,
+  /**
+   * Enrolled remote counterparts, keyed by chain name; values are the remote
+   * DelayedFlowRouterHookIsm instances (the contract is itself a Router, so
+   * on-chain nomenclature keeps "router": enrollRemoteRouters/routers()).
+   */
+  remoteIsms: z.record(z.string(), ZRouterBytes32).optional(),
+}).refine((val) => val.duration > 0n, {
+  message: 'duration must be greater than 0',
+  path: ['duration'],
+});
+export type DelayedFlowRouterHookConfig = z.infer<
+  typeof DelayedFlowRouterHookConfigSchema
+>;
+
+const KnownHookTypes: string[] = Object.values(HookType).filter(
+  (t) => t !== HookType.UNKNOWN,
+);
+
+/**
+ * Recursively normalizes unknown hook type values to HookType.UNKNOWN.
+ * Use this before parsing with HookConfigSchema when configs may contain
+ * hook types not yet known to this SDK version.
+ *
+ * Note: String address configs (e.g., "0x...") are passed through unchanged
+ * since they represent deployed hook addresses, not hook type configs.
+ */
+export function normalizeUnknownHookTypes<T>(config: T): T {
+  // Handle nullish values and primitives (including string addresses)
+  if (isNullish(config) || typeof config !== 'object') {
+    return config;
+  }
+
+  if (Array.isArray(config)) {
+    return config.map(normalizeUnknownHookTypes) as T;
+  }
+
+  // At this point, config must be a non-null object (not array, not primitive)
+  const obj = config as Record<string, unknown>;
+  const normalized: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === 'type' && typeof value === 'string') {
+      normalized[key] = KnownHookTypes.includes(value)
+        ? value
+        : HookType.UNKNOWN;
+    } else if (typeof value === 'object' && !isNullish(value)) {
+      normalized[key] = normalizeUnknownHookTypes(value);
+    } else {
+      normalized[key] = value;
+    }
+  }
+
+  return normalized as T;
+}
+
+export const HookConfigSchema: z.ZodType<HookConfig, unknown> = z.union([
   ZHash,
   ProtocolFeeSchema,
   PausableHookSchema,
@@ -214,7 +496,23 @@ export const HookConfigSchema = z.union([
   ArbL2ToL1HookSchema,
   MailboxDefaultHookSchema,
   CCIPHookSchema,
+  CctpHookSchema,
+  RateLimitedHookSchema,
+  NetFlowRateLimitedHookConfigSchema,
+  DelayedFlowRouterHookConfigSchema,
+  UnknownHookSchema,
+  PredicateHookSchema,
 ]);
+
+/**
+ * Forward-compatible hook config schema that normalizes unknown hook types.
+ * Use this instead of HookConfigSchema when parsing configs that may contain
+ * hook types added in newer registry versions.
+ */
+export const SafeParseHookConfigSchema = z.preprocess(
+  normalizeUnknownHookTypes,
+  HookConfigSchema,
+);
 
 // TODO: deprecate in favor of CoreConfigSchema
 export const HooksConfigSchema = z.object({
@@ -222,5 +520,5 @@ export const HooksConfigSchema = z.object({
   required: HookConfigSchema,
 });
 export type HooksConfig = z.infer<typeof HooksConfigSchema>;
-export const HooksConfigMapSchema = z.record(HooksConfigSchema);
+export const HooksConfigMapSchema = z.record(z.string(), HooksConfigSchema);
 export type HooksConfigMap = z.infer<typeof HooksConfigMapSchema>;

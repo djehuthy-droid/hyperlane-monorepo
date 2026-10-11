@@ -1,19 +1,35 @@
 use std::sync::Arc;
 
-use hyperlane_core::{config::OpSubmissionConfig, ChainCommunicationError, NativeToken};
+use hyperlane_core::{
+    config::OpSubmissionConfig, matching_list::MatchingList, ChainCommunicationError, NativeToken,
+};
 use serde::Serialize;
 use url::Url;
 
 use crate::{
     priority_fee::{ConstantPriorityFeeOracle, HeliusPriorityFeeOracle, PriorityFeeOracle},
     tx_submitter::config::TransactionSubmitterConfig,
+    universal_router_reveal::UniversalRouterRevealConfig,
+    NonEmptyAltAddresses, SealevelTransactionFormat,
 };
+
+/// An ALT override: if message matches matching_list, use alt_addresses.
+#[derive(Debug, Clone)]
+pub struct ProcessAltOverride {
+    /// Matching list to determine which messages use these ALTs
+    pub matching_list: MatchingList,
+    /// The ALT addresses to use for matching messages, in compile order.
+    /// Typically the core ALT followed by the route's warp-specific ALTs.
+    pub alt_addresses: NonEmptyAltAddresses,
+}
 
 /// Sealevel connection configuration
 #[derive(Debug, Clone)]
 pub struct ConnectionConf {
     /// A list of urls to connect to
     pub urls: Vec<Url>,
+    /// Highest transaction version accepted by JSON RPC reads (0 by default).
+    pub max_supported_transaction_version: u8,
     /// Operation batching configuration
     pub op_submission_config: OpSubmissionConfig,
     /// Native token and its denomination
@@ -22,6 +38,16 @@ pub struct ConnectionConf {
     pub priority_fee_oracle: PriorityFeeOracleConfig,
     /// Transaction submitter configuration
     pub transaction_submitter: TransactionSubmitterConfig,
+    /// Address Lookup Tables (ALTs) for mailbox process transactions.
+    /// When configured, versioned transactions using these ALTs are built for
+    /// reduced tx size. Otherwise legacy transactions are used.
+    pub mailbox_process_alts: SealevelTransactionFormat,
+    /// Per-message ALT overrides. First matching entry wins.
+    /// Falls back to `mailbox_process_alts` if no match.
+    pub process_alt_overrides: Vec<ProcessAltOverride>,
+    /// When set, the relayer automatically submits `RouterInstruction::Reveal`
+    /// after confirming delivery of a UR COMMIT message to this chain.
+    pub ur_reveal: Option<UniversalRouterRevealConfig>,
 }
 
 /// An error type when parsing a connection configuration.

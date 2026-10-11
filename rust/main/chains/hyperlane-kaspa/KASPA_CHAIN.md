@@ -164,17 +164,39 @@ Due to Kaspa's unique architecture, some Hyperlane features work differently:
 | AggregationIsm | Not implemented yet | Could be added if needed |
 | CcipReadIsm | Not supported | Not applicable for Kaspa |
 
+## Upstream compatibility
+
+This branch merges `hyperlane-xyz/main` at `4cdfc0ca8` into Reshmem's
+Kaspa-enabled `devel` branch. Kaspa remains a destination-only integration
+using the classic submitter; Lander rejects Kaspa explicitly. Upstream's
+Tron support remains enabled. Chain metrics expose the virtual DAA score
+as `ChainInfo.block_height`.
+
+The Rust workspaces pin UUID to 1.16.0 so consumers can combine
+`hyperlane-core` with the Kaspa 2.1 SDK. The adapter itself communicates
+with Igeret over HTTP and does not link the Kaspa SDK.
+
 ## Testing
 
-Integration tests require a running igra-service instance. Unit tests for configuration validation are included.
+Run from `rust/main`:
 
 ```bash
-# Run unit tests
-cargo test -p hyperlane-kaspa
-
-# Run with igra-service (integration)
-IGRA_SERVICE_URL=http://localhost:8088 cargo test -p hyperlane-kaspa --features integration
+cargo test --locked -p hyperlane-kaspa
+cargo test --locked -p hyperlane-base --features kaspa kaspa_
+cargo check --locked -p relayer --features kaspa
 ```
+
+Build validator and relayer separately: Kaspa is a destination-only feature
+and validator's origin configuration does not support it.
+
+```bash
+cargo build --release --locked -p validator
+cargo build --release --locked -p relayer --features kaspa
+```
+
+Unit tests cover configuration validation and the chain-info HTTP response.
+End-to-end message delivery requires Igeret, a Kaspa node, an EVM origin,
+validators, and a relayer; it is exercised by Igeret's devnet harness.
 
 ## Related Documentation
 

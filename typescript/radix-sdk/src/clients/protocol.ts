@@ -10,39 +10,47 @@ import {
   TransactionSubmitterConfig,
 } from '@hyperlane-xyz/provider-sdk';
 import { IProvider } from '@hyperlane-xyz/provider-sdk/altvm';
+import { IRawHookArtifactManager } from '@hyperlane-xyz/provider-sdk/hook';
 import { IRawIsmArtifactManager } from '@hyperlane-xyz/provider-sdk/ism';
+import { IRawMailboxArtifactManager } from '@hyperlane-xyz/provider-sdk/mailbox';
 import { AnnotatedTx, TxReceipt } from '@hyperlane-xyz/provider-sdk/module';
+import {
+  FeeReadContext,
+  IRawFeeArtifactManager,
+} from '@hyperlane-xyz/provider-sdk/fee';
+import { IRawValidatorAnnounceArtifactManager } from '@hyperlane-xyz/provider-sdk/validator-announce';
+import type { IRawWarpArtifactManager } from '@hyperlane-xyz/provider-sdk/warp';
 import { assert } from '@hyperlane-xyz/utils';
 
+import { RadixHookArtifactManager } from '../hook/hook-artifact-manager.js';
 import { RadixIsmArtifactManager } from '../ism/ism-artifact-manager.js';
+import { RadixMailboxArtifactManager } from '../mailbox/mailbox-artifact-manager.js';
 import { RadixBase } from '../utils/base.js';
+import { RadixWarpArtifactManager } from '../warp/warp-artifact-manager.js';
+import { RadixValidatorAnnounceArtifactManager } from '../validator-announce/validator-announce-artifact-manager.js';
 
 import { NETWORKS, RadixProvider } from './provider.js';
 import { RadixSigner } from './signer.js';
 
 const DEFAULT_GAS_MULTIPLIER = 1.2;
 
+// Base router deploy cost in native denom (XRD), used to size
+// getMinGas().WARP_DEPLOY_GAS. The composable per-config breakdown lives on
+// RadixProvider.getMinGasForWarpDeploy.
+const WARP_DEPLOY_BASE_XRD = 0n;
+
 export class RadixProtocolProvider implements ProtocolProvider {
   createProvider(chainMetadata: ChainMetadataForAltVM): Promise<IProvider> {
-    assert(chainMetadata.rpcUrls, 'rpc urls undefined');
-    const rpcUrls = chainMetadata.rpcUrls.map((rpc) => rpc.http);
-    return RadixProvider.connect(rpcUrls, chainMetadata.chainId, {
-      metadata: chainMetadata,
-    });
+    return RadixProvider.connect(chainMetadata);
   }
 
   async createSigner(
     chainMetadata: ChainMetadataForAltVM,
     config: SignerConfig,
   ): Promise<AltVM.ISigner<AnnotatedTx, TxReceipt>> {
-    assert(chainMetadata.rpcUrls, 'rpc urls undefined');
-    const rpcUrls = chainMetadata.rpcUrls.map((rpc) => rpc.http);
-
     const { privateKey } = config;
 
-    return RadixSigner.connectWithSigner(rpcUrls, privateKey, {
-      metadata: chainMetadata,
-    });
+    return RadixSigner.connectWithSigner(chainMetadata, privateKey);
   }
 
   createSubmitter<TConfig extends TransactionSubmitterConfig>(
@@ -56,6 +64,80 @@ export class RadixProtocolProvider implements ProtocolProvider {
   createIsmArtifactManager(
     chainMetadata: ChainMetadataForAltVM,
   ): IRawIsmArtifactManager {
+    const { gateway, base } = this.configureNetworkConnection(chainMetadata);
+    return new RadixIsmArtifactManager(gateway, base);
+  }
+
+  createHookArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+    context?: { mailbox?: string },
+  ): IRawHookArtifactManager {
+    const { gateway, base } = this.configureNetworkConnection(chainMetadata);
+
+    // Get native token denom from chain metadata
+    const nativeTokenDenom = chainMetadata.nativeToken?.denom || '';
+
+    // Get mailbox from context if provided, otherwise empty string for read-only operations
+    const mailboxAddress = context?.mailbox || '';
+
+    return new RadixHookArtifactManager(
+      gateway,
+      base,
+      mailboxAddress,
+      nativeTokenDenom,
+    );
+  }
+
+  createWarpArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+    _context?: { mailbox?: string },
+  ): IRawWarpArtifactManager {
+    const { gateway, base } = this.configureNetworkConnection(chainMetadata);
+    return new RadixWarpArtifactManager(gateway, base);
+  }
+
+  createMailboxArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+  ): IRawMailboxArtifactManager {
+    const { gateway, base, domainId } =
+      this.configureNetworkConnection(chainMetadata);
+    return new RadixMailboxArtifactManager(gateway, base, domainId);
+  }
+
+  createValidatorAnnounceArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+  ): IRawValidatorAnnounceArtifactManager {
+    const { gateway, base } = this.configureNetworkConnection(chainMetadata);
+    return new RadixValidatorAnnounceArtifactManager(gateway, base);
+  }
+
+  createFeeArtifactManager(
+    _chainMetadata: ChainMetadataForAltVM,
+    _context: FeeReadContext,
+  ): IRawFeeArtifactManager | null {
+    return null;
+  }
+
+  getMinGas(): MinimumRequiredGasByAction {
+    return {
+      CORE_DEPLOY_GAS: 0n,
+      WARP_DEPLOY_GAS: WARP_DEPLOY_BASE_XRD,
+      TEST_SEND_GAS: 0n,
+      AVS_GAS: 0n,
+      ISM_DEPLOY_GAS: 0n,
+      HOOK_DEPLOY_GAS: 0n,
+    };
+  }
+
+  /**
+   * Common setup logic for artifact managers.
+   * Creates gateway, base, and domainId.
+   */
+  private configureNetworkConnection(chainMetadata: ChainMetadataForAltVM): {
+    gateway: GatewayApiClient;
+    base: RadixBase;
+    domainId: number;
+  } {
     assert(chainMetadata.gatewayUrls, 'gateway urls undefined');
 
     const networkId = parseInt(chainMetadata.chainId.toString());
@@ -96,15 +178,8 @@ export class RadixProtocolProvider implements ProtocolProvider {
       packageAddress,
     );
 
-    return new RadixIsmArtifactManager(gateway, base);
-  }
+    const domainId = chainMetadata.domainId;
 
-  getMinGas(): MinimumRequiredGasByAction {
-    return {
-      CORE_DEPLOY_GAS: 0n,
-      WARP_DEPLOY_GAS: 0n,
-      TEST_SEND_GAS: 0n,
-      AVS_GAS: 0n,
-    };
+    return { gateway, base, domainId };
   }
 }

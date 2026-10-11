@@ -1,0 +1,533 @@
+import {
+  ChainMetadataForAltVM,
+  getProtocolProvider,
+} from '@hyperlane-xyz/provider-sdk';
+import { ISigner } from '@hyperlane-xyz/provider-sdk/altvm';
+import {
+  ArtifactNew,
+  ArtifactOnChain,
+  ArtifactState,
+  ArtifactWriter,
+  isArtifactDeployed,
+  isArtifactNew,
+  isArtifactUnderived,
+} from '@hyperlane-xyz/provider-sdk/artifact';
+import { ChainLookup } from '@hyperlane-xyz/provider-sdk/chain';
+import {
+  DeployedFeeAddress,
+  DeployedFeeArtifact,
+  FeeArtifactConfig,
+  mergeFeeArtifacts,
+  withFeeAssetConfig,
+} from '@hyperlane-xyz/provider-sdk/fee';
+import {
+  DeployedHookAddress,
+  HookArtifactConfig,
+  mergeHookArtifacts,
+} from '@hyperlane-xyz/provider-sdk/hook';
+import {
+  type ContextualAddress,
+  DeployedIsmAddress,
+  IsmArtifactConfig,
+  IsmArtifactResolutionOperation,
+  assertRateLimitedIsmRecipientsUnset,
+  mergeIsmArtifacts,
+  resolveIsmArtifact,
+} from '@hyperlane-xyz/provider-sdk/ism';
+import { AnnotatedTx, TxReceipt } from '@hyperlane-xyz/provider-sdk/module';
+import {
+  DeployedWarpAddress,
+  DeployedWarpArtifact,
+  IRawWarpArtifactManager,
+  RawWarpArtifactConfig,
+  WarpArtifactConfig,
+  buildFeeReadContextFromWarpArtifactConfig,
+  resolveFeeTokenFromWarpArtifactConfig,
+} from '@hyperlane-xyz/provider-sdk/warp';
+import {
+  addressToBytes32,
+  assert,
+  eqAddress,
+  isNullish,
+  rootLogger,
+} from '@hyperlane-xyz/utils';
+
+import { createFeeWriter } from '../fee/fee-writer.js';
+import { HookWriter, createHookWriter } from '../hook/hook-writer.js';
+import { IsmWriter, createIsmWriter } from '../ism/generic-ism-writer.js';
+
+import { WarpTokenReader } from './warp-reader.js';
+
+function warpRouterContext(address: string): ContextualAddress {
+  return {
+    address,
+    toBytes32: () => addressToBytes32(address).toLowerCase(),
+  };
+}
+
+/**
+ * Factory function to create a WarpTokenWriter instance.
+ *
+ * @param chainMetadata Chain metadata for the target chain
+ * @param chainLookup Chain lookup interface for resolving chain names and domain IDs
+ * @param signer Signer interface for signing transactions
+ * @returns A WarpTokenWriter instance
+ *
+ * @example
+ * ```typescript
+ * const writer = createWarpTokenWriter(chainMetadata, chainLookup, signer);
+ * const [deployed, receipts] = await writer.create(warpArtifact);
+ * ```
+ */
+export function createWarpTokenWriter(
+  chainMetadata: ChainMetadataForAltVM,
+  chainLookup: ChainLookup,
+  signer: ISigner<AnnotatedTx, TxReceipt>,
+): WarpTokenWriter {
+  const protocolProvider = getProtocolProvider(chainMetadata.protocol);
+  const artifactManager: IRawWarpArtifactManager =
+    protocolProvider.createWarpArtifactManager(chainMetadata);
+
+  return new WarpTokenWriter(
+    artifactManager,
+    chainMetadata,
+    chainLookup,
+    signer,
+  );
+}
+
+/**
+ * WarpTokenWriter handles creation and updates of warp tokens using the Artifact API.
+ * It delegates to protocol-specific artifact writers for individual warp token types.
+ *
+ * Key features:
+ * - Extends WarpTokenReader to inherit read() functionality
+ * - Works with pure Artifact API (WarpArtifactConfig)
+ * - Handles nested ISM deployment after warp token deployment
+ * - Delegates to typed writers from artifact manager for specific warp token types
+ * - Protocol-agnostic through artifact manager abstraction
+ */
+export class WarpTokenWriter
+  extends WarpTokenReader
+  implements ArtifactWriter<WarpArtifactConfig, DeployedWarpAddress>
+{
+  protected readonly ismWriter: IsmWriter;
+  protected readonly hookWriterFactory: (mailbox: string) => HookWriter;
+
+  constructor(
+    protected override readonly artifactManager: IRawWarpArtifactManager,
+    protected override readonly chainMetadata: ChainMetadataForAltVM,
+    protected override readonly chainLookup: ChainLookup,
+    protected readonly signer: ISigner<AnnotatedTx, TxReceipt>,
+  ) {
+    super(artifactManager, chainMetadata, chainLookup);
+    this.ismWriter = createIsmWriter(chainMetadata, chainLookup, signer);
+    this.hookWriterFactory = (mailbox) =>
+      createHookWriter(chainMetadata, chainLookup, signer, { mailbox });
+  }
+
+  /**
+   * Creates a new warp token by deploying it on-chain.
+   * If the warp token has a new nested ISM artifact, deploys it after the
+   * router so its config can use the router address.
+   *
+   * @param artifact The warp token configuration to deploy
+   * @returns A tuple of [deployed artifact, transaction receipts]
+   */
+  async create(
+    artifact: ArtifactNew<WarpArtifactConfig>,
+  ): Promise<[DeployedWarpArtifact, TxReceipt[]]> {
+    const { config } = artifact;
+    const allReceipts: TxReceipt[] = [];
+    const signerAddress = this.signer.getSignerAddress();
+    if (config.hook) {
+      assert(
+        config.mailbox,
+        'Mailbox is required when hook configuration is provided',
+      );
+    }
+
+    const configuredIsm = config.interchainSecurityModule;
+    if (configuredIsm) {
+      assertRateLimitedIsmRecipientsUnset(
+        configuredIsm,
+        this.chainMetadata.name,
+      );
+    }
+
+    // Deploy Hook if configured as a NEW artifact
+    let onChainHookArtifact:
+      | ArtifactOnChain<HookArtifactConfig, DeployedHookAddress>
+      | undefined;
+    if (config.hook) {
+      if (!this.artifactManager.supportsHookUpdates()) {
+        rootLogger.warn(
+          'Hook configuration is not supported for this protocol. Hook configuration will be ignored.',
+        );
+      } else {
+        const hookWriter = this.hookWriterFactory(config.mailbox);
+        if (isArtifactNew(config.hook)) {
+          const [deployedHook, hookReceipts] = await hookWriter.create(
+            config.hook,
+          );
+          allReceipts.push(...hookReceipts);
+
+          onChainHookArtifact = deployedHook;
+        } else {
+          onChainHookArtifact = config.hook;
+        }
+      }
+    }
+
+    // Keep the signer as the temporary owner while post-create configuration
+    // is attached. Protocol writers transfer ownership during create, which
+    // would otherwise prevent this signer from submitting the deferred update.
+    const rawArtifact: ArtifactNew<RawWarpArtifactConfig> = {
+      artifactState: ArtifactState.NEW,
+      config: {
+        ...config,
+        owner: signerAddress,
+        interchainSecurityModule: undefined,
+        hook: onChainHookArtifact,
+        fee: undefined,
+      },
+    };
+
+    const writer = this.artifactManager.createWriter(config.type, this.signer);
+    const [deployed, tokenReceipts] = await writer.create(rawArtifact);
+    allReceipts.push(...tokenReceipts);
+
+    // Deploy / resolve the ISM now that the warp address is known.
+    let onChainIsmArtifact:
+      | ArtifactOnChain<IsmArtifactConfig, DeployedIsmAddress>
+      | undefined;
+    if (configuredIsm) {
+      if (isArtifactUnderived(configuredIsm)) {
+        onChainIsmArtifact = configuredIsm;
+      } else {
+        const resolvedIsm = resolveIsmArtifact(configuredIsm, {
+          operation: IsmArtifactResolutionOperation.CREATE,
+          warpRouter: warpRouterContext(deployed.deployed.address),
+          context: this.chainMetadata.name,
+        });
+        if (isArtifactNew(resolvedIsm)) {
+          const [deployedIsm, ismReceipts] =
+            await this.ismWriter.create(resolvedIsm);
+          allReceipts.push(...ismReceipts);
+          onChainIsmArtifact = deployedIsm;
+        } else {
+          onChainIsmArtifact = resolvedIsm;
+        }
+      }
+    }
+
+    // Deploy / resolve the fee now that the warp is on-chain and its
+    // settlement asset is known.
+    let onChainFeeArtifact:
+      | ArtifactOnChain<FeeArtifactConfig, DeployedFeeAddress>
+      | undefined;
+    if (config.fee) {
+      const feeWriter = createFeeWriter(this.chainMetadata, this.signer, {
+        knownRoutersPerDomain: buildFeeReadContextFromWarpArtifactConfig(
+          deployed.config,
+        ).knownRoutersPerDomain,
+      });
+      if (!feeWriter) {
+        rootLogger.warn(
+          'Fee programs are not supported for this protocol. Fee configuration will be ignored.',
+        );
+      } else if (isArtifactNew(config.fee)) {
+        const feeAsset = resolveFeeTokenFromWarpArtifactConfig(deployed.config);
+        const feeArtifactToCreate: ArtifactNew<FeeArtifactConfig> = {
+          artifactState: ArtifactState.NEW,
+          config: withFeeAssetConfig(config.fee.config, feeAsset),
+        };
+        const [deployedFee, feeReceipts] =
+          await feeWriter.create(feeArtifactToCreate);
+        allReceipts.push(...feeReceipts);
+        onChainFeeArtifact = deployedFee;
+      } else {
+        onChainFeeArtifact = config.fee;
+      }
+    }
+
+    const ismToAttach = onChainIsmArtifact
+      ? {
+          artifactState: ArtifactState.UNDERIVED,
+          deployed: { address: onChainIsmArtifact.deployed.address },
+        }
+      : undefined;
+    const feeToAttach = onChainFeeArtifact
+      ? {
+          artifactState: ArtifactState.UNDERIVED,
+          deployed: { address: onChainFeeArtifact.deployed.address },
+        }
+      : undefined;
+    const hookToAttach = onChainHookArtifact
+      ? {
+          artifactState: ArtifactState.UNDERIVED,
+          deployed: { address: onChainHookArtifact.deployed.address },
+        }
+      : undefined;
+    // Attach deferred artifacts and transfer ownership through one regular
+    // update. Protocol writers must place their ownership transaction last.
+    if (
+      onChainIsmArtifact ||
+      onChainFeeArtifact ||
+      !eqAddress(signerAddress, config.owner)
+    ) {
+      const attachTxs = await this.update({
+        artifactState: ArtifactState.DEPLOYED,
+        config: {
+          ...config,
+          interchainSecurityModule: ismToAttach,
+          hook: hookToAttach,
+          fee: feeToAttach,
+        },
+        deployed: deployed.deployed,
+      });
+      for (const tx of attachTxs) {
+        const receipt = await this.signer.sendAndConfirmTransaction(tx);
+        allReceipts.push(receipt);
+      }
+    }
+
+    return [
+      {
+        artifactState: ArtifactState.DEPLOYED,
+        config: {
+          ...deployed.config,
+          owner: config.owner,
+          interchainSecurityModule: onChainIsmArtifact,
+          hook: onChainHookArtifact,
+          fee: onChainFeeArtifact,
+        },
+        deployed: deployed.deployed,
+      },
+      allReceipts,
+    ];
+  }
+
+  /**
+   * Updates an existing warp token to match the desired configuration.
+   * Warp tokens are mutable - supports remote router enrollment/unenrollment,
+   * ISM updates, and owner changes.
+   *
+   * The protocol-specific writer will read the current on-chain state and compare
+   * with the expected config to generate the necessary update transactions.
+   *
+   * @param artifact The desired warp token state (must include deployed address)
+   * @returns Array of transactions needed to perform the update
+   * @throws Error if the token type cannot be changed (e.g., collateral -> synthetic)
+   */
+  async update(artifact: DeployedWarpArtifact): Promise<AnnotatedTx[]> {
+    const { config, deployed } = artifact;
+    const expectedHook = config.hook;
+    if (expectedHook && !isArtifactUnderived(expectedHook)) {
+      assert(
+        config.mailbox,
+        'Mailbox is required when hook configuration is provided',
+      );
+    }
+
+    // Read current on-chain state to verify token type hasn't changed
+    const currentArtifact = await this.read(deployed.address);
+    assert(
+      currentArtifact.config.type === config.type,
+      `Cannot change warp token type from '${currentArtifact.config.type}' to '${config.type}'. ` +
+        `Token type is immutable after deployment.`,
+    );
+
+    assert(
+      isNullish(currentArtifact.config.interchainSecurityModule) ||
+        isArtifactDeployed(currentArtifact.config.interchainSecurityModule),
+      `Expected Warp Reader to expand the ISM config`,
+    );
+
+    assert(
+      isNullish(currentArtifact.config.hook) ||
+        isArtifactDeployed(currentArtifact.config.hook),
+      `Expected Warp Reader to expand the Hook config`,
+    );
+
+    assert(
+      isNullish(currentArtifact.config.fee) ||
+        isArtifactDeployed(currentArtifact.config.fee),
+      `Expected Warp Reader to expand the Fee config`,
+    );
+
+    const updateTxs: AnnotatedTx[] = [];
+
+    // Resolve ISM updates
+    const expectedIsm = config.interchainSecurityModule;
+    const currentIsm = currentArtifact.config.interchainSecurityModule;
+
+    let onChainIsmArtifact:
+      | ArtifactOnChain<IsmArtifactConfig, DeployedIsmAddress>
+      | undefined;
+
+    if (expectedIsm && !isArtifactUnderived(expectedIsm)) {
+      // Resolve before merging: mergeIsmArtifacts returns a compositeIsm's
+      // expected config verbatim, so a router-derived recipient has to be in
+      // place already for both the NEW and the DEPLOYED branch below.
+      const resolvedIsm = resolveIsmArtifact(expectedIsm, {
+        operation: IsmArtifactResolutionOperation.UPDATE,
+        warpRouter: warpRouterContext(deployed.address),
+        context: this.chainMetadata.name,
+      });
+
+      // NEW or DEPLOYED: Merge with current and decide deploy vs update
+      const mergedIsmConfig = mergeIsmArtifacts(currentIsm, resolvedIsm);
+
+      if (isArtifactNew(mergedIsmConfig)) {
+        // Deploy new ISM
+        const [deployed] = await this.ismWriter.create(mergedIsmConfig);
+
+        onChainIsmArtifact = {
+          artifactState: ArtifactState.UNDERIVED,
+          deployed: { address: deployed.deployed.address },
+        };
+      } else if (isArtifactDeployed(mergedIsmConfig)) {
+        // DEPLOYED: update existing ISM (or reuse if unchanged)
+        const txs = await this.ismWriter.update(mergedIsmConfig);
+
+        updateTxs.push(...txs);
+        onChainIsmArtifact = {
+          artifactState: ArtifactState.UNDERIVED,
+          deployed: { address: mergedIsmConfig.deployed.address },
+        };
+      }
+    } else {
+      onChainIsmArtifact = expectedIsm;
+    }
+
+    // Resolve Hook updates
+    const currentHook = currentArtifact.config.hook;
+
+    let onChainHookArtifact:
+      | ArtifactOnChain<HookArtifactConfig, DeployedHookAddress>
+      | undefined;
+
+    if (expectedHook && !isArtifactUnderived(expectedHook)) {
+      if (!this.artifactManager.supportsHookUpdates()) {
+        rootLogger.warn(
+          'Hook updates are not supported for this protocol. Hook configuration will be ignored.',
+        );
+        onChainHookArtifact = currentHook;
+      } else {
+        const hookWriter = this.hookWriterFactory(config.mailbox);
+
+        // NEW or DEPLOYED: Merge with current and decide deploy vs update
+        const mergedHookConfig = mergeHookArtifacts(currentHook, expectedHook);
+
+        if (isArtifactNew(mergedHookConfig)) {
+          // Deploy new Hook
+          const [deployed] = await hookWriter.create(mergedHookConfig);
+
+          onChainHookArtifact = {
+            artifactState: ArtifactState.UNDERIVED,
+            deployed: { address: deployed.deployed.address },
+          };
+        } else if (isArtifactDeployed(mergedHookConfig)) {
+          // DEPLOYED: update existing Hook (or reuse if unchanged)
+          const txs = await hookWriter.update(mergedHookConfig);
+
+          updateTxs.push(...txs);
+          onChainHookArtifact = {
+            artifactState: ArtifactState.UNDERIVED,
+            deployed: { address: mergedHookConfig.deployed.address },
+          };
+        }
+      }
+    } else {
+      onChainHookArtifact = expectedHook;
+    }
+
+    // Resolve Fee updates
+    const expectedFee = config.fee;
+    const currentFee = currentArtifact.config.fee;
+
+    let onChainFeeArtifact:
+      | ArtifactOnChain<FeeArtifactConfig, DeployedFeeAddress>
+      | undefined;
+
+    if (expectedFee && !isArtifactUnderived(expectedFee)) {
+      const feeContext = buildFeeReadContextFromWarpArtifactConfig(
+        config,
+        currentArtifact.config,
+      );
+      const feeWriter = createFeeWriter(
+        this.chainMetadata,
+        this.signer,
+        feeContext,
+      );
+
+      if (!feeWriter) {
+        rootLogger.warn(
+          'Fee programs are not supported for this protocol. Fee configuration will be ignored.',
+        );
+        onChainFeeArtifact = currentFee;
+      } else {
+        const mergedFeeConfig = mergeFeeArtifacts(currentFee, expectedFee);
+        // Prefer the freshly-read warp asset (synthetic warps populate it
+        // post-deploy), falling back to the expected warp config when the
+        // current read doesn't carry one.
+        const feeAsset =
+          resolveFeeTokenFromWarpArtifactConfig(currentArtifact.config) ??
+          resolveFeeTokenFromWarpArtifactConfig(config);
+        const mergedConfigWithAsset = withFeeAssetConfig(
+          mergedFeeConfig.config,
+          feeAsset,
+        );
+
+        if (isArtifactNew(mergedFeeConfig)) {
+          const feeArtifactToCreate: ArtifactNew<FeeArtifactConfig> = {
+            artifactState: ArtifactState.NEW,
+            config: mergedConfigWithAsset,
+          };
+          const [deployedFee] = await feeWriter.create(feeArtifactToCreate);
+
+          onChainFeeArtifact = {
+            artifactState: ArtifactState.UNDERIVED,
+            deployed: { address: deployedFee.deployed.address },
+          };
+        } else if (isArtifactDeployed(mergedFeeConfig)) {
+          const feeArtifactToUpdate: DeployedFeeArtifact = {
+            artifactState: ArtifactState.DEPLOYED,
+            config: mergedConfigWithAsset,
+            deployed: mergedFeeConfig.deployed,
+          };
+          const txs = await feeWriter.update(feeArtifactToUpdate);
+
+          updateTxs.push(...txs);
+          onChainFeeArtifact = {
+            artifactState: ArtifactState.UNDERIVED,
+            deployed: { address: mergedFeeConfig.deployed.address },
+          };
+        }
+      }
+    } else {
+      onChainFeeArtifact = expectedFee;
+    }
+
+    // Build raw artifact with flattened ISM, Hook, and Fee references
+    const rawArtifact = {
+      artifactState: ArtifactState.DEPLOYED,
+      config: {
+        ...config,
+        interchainSecurityModule: onChainIsmArtifact,
+        hook: onChainHookArtifact,
+        fee: onChainFeeArtifact,
+      },
+      deployed,
+    };
+
+    // Delegate to protocol-specific writer which will read current state and compare
+    const writer = this.artifactManager.createWriter(config.type, this.signer);
+
+    const warpUpdateTxs = await writer.update(rawArtifact);
+    updateTxs.push(...warpUpdateTxs);
+
+    return updateTxs;
+  }
+}

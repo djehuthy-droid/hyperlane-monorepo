@@ -14,6 +14,7 @@ use std::{
 };
 
 use solana_sdk::{instruction::Instruction, program_error::ProgramError, pubkey::Pubkey};
+use solana_system_interface::instruction as system_instruction;
 
 use hyperlane_sealevel_connection_client::{
     gas_router::GasRouterConfig, router::RemoteRouterConfig,
@@ -707,11 +708,7 @@ fn fund_ata_payer_up_to(
 
     ctx.new_txn()
         .add_with_description(
-            solana_program::system_instruction::transfer(
-                &ctx.payer_pubkey,
-                &ata_payer_account,
-                funding_amount,
-            ),
+            system_instruction::transfer(&ctx.payer_pubkey, &ata_payer_account, funding_amount),
             format!(
                 "Funding ATA payer {} with funding_amount {} to reach total balance of {}",
                 ata_payer_account, funding_amount, ata_payer_funding_amount
@@ -746,6 +743,13 @@ pub fn parse_token_account_data(token_type: FlatTokenType, data: &mut &[u8]) {
 }
 
 pub fn install_spl_token_cli() {
+    let home_path = std::env::var("HOME").unwrap_or_default();
+    let cargo_bin = format!("{home_path}/.cargo/bin/spl-token");
+    if std::path::Path::new(&cargo_bin).exists() {
+        println!("spl-token already installed at {cargo_bin}, skipping");
+        return;
+    }
+
     println!("Installing cargo 1.76.0 (required by spl-token-cli)");
     Command::new("rustup")
         .args(["toolchain", "install", "1.76.0"])

@@ -6,11 +6,9 @@ use clap::{Args, Subcommand};
 use hyperlane_sealevel_mailbox::instruction::Instruction as MailboxInstruction;
 use hyperlane_sealevel_multisig_ism_message_id::instruction::Instruction as MultisigIsmInstruction;
 use solana_client::rpc_client::RpcClient;
+use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_program::pubkey;
-use solana_sdk::{
-    account::Account, account_utils::StateMut, bpf_loader_upgradeable::UpgradeableLoaderState,
-    pubkey::Pubkey,
-};
+use solana_sdk::{account::Account, pubkey::Pubkey};
 
 use crate::{read_core_program_ids, registry::FileSystemRegistry, Context, EnvironmentArgs};
 
@@ -19,19 +17,6 @@ const BPF_LOADER_UPGRADEABLE_PROGRAM_ID: Pubkey =
     pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
 
 const CHAIN_CORE_OWNERS: &[(&str, &[(&str, Pubkey)])] = &[
-    (
-        "soon",
-        &[
-            (
-                "OLD pre-TGE owner",
-                pubkey!("E3QPSn2Upk2EiidSsUqSQpRCc7BhzWZCKpVncemz3p62"),
-            ),
-            (
-                "NEW post-TGE owner",
-                pubkey!("7Y6WDpMfNeb1b4YYbyUkF41z1DuPhvDDuWWJCHPRNa9Y"),
-            ),
-        ],
-    ),
     (
         "solanamainnet",
         &[
@@ -116,18 +101,23 @@ pub fn process_squads_cmd(ctx: Context, cmd: SquadsCmd) {
                 &verify.env_args.environment,
                 &verify.chain,
             );
-            let core_programs = vec![
+            let mut core_programs = vec![
                 ProgramIdWithMetadata::new("Mailbox".into(), core_program_ids.mailbox),
                 ProgramIdWithMetadata::new(
                     "Validator Announce".into(),
                     core_program_ids.validator_announce,
                 ),
-                ProgramIdWithMetadata::new(
-                    "Multisig ISM Message ID".into(),
-                    core_program_ids.multisig_ism_message_id,
-                ),
                 ProgramIdWithMetadata::new("IGP program".into(), core_program_ids.igp_program_id),
             ];
+            if let Some(id) = core_program_ids.multisig_ism_message_id {
+                core_programs.push(ProgramIdWithMetadata::new(
+                    "Multisig ISM Message ID".into(),
+                    id,
+                ));
+            }
+            if let Some(id) = core_program_ids.composite_ism {
+                core_programs.push(ProgramIdWithMetadata::new("Composite ISM".into(), id));
+            }
 
             // Chain -> (Label, Owner)
             let chain_owner_lookups: HashMap<String, Vec<(Pubkey, String)>> = CHAIN_CORE_OWNERS
@@ -329,9 +319,10 @@ impl PubkeyClassifier {
             // Get the program data account address by looking at the program state
             let programdata_address = if let Ok(UpgradeableLoaderState::Program {
                 programdata_address,
-            }) = program_account.state()
+            }) = bincode::deserialize(&program_account.data)
             {
-                programdata_address
+                // Convert from solana_pubkey::Pubkey to solana_sdk::pubkey::Pubkey
+                Pubkey::new_from_array(programdata_address.to_bytes())
             } else {
                 panic!("Unable to deserialize program account {:?}", program);
             };

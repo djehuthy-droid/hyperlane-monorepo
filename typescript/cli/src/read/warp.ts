@@ -5,13 +5,13 @@ import {
   HypXERC20__factory,
   IXERC20__factory,
 } from '@hyperlane-xyz/core';
-import { AltVMWarpRouteReader } from '@hyperlane-xyz/deploy-sdk';
+import { createWarpTokenReader } from '@hyperlane-xyz/deploy-sdk';
 import { hasProtocol } from '@hyperlane-xyz/provider-sdk';
 import {
   type ChainMap,
   type ChainName,
   type DerivedWarpRouteDeployConfig,
-  EvmERC20WarpRouteReader,
+  EvmWarpRouteReader,
   type HypTokenRouterConfig,
   type MultiProvider,
   TokenStandard,
@@ -21,7 +21,7 @@ import {
 import {
   type Address,
   ProtocolType,
-  mustGet,
+  isEVMLike,
   objFilter,
   objMap,
   promiseObjAll,
@@ -35,26 +35,22 @@ export async function runWarpRouteRead({
   context,
   chain,
   address,
-  symbol,
   warpRouteId,
-  warpCoreConfigPath,
 }: {
   context: CommandContext;
   chain?: ChainName;
   address?: string;
-  symbol?: string;
   warpRouteId?: string;
-  warpCoreConfigPath?: string;
 }): Promise<ChainMap<HypTokenRouterConfig>> {
   let addresses: ChainMap<Address>;
   let warpCoreConfig: WarpCoreConfig | undefined;
-  if (symbol || warpCoreConfigPath || warpRouteId) {
-    warpCoreConfig = await getWarpCoreConfigOrExit({
-      context,
-      symbol,
-      warp: warpCoreConfigPath,
-      warpRouteId,
-    });
+  if (warpRouteId) {
+    warpCoreConfig =
+      context.warpCoreConfig ??
+      (await getWarpCoreConfigOrExit({
+        context,
+        warpRouteId,
+      }));
 
     addresses = Object.fromEntries(
       warpCoreConfig.tokens.map((t) => [t.chainName, t.addressOrDenom!]),
@@ -65,7 +61,7 @@ export async function runWarpRouteRead({
     };
   } else {
     throw new Error(
-      'Invalid input parameters. Please provide either a token symbol, a warp route id or both chain name and token address',
+      'Invalid input parameters. Please provide either a warp route ID (-w) or both chain name and token address',
     );
   }
 
@@ -73,14 +69,13 @@ export async function runWarpRouteRead({
   const filteredAddresses = objFilter(
     addresses,
     (chain, _address): _address is string =>
-      context.multiProvider.getProtocol(chain) === ProtocolType.Ethereum ||
+      isEVMLike(context.multiProvider.getProtocol(chain)) ||
       hasProtocol(context.multiProvider.getProtocol(chain)),
   );
   if (warpCoreConfig) {
     warpCoreConfig.tokens = warpCoreConfig.tokens.filter(
       (config) =>
-        context.multiProvider.getProtocol(config.chainName) ===
-          ProtocolType.Ethereum ||
+        isEVMLike(context.multiProvider.getProtocol(config.chainName)) ||
         hasProtocol(context.multiProvider.getProtocol(config.chainName)),
     );
   }
@@ -107,8 +102,6 @@ async function deriveWarpRouteConfigs(
   addresses: ChainMap<string>,
   warpCoreConfig?: WarpCoreConfig,
 ): Promise<DerivedWarpRouteDeployConfig> {
-  const { multiProvider } = context;
-
   validateCompatibility(
     context.multiProvider,
     context.supportedProtocols,
@@ -117,33 +110,42 @@ async function deriveWarpRouteConfigs(
 
   // Get XERC20 limits if warpCoreConfig is available
   if (warpCoreConfig) {
-    await logXerc20Limits(warpCoreConfig, multiProvider);
+    await logXERC20Limits(warpCoreConfig, context.multiProvider);
   }
 
-  // Derive and return warp route config
   return promiseObjAll(
-    objMap(addresses, async (chain, address) => {
-      const protocol = context.multiProvider.getProtocol(chain);
-      switch (protocol) {
-        case ProtocolType.Ethereum: {
-          return new EvmERC20WarpRouteReader(
-            multiProvider,
-            chain,
-          ).deriveWarpRouteConfig(address);
-        }
-        default: {
-          const provider = mustGet(context.altVmProviders, chain);
-          const chainLookup = altVmChainLookup(multiProvider);
-          const metadata = chainLookup.getChainMetadata(chain);
-          return new AltVMWarpRouteReader(
-            metadata,
-            chainLookup,
-            provider,
-          ).deriveWarpRouteConfig(address);
-        }
-      }
-    }),
+    objMap(addresses, (chain, address) =>
+      deriveWarpRouteConfigForChain(context, chain, address),
+    ),
   );
+}
+
+/**
+ * Derive the on-chain warp router config for a single chain. EVM and Tron go
+ * through `EvmWarpRouteReader`; alt-VMs go through the deploy-sdk
+ * `createWarpTokenReader`. Used by per-chain CLI handlers that don't need to
+ * derive every chain in the warp route.
+ */
+export async function deriveWarpRouteConfigForChain(
+  context: CommandContext,
+  chain: ChainName,
+  routerAddress: string,
+) {
+  const { multiProvider } = context;
+  const protocol = multiProvider.getProtocol(chain);
+  switch (protocol) {
+    case ProtocolType.Tron:
+    case ProtocolType.Ethereum:
+      return new EvmWarpRouteReader(multiProvider, chain).deriveWarpRouteConfig(
+        routerAddress,
+      );
+    default: {
+      const chainLookup = altVmChainLookup(multiProvider);
+      const chainMetadata = chainLookup.getChainMetadata(chain);
+      const reader = createWarpTokenReader(chainMetadata, chainLookup);
+      return reader.deriveWarpConfig(routerAddress);
+    }
+  }
 }
 
 // Validate that all chains are EVM or AltVM compatible
@@ -174,7 +176,7 @@ function validateCompatibility(
 /**
  * Logs XERC20 token limits for the given warp core config
  */
-export async function logXerc20Limits(
+export async function logXERC20Limits(
   warpCoreConfig: WarpCoreConfig,
   multiProvider: MultiProvider,
 ): Promise<void> {

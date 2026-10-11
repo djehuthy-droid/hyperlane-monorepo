@@ -17,7 +17,9 @@ import {
   ProtocolType,
   addBufferToGasLimit,
   eqAddress,
+  isEVMLike,
   isZeroishAddress,
+  pollAsync,
   rootLogger,
   runWithTimeout,
 } from '@hyperlane-xyz/utils';
@@ -93,7 +95,7 @@ export abstract class HyperlaneDeployer<
     protected readonly icaAddresses = {},
   ) {
     this.logger = options?.logger ?? rootLogger.child({ module: 'deployer' });
-    this.chainTimeoutMs = options?.chainTimeoutMs ?? 15 * 60 * 1000; // 15 minute timeout per chain
+    this.chainTimeoutMs = options?.chainTimeoutMs ?? 45 * 60 * 1000; // 45 minute timeout per chain
     if (Object.keys(icaAddresses).length > 0) {
       this.options.icaApp = InterchainAccount.fromAddressesMap(
         icaAddresses,
@@ -121,6 +123,14 @@ export abstract class HyperlaneDeployer<
     input: ContractVerificationInput,
     logger = this.logger,
   ): Promise<void> {
+    const metadata = this.multiProvider.getChainMetadata(chain);
+
+    // Skip verification for Tron chains (not supported yet)
+    if (metadata.protocol === ProtocolType.Tron) {
+      logger.debug(`Skipping contract verification for Tron chain ${chain}`);
+      return;
+    }
+
     const explorerApi = this.multiProvider.tryGetExplorerApi(chain);
     if (!explorerApi) {
       logger.warn(
@@ -146,10 +156,8 @@ export abstract class HyperlaneDeployer<
     configMap: ChainMap<Config>,
   ): Promise<HyperlaneContractsMap<Factories>> {
     const configChains = Object.keys(configMap);
-    const ethereumConfigChains = configChains.filter(
-      (chain) =>
-        this.multiProvider.getChainMetadata(chain).protocol ===
-        ProtocolType.Ethereum,
+    const ethereumConfigChains = configChains.filter((chain) =>
+      isEVMLike(this.multiProvider.getChainMetadata(chain).protocol),
     );
 
     const targetChains = this.multiProvider.intersect(
@@ -319,9 +327,18 @@ export abstract class HyperlaneDeployer<
         populatedTx.gasLimit = addBufferToGasLimit(estimatedGas);
         await this.multiProvider.sendTransaction(chain, populatedTx);
 
-        if (!eqAddress(targetIsm, await getIsm(contract))) {
-          throw new Error(`Set ISM failed on ${chain}`);
-        }
+        await pollAsync(
+          async () => {
+            const actualIsm = await getIsm(contract);
+            if (!eqAddress(targetIsm, actualIsm)) {
+              throw new Error(
+                `Set ISM failed on ${chain}, wanted ${targetIsm}, got ${actualIsm}`,
+              );
+            }
+          },
+          this.postTxReadDelayMs(chain),
+          10,
+        );
       });
     }
   }
@@ -347,12 +364,18 @@ export abstract class HyperlaneDeployer<
           chain,
           setHook(contract, config),
         );
-        const actualHook = await getHook(contract);
-        if (!eqAddress(config, actualHook)) {
-          throw new Error(
-            `Set hook failed on ${chain}, wanted ${config}, got ${actualHook}`,
-          );
-        }
+        await pollAsync(
+          async () => {
+            const actualHook = await getHook(contract);
+            if (!eqAddress(config, actualHook)) {
+              throw new Error(
+                `Set hook failed on ${chain}, wanted ${config}, got ${actualHook}`,
+              );
+            }
+          },
+          this.postTxReadDelayMs(chain),
+          10,
+        );
       });
     }
   }
@@ -391,6 +414,12 @@ export abstract class HyperlaneDeployer<
 
   initializeFnSignature(_contractName: string): string {
     return 'initialize';
+  }
+
+  protected postTxReadDelayMs(chain: ChainName): number {
+    const estimateBlockTime =
+      this.multiProvider.getChainMetadata(chain).blocks?.estimateBlockTime ?? 1;
+    return Math.max(estimateBlockTime * 1000, 1000);
   }
 
   public async deployContractFromFactory<F extends ethers.ContractFactory>(
@@ -455,9 +484,9 @@ export abstract class HyperlaneDeployer<
         // Estimate gas for the initialize transaction
         const estimatedGas = await contract
           .connect(signer)
-          .estimateGas[
-            this.initializeFnSignature(contractName)
-          ](...initializeArgs);
+          .estimateGas[this.initializeFnSignature(contractName)](
+            ...initializeArgs,
+          );
 
         // deploy with buffer on gas limit
         const overrides = this.multiProvider.getTransactionOverrides(chain);

@@ -1,11 +1,10 @@
 import { HexString, ProtocolType } from '@hyperlane-xyz/utils';
 
-import { MultiProtocolProvider } from '../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../providers/MultiProviderAdapter.js';
 import { ChainName } from '../types.js';
 
 import { CosmosNativeMultiProtocolSignerAdapter } from './cosmos/cosmjs.js';
 import { EvmMultiProtocolSignerAdapter } from './evm/ethersv5.js';
-import { RadixMultiProtocolSignerAdapter } from './radix/radix-toolkit.js';
 import { StarknetMultiProtocolSignerAdapter } from './starknet/starknetjs.js';
 import {
   KeypairSvmTransactionSigner,
@@ -34,11 +33,12 @@ export type MultiProtocolSignerSignerAccountInfo =
 export async function getSignerForChain<TProtocol extends ProtocolType>(
   chainName: ChainName,
   accountConfig: MultiProtocolSignerSignerAccountInfo,
-  multiProtocolProvider: MultiProtocolProvider,
+  multiProtocolProvider: MultiProviderAdapter,
 ): Promise<IMultiProtocolSigner<TProtocol>> {
   const protocol = accountConfig.protocol;
 
   switch (accountConfig.protocol) {
+    case ProtocolType.Tron:
     case ProtocolType.Ethereum:
       return new EvmMultiProtocolSignerAdapter(
         chainName,
@@ -64,12 +64,15 @@ export async function getSignerForChain<TProtocol extends ProtocolType>(
         accountConfig.address,
         multiProtocolProvider,
       );
-    case ProtocolType.Radix:
+    case ProtocolType.Radix: {
+      const { RadixMultiProtocolSignerAdapter } =
+        await import('./radix/radix-toolkit.js');
       return RadixMultiProtocolSignerAdapter.init(
         chainName,
         accountConfig.privateKey,
         multiProtocolProvider,
       );
+    }
     default:
       throw new Error(`Signer not supported for protocol type ${protocol}`);
   }

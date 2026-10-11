@@ -34,7 +34,7 @@ export const tokenMessengerV2Addresses = {
   sei: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
   hyperevm: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
   ink: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
-  plume: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
+  arc: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
 } as const;
 
 export const messageTransmitterV2Addresses = {
@@ -51,22 +51,23 @@ export const messageTransmitterV2Addresses = {
   sei: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
   hyperevm: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
   ink: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
-  plume: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
+  arc: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
 } as const;
 
-// https://developers.circle.com/cctp/technical-guide#cctp-v2-fees
+// https://developers.circle.com/cctp/concepts/fees
+// Values in fractional bps matching Circle's published rates.
+// The SDK converts to ppm (bps * 100) for on-chain storage.
 export const FAST_TRANSFER_FEE_BPS: Partial<
   Record<keyof typeof tokenMessengerV2Addresses, number>
 > = {
-  arbitrum: 1,
-  base: 1,
+  arbitrum: 1.4,
+  base: 1.3,
   ethereum: 1,
   ink: 2,
-  linea: 14,
-  optimism: 1,
-  plume: 2,
-  unichain: 1,
-  worldchain: 1,
+  linea: 13,
+  optimism: 1.3,
+  unichain: 2,
+  worldchain: 1.3,
 };
 
 // https://developers.circle.com/cctp/technical-guide#cctp-v2-finality-thresholds
@@ -77,8 +78,10 @@ export const usdcTokenAddresses = {
   algorand: '31566704',
   aptos: '0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b',
   arbitrum: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+  arc: '0x3600000000000000000000000000000000000000',
   avalanche: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',
   base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+  bsc: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
   celo: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C',
   ethereum: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
   flow: 'A.b19436aae4d94622.FiatToken',
@@ -86,12 +89,14 @@ export const usdcTokenAddresses = {
   hyperevm: '0xb88339CB7199b77E23DB6E890353E22632Ba630f',
   ink: '0x2D270e6886d130D724215A266106e6832161EAEd',
   linea: '0x176211869cA2b568f2A7D4EE941E073a821EE1ff',
+  // vbUSDC
+  katana: '0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36',
   near: '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1',
+  monad: '0x754704Bc059F8C67012fEd69BC8A327a5aafb603',
   noble: 'uusdc',
   optimism: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
   polkadotassethub: '1337',
   polygon: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
-  plume: '0x222365EF19F7947e5484218551B56bb3965Aa7aF',
   sei: '0xe15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392',
   sonic: '0x29219dd400f2Bf60E5a23d13Be72B486D4038894',
   stellar: 'USDC-GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
@@ -99,7 +104,6 @@ export const usdcTokenAddresses = {
   tron: 'TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8',
   unichain: '0x078D782b760474a361dDA0AF3839290b0EF57AD6',
   worldchain: '0x79A02482A880bCE3F13e09Da970dC34db4CD24d1',
-  zksync: '0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4',
   solanamainnet: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
   starknet:
     '0x053C91253BC9682c04929cA02ED00b3E423f6710D2ee7e0D5EBB06F3eCF368A8',

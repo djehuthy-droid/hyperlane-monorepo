@@ -1,0 +1,885 @@
+import { expect } from 'chai';
+import { pino } from 'pino';
+
+import type { LiFiStep } from '@lifi/sdk';
+import { ProtocolType } from '@hyperlane-xyz/utils';
+
+import type {
+  BridgeQuote,
+  BridgeQuoteParams,
+  ExternalBridgeConfig,
+} from '../interfaces/IExternalBridge.js';
+import { LiFiBridge } from './LiFiBridge.js';
+
+const testLogger = pino({ level: 'silent' });
+
+const TEST_PRIVATE_KEY =
+  '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+const OTHER_PRIVATE_KEY = `${TEST_PRIVATE_KEY.slice(0, -1)}1`;
+
+const BRIDGE_CONFIG: ExternalBridgeConfig = {
+  integrator: 'test-rebalancer',
+};
+
+const SOLANA_CHAIN_METADATA_CONFIG: ExternalBridgeConfig = {
+  integrator: 'test-rebalancer',
+  chainMetadata: {
+    solana: {
+      chainId: 1399811149,
+      protocol: ProtocolType.Sealevel,
+      name: 'solana',
+      displayName: 'Solana',
+      domainId: 1399811149,
+      rpcUrls: [{ http: 'https://api.mainnet-beta.solana.com' }],
+    },
+  },
+};
+
+const DUPLICATE_CHAIN_ID_CONFIG: ExternalBridgeConfig = {
+  integrator: 'test-rebalancer',
+  chainMetadata: {
+    ethereum: {
+      chainId: 1,
+      protocol: ProtocolType.Ethereum,
+      name: 'ethereum',
+      displayName: 'Ethereum',
+      domainId: 1,
+      rpcUrls: [{ http: 'https://ethereum-rpc.local' }],
+    },
+    radix: {
+      chainId: 1,
+      protocol: ProtocolType.Radix,
+      name: 'radix',
+      displayName: 'Radix',
+      domainId: 1001,
+      rpcUrls: [{ http: 'https://radix-rpc.local' }],
+    },
+    solanamainnet: {
+      chainId: 1399811149,
+      protocol: ProtocolType.Sealevel,
+      name: 'solanamainnet',
+      displayName: 'Solana',
+      domainId: 1399811149,
+      rpcUrls: [{ http: 'https://api.mainnet-beta.solana.com' }],
+    },
+  },
+};
+
+const NON_EVM_DOMAIN_COLLISION_CONFIG: ExternalBridgeConfig = {
+  integrator: 'test-rebalancer',
+  chainMetadata: {
+    ethereum: {
+      chainId: 1,
+      protocol: ProtocolType.Ethereum,
+      name: 'ethereum',
+      displayName: 'Ethereum',
+      domainId: 1,
+      rpcUrls: [{ http: 'https://ethereum-rpc.local' }],
+    },
+    cosmos: {
+      chainId: 999999999,
+      protocol: ProtocolType.Cosmos,
+      name: 'cosmos',
+      displayName: 'Cosmos',
+      domainId: 1,
+      rpcUrls: [{ http: 'https://rpc.cosmos.invalid' }],
+    },
+  },
+};
+
+// Use all-digit hex addresses to avoid EIP-55 checksum case mutations
+const TOKEN_ADDR = '0x1234567890123456789012345678901234567890';
+const SENDER_ADDR = '0x9876543210987654321098765432109876543210';
+const BAD_ADDR = '0x1111111111111111111111111111111111111111';
+
+/**
+ * Creates a LiFiStep object that convertQuoteToRoute can consume.
+ * The SDK's convertQuoteToRoute reads action.fromToken.chainId, action.toToken.chainId, etc.
+ */
+function createLiFiStep(overrides?: {
+  fromChainId?: number;
+  toChainId?: number;
+  fromTokenAddress?: string;
+  toTokenAddress?: string;
+  toAddress?: string;
+  fromAmount?: string;
+  toAmount?: string;
+  fromAddress?: string;
+}): LiFiStep {
+  const fromChainId = overrides?.fromChainId ?? 42161;
+  const toChainId = overrides?.toChainId ?? 1151111081099710;
+  const fromTokenAddress = overrides?.fromTokenAddress ?? TOKEN_ADDR;
+  const toTokenAddress = overrides?.toTokenAddress ?? TOKEN_ADDR;
+  const fromAmount = overrides?.fromAmount ?? '10000000000';
+  const fromAddress = overrides?.fromAddress ?? SENDER_ADDR;
+  const toAddress = overrides?.toAddress ?? SENDER_ADDR;
+
+  return {
+    id: 'quote-123',
+    type: 'lifi' as const,
+    tool: 'across',
+    toolDetails: { key: 'across', name: 'Across', logoURI: '' },
+    includedSteps: [],
+    action: {
+      fromToken: {
+        chainId: fromChainId,
+        address: fromTokenAddress,
+        symbol: 'USDC',
+        decimals: 6,
+        name: 'USD Coin',
+        priceUSD: '1',
+      },
+      toToken: {
+        chainId: toChainId,
+        address: toTokenAddress,
+        symbol: 'USDC',
+        decimals: 6,
+        name: 'USD Coin',
+        priceUSD: '1',
+      },
+      fromAmount,
+      fromAddress,
+      toAddress,
+      fromChainId,
+      toChainId,
+      slippage: 0.005,
+    },
+    estimate: {
+      tool: 'across',
+      fromAmount,
+      fromAmountUSD: '10000',
+      toAmount: overrides?.toAmount ?? '9950000000',
+      toAmountMin: '9900000000',
+      toAmountUSD: '9950',
+      approvalAddress: '0x0000000000000000000000000000000000000000',
+      executionDuration: 300,
+      gasCosts: [
+        {
+          type: 'SEND' as const,
+          price: '50',
+          estimate: '21000',
+          limit: '26250',
+          amount: '50000000',
+          amountUSD: '5',
+          token: {
+            chainId: fromChainId,
+            address: '0x0000000000000000000000000000000000000000',
+            symbol: 'ETH',
+            decimals: 18,
+            name: 'Ethereum',
+            priceUSD: '3000',
+          },
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * Creates a BridgeQuote with matching requestParams for the default LiFi step.
+ */
+function createTestQuote(
+  routeOverrides?: Parameters<typeof createLiFiStep>[0],
+  paramOverrides?: Partial<BridgeQuoteParams>,
+): BridgeQuote<LiFiStep> {
+  const lifiStep = createLiFiStep(routeOverrides);
+
+  const defaultParams: BridgeQuoteParams = {
+    fromChain: 42161,
+    toChain: 1151111081099710,
+    fromToken: TOKEN_ADDR,
+    toToken: TOKEN_ADDR,
+    fromAddress: SENDER_ADDR,
+    toAddress: SENDER_ADDR,
+    fromAmount: 10000000000n,
+  };
+
+  return {
+    id: 'quote-123',
+    tool: 'across',
+    fromAmount: 10000000000n,
+    toAmount: 9950000000n,
+    toAmountMin: 9900000000n,
+    executionDuration: 300,
+    gasCosts: 50000000n,
+    feeCosts: 0n,
+    route: lifiStep,
+    requestParams: { ...defaultParams, ...paramOverrides },
+  };
+}
+
+/**
+ * Validation regex patterns used by LiFiBridge.execute() assertion messages.
+ * If an error message matches any of these, it came from route validation.
+ */
+const VALIDATION_PATTERNS = [
+  /Route fromChainId .* does not match requested/,
+  /Route toChainId .* does not match requested/,
+  /Route fromToken .* does not match requested/,
+  /Route toToken .* does not match requested/,
+  /Route toAddress .* does not match requested/,
+  /Route fromAddress .* does not match requested/,
+  /Route fromAmount .* does not match requested/,
+  /Route toAmount .* is less than requested/,
+  /Route fromAmount must be positive/,
+];
+
+function isValidationError(msg: string): boolean {
+  return VALIDATION_PATTERNS.some((pattern) => pattern.test(msg));
+}
+
+describe('LiFiBridge.execute() route validation', function () {
+  // Allow extra time for tests that pass validation and reach SDK execution
+  this.timeout(15000);
+
+  let bridge: LiFiBridge;
+
+  beforeEach(() => {
+    bridge = new LiFiBridge(BRIDGE_CONFIG, testLogger);
+  });
+
+  it('should pass validation when all route fields match requestParams', async () => {
+    const quote = createTestQuote();
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      // If it resolves, validation definitely passed
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      // Post-validation error (SDK/RPC). Verify it is NOT a route validation error.
+      expect(
+        isValidationError(msg),
+        `Expected non-validation error but got: ${msg}`,
+      ).to.equal(false);
+    }
+  });
+
+  it('should throw when route fromChainId does not match requested', async () => {
+    const quote = createTestQuote({ fromChainId: 999 }, { fromChain: 42161 });
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('999');
+      expect(msg).to.include('42161');
+      expect(msg).to.include('fromChainId');
+    }
+  });
+
+  it('should throw when route toChainId does not match requested', async () => {
+    const quote = createTestQuote(
+      { toChainId: 888 },
+      { toChain: 1151111081099710 },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('888');
+      expect(msg).to.include('1151111081099710');
+      expect(msg).to.include('toChainId');
+    }
+  });
+
+  it('should throw when route fromToken does not match requested', async () => {
+    const quote = createTestQuote(
+      { fromTokenAddress: BAD_ADDR },
+      { fromToken: TOKEN_ADDR },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('fromToken');
+      // Error message should contain the mismatched address value
+      expect(msg.toLowerCase()).to.include(BAD_ADDR.toLowerCase());
+    }
+  });
+
+  it('should throw when route toToken does not match requested', async () => {
+    const quote = createTestQuote(
+      { toTokenAddress: BAD_ADDR },
+      { toToken: TOKEN_ADDR },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('toToken');
+      expect(msg.toLowerCase()).to.include(BAD_ADDR.toLowerCase());
+    }
+  });
+
+  it('should throw when route toAddress does not match requested', async () => {
+    const quote = createTestQuote(
+      { toAddress: BAD_ADDR },
+      { toAddress: SENDER_ADDR },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('toAddress');
+    }
+  });
+
+  it('should throw when route fromAddress does not match requested', async () => {
+    const quote = createTestQuote(
+      { fromAddress: BAD_ADDR },
+      { fromAddress: SENDER_ADDR },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('fromAddress');
+    }
+  });
+
+  it('should pass validation when fromAmount is omitted in requestParams', async () => {
+    // Route has fromAmount='99999' but requestParams has no fromAmount.
+    // The fromAmount assertion is skipped when requestParams.fromAmount is undefined.
+    // The positive amount check still passes (99999 > 0).
+    const quote = createTestQuote(
+      { fromAmount: '99999' },
+      { fromAmount: undefined },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(
+        isValidationError(msg),
+        `Expected non-validation error but got: ${msg}`,
+      ).to.equal(false);
+    }
+  });
+
+  it('should throw when route fromAmount does not match requested', async () => {
+    const quote = createTestQuote(
+      { fromAmount: '9999999999' },
+      { fromAmount: 10000000000n },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('9999999999');
+      expect(msg).to.include('10000000000');
+      expect(msg).to.include('fromAmount');
+    }
+  });
+
+  it('should throw when route fromAmount is zero', async () => {
+    // fromAmount=0n is falsy, so the mismatch assertion is skipped.
+    // But the positive amount check catches it.
+    const quote = createTestQuote(
+      { fromAmount: '0' },
+      { fromAmount: undefined },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('must be positive');
+    }
+  });
+
+  it('should match addresses case-insensitively (mixed vs uppercase)', async () => {
+    // Route uses lowercase a-f, requestParams uses uppercase A-F
+    // Both should match after toLowerCase()
+    const mixedCaseToken = '0xaabb000000000000000000000000000000001122';
+    const upperCaseToken = '0xAABB000000000000000000000000000000001122';
+    const mixedCaseSender = '0xddee000000000000000000000000000000003344';
+    const upperCaseSender = '0xDDEE000000000000000000000000000000003344';
+
+    const quote = createTestQuote(
+      {
+        fromTokenAddress: mixedCaseToken,
+        toTokenAddress: mixedCaseToken,
+        fromAddress: mixedCaseSender,
+        toAddress: mixedCaseSender,
+      },
+      {
+        fromToken: upperCaseToken,
+        toToken: upperCaseToken,
+        fromAddress: upperCaseSender,
+        toAddress: upperCaseSender,
+      },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(
+        isValidationError(msg),
+        `Expected non-validation error but got: ${msg}`,
+      ).to.equal(false);
+    }
+  });
+
+  it('should throw when requestParams.fromAmount is 0n and route has positive amount', async () => {
+    // Validates the fix for the fromAmount=0n truthiness bypass:
+    // 0n was falsy so `if (requestParams.fromAmount)` would skip the comparison.
+    // With `!== undefined`, a 0n request is correctly compared against the route amount.
+    const quote = createTestQuote({ fromAmount: '1' }, { fromAmount: 0n });
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('fromAmount');
+    }
+  });
+
+  it('should pass validation for toAmount quote path (fromAmount undefined, toAmount present)', async () => {
+    // Tests reverse-quote pattern where toAmount is set and fromAmount is undefined.
+    // The fromAmount equality check is skipped when requestParams.fromAmount is undefined.
+    // The toAmount equality check passes because route.toAmount matches requestParams.toAmount.
+    const quote = createTestQuote(
+      { fromAmount: '5000000000', toAmount: '5000000000' },
+      { fromAmount: undefined, toAmount: 5000000000n },
+    );
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(
+        isValidationError(msg),
+        `Expected non-validation error but got: ${msg}`,
+      ).to.equal(false);
+    }
+  });
+
+  it('should throw when route toAmount is less than requested for reverse quote', async () => {
+    // Route estimate.toAmount='100' but requestParams.toAmount=123n -> 100 < 123, should throw
+    const quote = createTestQuote(
+      { toAmount: '100' },
+      { fromAmount: undefined, toAmount: 123n },
+    );
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('toAmount');
+      expect(msg).to.include('100');
+      expect(msg).to.include('123');
+      expect(msg).to.include('is less than');
+    }
+  });
+
+  it('should pass validation when route toAmount exceeds requested (reverse quote)', async () => {
+    // paulbalaji reproduction: requested 1000000, LiFi returned 1000002.
+    // >= semantics: 1000002 >= 1000000 passes validation.
+    const quote = createTestQuote(
+      { toAmount: '1000002' },
+      { fromAmount: undefined, toAmount: 1000000n },
+    );
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(
+        isValidationError(msg),
+        `Expected non-validation error but got: ${msg}`,
+      ).to.equal(false);
+    }
+  });
+});
+
+describe('LiFiBridge.quote() input validation', function () {
+  let bridge: LiFiBridge;
+
+  beforeEach(() => {
+    bridge = new LiFiBridge(BRIDGE_CONFIG, testLogger);
+  });
+
+  it('should throw when fromAmount is 0n', async () => {
+    try {
+      await bridge.quote({
+        fromChain: 42161,
+        toChain: 1151111081099710,
+        fromToken: TOKEN_ADDR,
+        toToken: TOKEN_ADDR,
+        fromAddress: SENDER_ADDR,
+        fromAmount: 0n,
+      });
+      expect.fail('Expected quote to throw');
+    } catch (error: unknown) {
+      expect((error as Error).message).to.include(
+        'fromAmount must be positive',
+      );
+    }
+  });
+
+  it('should throw when toAmount is 0n', async () => {
+    try {
+      await bridge.quote({
+        fromChain: 42161,
+        toChain: 1151111081099710,
+        fromToken: TOKEN_ADDR,
+        toToken: TOKEN_ADDR,
+        fromAddress: SENDER_ADDR,
+        toAmount: 0n,
+      });
+      expect.fail('Expected quote to throw');
+    } catch (error: unknown) {
+      expect((error as Error).message).to.include('toAmount must be positive');
+    }
+  });
+
+  it('should throw when both fromAmount and toAmount are provided', async () => {
+    try {
+      await bridge.quote({
+        fromChain: 42161,
+        toChain: 1151111081099710,
+        fromToken: TOKEN_ADDR,
+        toToken: TOKEN_ADDR,
+        fromAddress: SENDER_ADDR,
+        fromAmount: 10000000000n,
+        toAmount: 5000000000n,
+      });
+      expect.fail('Expected quote to throw');
+    } catch (error: unknown) {
+      expect((error as Error).message).to.include('Cannot specify both');
+    }
+  });
+
+  it('should throw when neither fromAmount nor toAmount is provided', async () => {
+    try {
+      await bridge.quote({
+        fromChain: 42161,
+        toChain: 1151111081099710,
+        fromToken: TOKEN_ADDR,
+        toToken: TOKEN_ADDR,
+        fromAddress: SENDER_ADDR,
+      });
+      expect.fail('Expected quote to throw');
+    } catch (error: unknown) {
+      expect((error as Error).message).to.include('Must specify either');
+    }
+  });
+});
+
+describe('LiFiBridge.quote() routing policy', function () {
+  let bridge: LiFiBridge;
+
+  beforeEach(() => {
+    bridge = new LiFiBridge(BRIDGE_CONFIG, testLogger);
+  });
+
+  it('should use RECOMMENDED order for reverse toAmount quotes', async () => {
+    const originalFetch = globalThis.fetch;
+    let requestUrl = '';
+
+    globalThis.fetch = (async (input: URL | RequestInfo) => {
+      requestUrl = String(input);
+      return {
+        ok: true,
+        json: async () =>
+          createLiFiStep({
+            toChainId: 1151111081099710,
+            toAmount: '5000000000',
+          }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      const quote = await bridge.quote({
+        fromChain: 42161,
+        toChain: 1151111081099710,
+        fromToken: TOKEN_ADDR,
+        toToken: TOKEN_ADDR,
+        fromAddress: SENDER_ADDR,
+        toAddress: SENDER_ADDR,
+        toAmount: 5000000000n,
+      });
+      const params = new URL(requestUrl).searchParams;
+
+      expect(params.get('order')).to.equal('RECOMMENDED');
+      expect(quote.requestParams.toAmount).to.equal(5000000000n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe('LiFiBridge.getStatus()', function () {
+  let bridge: LiFiBridge;
+
+  beforeEach(() => {
+    bridge = new LiFiBridge(BRIDGE_CONFIG, testLogger);
+  });
+
+  it('should translate Hyperlane domain IDs to LiFi chain IDs before SDK status lookup', async () => {
+    const originalFetch = globalThis.fetch;
+    let requestUrl = '';
+
+    globalThis.fetch = (async (input: URL | RequestInfo) => {
+      requestUrl = String(input);
+      return {
+        ok: true,
+        json: async () => ({ status: 'NOT_FOUND' }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      const result = await bridge.getStatus('0x1234', 1399811149, 1399811149);
+      const params = new URL(requestUrl).searchParams;
+
+      expect(result.status).to.equal('not_found');
+      expect(params.get('fromChain')).to.equal('1151111081099710');
+      expect(params.get('toChain')).to.equal('1151111081099710');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe('LiFiBridge constructor chainMetadataByChainId', function () {
+  it('should resolve Sealevel protocol using a LiFi chain ID mapped from Hyperlane metadata', async () => {
+    const bridge = new LiFiBridge(SOLANA_CHAIN_METADATA_CONFIG, testLogger);
+    const quote = createTestQuote(
+      {
+        toTokenAddress: 'Abcdef123456789ABCDEFGHijklmnopQRSTUVwx',
+      },
+      {
+        toToken: 'abcdef123456789abcdefghijklmnopqrstuvwx',
+      },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include('toToken');
+      expect(msg).to.include('does not match requested');
+    }
+  });
+
+  it('should prefer Ethereum metadata for LiFi chainId lookups when non-EVM chainIds collide', () => {
+    const bridge = new LiFiBridge(DUPLICATE_CHAIN_ID_CONFIG, testLogger);
+    const quote = createTestQuote(
+      { fromChainId: 1 },
+      {
+        fromChain: 1,
+        toChain: 1151111081099710,
+      },
+    );
+
+    return bridge
+      .execute(quote, {
+        [ProtocolType.Ethereum]: '0x1234',
+      })
+      .catch((error: unknown) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        expect(
+          isValidationError(msg),
+          `Expected non-validation error but got: ${msg}`,
+        ).to.equal(false);
+        expect(msg).to.not.include('Missing private key');
+        expect(msg).to.not.include('protocol radix');
+        expect(msg.toLowerCase()).to.include('private key');
+      });
+  });
+
+  it('should index Tron by chainId even when domainId differs', () => {
+    const TRON_CHAIN_ID = 728126428;
+    const bridge = new LiFiBridge(
+      {
+        integrator: 'test-rebalancer',
+        chainMetadata: {
+          tron: {
+            chainId: TRON_CHAIN_ID,
+            protocol: ProtocolType.Tron,
+            name: 'tron',
+            displayName: 'Tron',
+            domainId: 999000999,
+            rpcUrls: [{ http: 'https://api.trongrid.io/jsonrpc' }],
+          },
+        },
+      },
+      testLogger,
+    );
+    const getProtocolTypeForChainId = (
+      bridge as any
+    ).getProtocolTypeForChainId.bind(bridge);
+
+    expect(getProtocolTypeForChainId(TRON_CHAIN_ID)).to.equal(
+      ProtocolType.Tron,
+    );
+    expect(getProtocolTypeForChainId(999000999)).to.equal(undefined);
+  });
+
+  it('should not let non-EVM domainIds overwrite EVM chainId lookups', () => {
+    const bridge = new LiFiBridge(NON_EVM_DOMAIN_COLLISION_CONFIG, testLogger);
+    const getProtocolTypeForChainId = (
+      bridge as any
+    ).getProtocolTypeForChainId.bind(bridge);
+
+    expect(getProtocolTypeForChainId(1)).to.equal(ProtocolType.Ethereum);
+    expect(getProtocolTypeForChainId(999999999)).to.equal(ProtocolType.Cosmos);
+  });
+});
+
+describe('LiFiBridge source protocol handling', function () {
+  it('ignores unrelated Tron keys when executing an Ethereum LiFi route', async () => {
+    const bridge = new LiFiBridge(BRIDGE_CONFIG, testLogger);
+    (bridge as any).configureLiFiProvider = (
+      protocol: ProtocolType,
+      key: string,
+      fromChain: number,
+    ) => {
+      expect(protocol).to.equal(ProtocolType.Ethereum);
+      expect(key).to.equal(TEST_PRIVATE_KEY);
+      expect(fromChain).to.equal(42161);
+      throw new Error('expected downstream error');
+    };
+
+    const quote = createTestQuote();
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Ethereum]: TEST_PRIVATE_KEY,
+        [ProtocolType.Tron]: OTHER_PRIVATE_KEY,
+      });
+      expect.fail('Expected execute to throw');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.equal('expected downstream error');
+    }
+  });
+
+  it('addressesEqual keeps Sealevel base58 comparison case-sensitive', () => {
+    const bridge = new LiFiBridge(SOLANA_CHAIN_METADATA_CONFIG, testLogger);
+    const addressesEqualFn = (bridge as any).addressesEqual.bind(bridge);
+
+    expect(
+      addressesEqualFn(
+        'SoLANAAddReSs1234567890123456789012345678',
+        'solanaaddress1234567890123456789012345678',
+        1399811149,
+      ),
+    ).to.be.false;
+  });
+
+  it('throws when the route source protocol is Tron', async () => {
+    const TRON_CHAIN_ID = 728126428;
+    const bridge = new LiFiBridge(
+      {
+        integrator: 'test-rebalancer',
+        chainMetadata: {
+          tron: {
+            chainId: TRON_CHAIN_ID,
+            protocol: ProtocolType.Tron,
+            name: 'tron',
+            displayName: 'Tron',
+            domainId: TRON_CHAIN_ID,
+            rpcUrls: [{ http: 'https://api.trongrid.io/jsonrpc' }],
+          },
+        },
+      },
+      testLogger,
+    );
+    const quote = createTestQuote(
+      { fromChainId: TRON_CHAIN_ID },
+      { fromChain: TRON_CHAIN_ID },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Tron]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Should have thrown for unsupported source protocol Tron');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include("Unsupported protocol type 'tron'");
+    }
+  });
+
+  it('throws when the route source protocol is an unsupported non-Tron chain', async () => {
+    const COSMOS_CHAIN_ID = 999999999;
+    const bridge = new LiFiBridge(
+      {
+        integrator: 'test-rebalancer',
+        chainMetadata: {
+          cosmos: {
+            chainId: COSMOS_CHAIN_ID,
+            protocol: ProtocolType.Cosmos,
+            name: 'cosmos',
+            displayName: 'Cosmos',
+            domainId: COSMOS_CHAIN_ID,
+            rpcUrls: [{ http: 'https://rpc.cosmos.invalid' }],
+          },
+        },
+      },
+      testLogger,
+    );
+    const quote = createTestQuote(
+      { fromChainId: COSMOS_CHAIN_ID },
+      { fromChain: COSMOS_CHAIN_ID },
+    );
+
+    try {
+      await bridge.execute(quote, {
+        [ProtocolType.Cosmos]: TEST_PRIVATE_KEY,
+      });
+      expect.fail('Should have thrown for unsupported source protocol Cosmos');
+    } catch (error: unknown) {
+      const msg = (error as Error).message;
+      expect(msg).to.include("Unsupported protocol type 'cosmos'");
+    }
+  });
+});

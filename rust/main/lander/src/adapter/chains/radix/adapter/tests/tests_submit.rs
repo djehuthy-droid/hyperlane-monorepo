@@ -33,7 +33,7 @@ use super::super::super::transaction::Precursor;
 use super::super::super::VisibleComponents;
 use super::tests_common::{adapter, payload, MockRadixProvider, MAILBOX_ADDRESS, TEST_PRIVATE_KEY};
 
-const MAILBOX_METHOD_NAME_RPOCESS: &str = "process";
+const MAILBOX_METHOD_NAME_PROCESS: &str = "process";
 
 const ADDRESSES: &[&str] = &[
     "component_rdx1cznxpn5m3kutzr6jrhgnvv0x7uhcs0rf8fl2w59hkclm6m7axzlqgu",
@@ -54,9 +54,22 @@ async fn test_radix_submit_tx() {
             ..Default::default()
         })
     });
+    let submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = submitted.clone();
     provider
         .expect_send_transaction()
-        .returning(|_| Ok(TransactionSubmitResponse::new(false)));
+        .times(3)
+        .returning(move |raw| {
+            let mut attempts = captured.lock().unwrap();
+            attempts.push(raw);
+            if attempts.len() == 1 {
+                Err(hyperlane_core::ChainCommunicationError::CustomError(
+                    "submission failed".to_owned(),
+                ))
+            } else {
+                Ok(TransactionSubmitResponse::new(false))
+            }
+        });
 
     let mut counter = 0;
     provider.expect_preview_tx().returning(move |_ops| {
@@ -92,7 +105,7 @@ async fn test_radix_submit_tx() {
 
     let mut precursor = RadixTxPrecursor::new(
         MAILBOX_ADDRESS.into(),
-        MAILBOX_METHOD_NAME_RPOCESS.into(),
+        MAILBOX_METHOD_NAME_PROCESS.into(),
         encoded_arguments.clone(),
     );
     let fee_summary = FeeSummary::new(
@@ -113,7 +126,7 @@ async fn test_radix_submit_tx() {
 
     let process_calldata = RadixTxCalldata {
         component_address: MAILBOX_ADDRESS.into(),
-        method_name: MAILBOX_METHOD_NAME_RPOCESS.into(),
+        method_name: MAILBOX_METHOD_NAME_PROCESS.into(),
         encoded_arguments,
     };
 
@@ -134,6 +147,14 @@ async fn test_radix_submit_tx() {
         last_status_check: None,
     };
 
+    // Failed sends must not publish the already computed hash into the transaction.
+    let before = transaction.clone();
+    assert!(adapter.submit(&mut transaction).await.is_err());
+    assert_eq!(transaction, before);
+
+    let built = adapter.build_transaction(&transaction, 0).await.unwrap();
+    let expected_raw = built.raw.to_vec();
+
     // when
     adapter
         .submit(&mut transaction)
@@ -148,6 +169,11 @@ async fn test_radix_submit_tx() {
 
     let precursor = transaction.precursor();
     assert_eq!(precursor.tx_hash, Some(expected_hash));
+    adapter.submit(&mut transaction).await.unwrap();
+    assert_eq!(transaction.tx_hashes, vec![expected_hash]);
+    let attempts = submitted.lock().unwrap();
+    assert_eq!(attempts.len(), 3);
+    assert!(attempts.iter().all(|raw| raw == &expected_raw));
 }
 
 #[ignore]
@@ -207,7 +233,7 @@ async fn test_radix_lander_classic_build_transaction() {
 
     let mut precursor = RadixTxPrecursor::new(
         MAILBOX_ADDRESS.into(),
-        MAILBOX_METHOD_NAME_RPOCESS.into(),
+        MAILBOX_METHOD_NAME_PROCESS.into(),
         encoded_arguments.clone(),
     );
     let fee_summary = FeeSummary::new(
@@ -228,7 +254,7 @@ async fn test_radix_lander_classic_build_transaction() {
 
     let process_calldata = RadixTxCalldata {
         component_address: MAILBOX_ADDRESS.into(),
-        method_name: MAILBOX_METHOD_NAME_RPOCESS.into(),
+        method_name: MAILBOX_METHOD_NAME_PROCESS.into(),
         encoded_arguments,
     };
 

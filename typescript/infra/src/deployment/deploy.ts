@@ -3,6 +3,7 @@ import chalk from 'chalk';
 import {
   ChainMap,
   ChainName,
+  HyperlaneAddressesMap,
   HyperlaneContractsMap,
   HyperlaneDeployer,
   HyperlaneFactories,
@@ -10,7 +11,7 @@ import {
   serializeContractsMap,
 } from '@hyperlane-xyz/sdk';
 import {
-  ProtocolType,
+  isEVMLike,
   objFilter,
   objMerge,
   runWithTimeout,
@@ -22,7 +23,7 @@ import {
   getAddresses,
   writeAddresses,
 } from '../../scripts/agent-utils.js';
-import { DeployEnvironment } from '../config/environment.js';
+import { DeployEnvironment } from '../config/deploy-environment.js';
 import { writeAndFormatJsonAtPath } from '../utils/utils.js';
 
 enum DeployStatus {
@@ -81,7 +82,10 @@ export async function deployWithArtifacts<Config extends object>({
       : configMap;
 
   // Run post-deploy steps
+  let exitInProgress = false;
   const handleExit = async () => {
+    if (exitInProgress) return;
+    exitInProgress = true;
     console.info(chalk.gray.italic('Running post-deploy steps'));
     await runWithTimeout(5000, () =>
       postDeploy(deployer, cache, targetNetworks),
@@ -131,9 +135,6 @@ export async function deployWithArtifacts<Config extends object>({
 
   // Handle Ctrl+C
   process.on('SIGINT', handleExit);
-  // One final post-deploy before exit to ensure
-  // deployments exceeding the timeout are still written
-  process.on('beforeExit', handleExit);
 
   // Standard deploy modules are the ones that can be deployed with the
   // abstract HyperlaneDeployer's deploy function because they don't require any special logic
@@ -143,6 +144,7 @@ export async function deployWithArtifacts<Config extends object>({
       deployer,
       multiProvider,
       concurrentDeploy,
+      (chain) => writeDeploymentAddresses(deployer, cache, [chain]),
     );
   } else {
     try {
@@ -156,8 +158,17 @@ export async function deployWithArtifacts<Config extends object>({
       } else {
         console.error(chalk.red('Contract deployment failed'), error);
       }
+      // Mark all target chains as failed so handleExit writes artifacts
+      // and exits non-zero
+      for (const chain of Object.keys(targetConfigMap)) {
+        deployStatus[chain] = DeployStatus.FAILURE;
+      }
     }
   }
+
+  // Explicitly run post-deploy and exit. Cannot rely on 'beforeExit' because
+  // active provider connections keep the event loop alive indefinitely.
+  await handleExit();
 }
 
 export async function baseDeploy<
@@ -168,11 +179,11 @@ export async function baseDeploy<
   deployer: HyperlaneDeployer<Config, Factories>,
   multiProvider: MultiProvider,
   concurrentDeploy: boolean,
+  onChainSettled?: (chain: ChainName) => void,
 ): Promise<HyperlaneContractsMap<Factories>> {
   const configChains = Object.keys(configMap);
-  const ethereumConfigChains = configChains.filter(
-    (chain) =>
-      multiProvider.getChainMetadata(chain).protocol === ProtocolType.Ethereum,
+  const ethereumConfigChains = configChains.filter((chain) =>
+    isEVMLike(multiProvider.getChainMetadata(chain).protocol),
   );
 
   const targetChains = multiProvider.intersect(
@@ -212,6 +223,7 @@ export async function baseDeploy<
                 } still in-flight: ${inFlightChains.join(', ')}`,
           ),
         );
+        onChainSettled?.(chain);
       })
       .catch((error) => {
         deployStatus[chain] = DeployStatus.FAILURE;
@@ -221,6 +233,7 @@ export async function baseDeploy<
         if (error?.stack) {
           console.error(chalk.gray(error.stack));
         }
+        onChainSettled?.(chain);
       });
   };
 
@@ -241,12 +254,7 @@ async function postDeploy<Config extends object>(
   targetNetworks: ChainName[],
 ) {
   if (cache.write) {
-    const deployedAddresses = serializeContractsMap(deployer.deployedContracts);
-    const cachedAddresses = deployer.cachedAddresses;
-    const addresses = objMerge(deployedAddresses, cachedAddresses);
-
-    // cache addresses of deployed contracts
-    writeAddresses(cache.environment, cache.module, addresses, targetNetworks);
+    writeDeploymentAddresses(deployer, cache, targetNetworks);
 
     let savedVerification = {};
     try {
@@ -280,4 +288,67 @@ async function postDeploy<Config extends object>(
       deduplicatedVerificationInputs,
     );
   }
+}
+
+function writeDeploymentAddresses<Config extends object>(
+  deployer: HyperlaneDeployer<Config, any>,
+  cache: DeployCache,
+  targetNetworks: ChainName[],
+) {
+  if (!cache.write) {
+    return;
+  }
+
+  const chains = getAddressWriteChains(deployer, targetNetworks);
+
+  for (const chain of chains) {
+    let deployedAddresses: HyperlaneAddressesMap<any> = {};
+    const deployedContracts = deployer.deployedContracts[chain];
+
+    if (deployedContracts) {
+      try {
+        deployedAddresses = serializeContractsMap({
+          [chain]: deployedContracts,
+        });
+      } catch (error) {
+        console.error(
+          chalk.red(
+            `Failed to serialize deployed contracts for ${chain}; writing cached addresses only`,
+          ),
+          error,
+        );
+      }
+    }
+
+    const cachedAddresses = deployer.cachedAddresses[chain]
+      ? { [chain]: deployer.cachedAddresses[chain] }
+      : {};
+    const addresses = objMerge(deployedAddresses, cachedAddresses);
+
+    if (Object.keys(addresses).length === 0) {
+      continue;
+    }
+
+    try {
+      writeAddresses(cache.environment, cache.module, addresses, [chain]);
+    } catch (error) {
+      console.error(chalk.red(`Failed to write addresses for ${chain}`), error);
+    }
+  }
+}
+
+function getAddressWriteChains<Config extends object>(
+  deployer: HyperlaneDeployer<Config, any>,
+  targetNetworks: ChainName[],
+): ChainName[] {
+  const chains = new Set([
+    ...Object.keys(deployer.deployedContracts),
+    ...Object.keys(deployer.cachedAddresses),
+  ]);
+
+  if (targetNetworks.length > 0) {
+    return targetNetworks.filter((chain) => chains.has(chain));
+  }
+
+  return Array.from(chains);
 }

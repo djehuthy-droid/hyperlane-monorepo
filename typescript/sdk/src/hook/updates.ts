@@ -28,12 +28,17 @@ type UpdateHookParams = {
   setHookFunctionCallEncoder: (newHookAddress: Address) => string;
   ccipContractCache?: CCIPContractCache;
   contractVerifier?: ContractVerifier;
+  rateLimitedSender?: Address;
+  opaqueHybridAddresses?: Address[];
 };
 
 export async function getEvmHookUpdateTransactions(
   clientContractAddress: string,
   updateHookParams: Readonly<UpdateHookParams>,
-): Promise<AnnotatedEV5Transaction[]> {
+): Promise<{
+  transactions: AnnotatedEV5Transaction[];
+  newHookAddress: Address;
+}> {
   const {
     actualConfig: actualHookConfig,
     evmChainName,
@@ -45,6 +50,8 @@ export async function getEvmHookUpdateTransactions(
     multiProvider,
     ccipContractCache,
     contractVerifier,
+    rateLimitedSender,
+    opaqueHybridAddresses,
   } = updateHookParams;
 
   const hookModule = new EvmHookModule(
@@ -60,6 +67,7 @@ export async function getEvmHookUpdateTransactions(
           typeof actualHookConfig === 'string'
             ? actualHookConfig
             : actualHookConfig.address,
+        ...(rateLimitedSender ? { rateLimitedSender } : {}),
       },
     },
     ccipContractCache,
@@ -73,7 +81,10 @@ export async function getEvmHookUpdateTransactions(
   logger.info(
     `Comparing target Hook config with current one for ${evmChainName} chain`,
   );
-  const updateTransactions = await hookModule.update(deepCopy(expectedConfig));
+  const updateTransactions = await hookModule.update(
+    deepCopy(expectedConfig),
+    opaqueHybridAddresses,
+  );
   const { deployedHook: newHookAddress } = hookModule.serialize();
 
   // If a new Hook is deployed, push the tx to set the hook on the client contract
@@ -88,5 +99,5 @@ export async function getEvmHookUpdateTransactions(
     });
   }
 
-  return updateTransactions;
+  return { transactions: updateTransactions, newHookAddress };
 }

@@ -1,0 +1,1143 @@
+import {
+  SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
+  SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
+  SolanaError,
+} from '@solana/errors';
+import {
+  AccountRole,
+  type TransactionSendingSigner,
+  address,
+  blockhash,
+  decompileTransactionMessage,
+  getBase58Encoder,
+  getBase64Encoder,
+  getTransactionDecoder,
+  getCompiledTransactionMessageDecoder,
+  signature as toSignature,
+} from '@solana/kit';
+import chai, { expect } from 'chai';
+import chaiAsPromised from 'chai-as-promised';
+import { afterEach, describe, it } from 'mocha';
+import sinon from 'sinon';
+
+chai.use(chaiAsPromised);
+
+import { ProtocolType } from '@hyperlane-xyz/provider-sdk';
+import type { ChainMetadataForAltVM } from '@hyperlane-xyz/provider-sdk/chain';
+import { assert } from '@hyperlane-xyz/utils';
+
+import { SvmSigner } from '../clients/signer.js';
+import { COMPUTE_BUDGET_PROGRAM_ID } from '../constants.js';
+import type { SvmRpc, SvmTransaction } from '../types.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const FAKE_BLOCKHASH = blockhash(
+  '4nQrcFMj3GKNXaVGRmnAPVagSnTeAF2r2RWyskNswDJf',
+);
+const FAKE_SIGNATURE = toSignature(
+  '5wHu1qwD7q5JNMPbHBfUhLmk7GKBX2vRvNcF9jEJvR7p3yfXnBmWdYPQXkbRZJhzGN5LpVR6pRxw7VGnPJb7Qss', // gitleaks:allow
+);
+
+function noopTx(): SvmTransaction {
+  return { instructions: [] };
+}
+
+type RpcMethodStub = (...args: unknown[]) => { send: () => Promise<unknown> };
+
+interface MockRpcConfig {
+  getLatestBlockhash?: RpcMethodStub;
+  sendTransaction?: RpcMethodStub;
+  getSignatureStatuses?: RpcMethodStub;
+  getBlockHeight?: RpcMethodStub;
+}
+
+function createMockRpc(config: MockRpcConfig = {}): SvmRpc {
+  const defaultBlockhash = () => ({
+    send: async () => ({
+      value: {
+        blockhash: FAKE_BLOCKHASH,
+        lastValidBlockHeight: 1000n,
+      },
+    }),
+  });
+
+  const defaultSendTx = () => ({
+    send: async () => FAKE_SIGNATURE,
+  });
+
+  const defaultSignatureStatuses = () => ({
+    send: async () => ({
+      value: [
+        {
+          slot: 42n,
+          confirmationStatus: 'confirmed' as const,
+          confirmations: 10n,
+          err: null,
+        },
+      ],
+    }),
+  });
+
+  const defaultBlockHeight = () => ({
+    send: async () => 500n,
+  });
+
+  return new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        switch (prop) {
+          case 'getLatestBlockhash':
+            return config.getLatestBlockhash ?? defaultBlockhash;
+          case 'sendTransaction':
+            return config.sendTransaction ?? defaultSendTx;
+          case 'getSignatureStatuses':
+            return config.getSignatureStatuses ?? defaultSignatureStatuses;
+          case 'getBlockHeight':
+            return config.getBlockHeight ?? defaultBlockHeight;
+          default:
+            return () => ({
+              send: async () => {
+                throw new Error(`Unmocked RPC method: ${String(prop)}`);
+              },
+            });
+        }
+      },
+    },
+  ) as unknown as SvmRpc;
+}
+
+const TEST_PRIVATE_KEY =
+  '0x0000000000000000000000000000000000000000000000000000000000000001';
+
+const TEST_CHAIN_METADATA: ChainMetadataForAltVM = {
+  name: 'solanamainnet',
+  protocol: ProtocolType.Sealevel,
+  chainId: 1399811149,
+  domainId: 1399811149,
+  rpcUrls: [{ http: 'http://localhost:8899' }],
+};
+
+async function createTestSigner(
+  rpc: SvmRpc,
+  metadata: ChainMetadataForAltVM = TEST_CHAIN_METADATA,
+): Promise<SvmSigner> {
+  const signer = await SvmSigner.connectWithSigner(metadata, TEST_PRIVATE_KEY);
+  signer['rpc'] = rpc;
+  return signer;
+}
+
+function makePreflightBlockhashError(): SolanaError {
+  const cause = new SolanaError(
+    SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
+  );
+  return new SolanaError(
+    SOLANA_ERROR__JSON_RPC__SERVER_ERROR_SEND_TRANSACTION_PREFLIGHT_FAILURE,
+    {
+      cause,
+      accounts: null,
+      fee: null,
+      loadedAccountsDataSize: 0,
+      loadedAddresses: null,
+      logs: [],
+      postBalances: null,
+      postTokenBalances: null,
+      preBalances: null,
+      preTokenBalances: null,
+      replacementBlockhash: null,
+      returnData: null,
+      unitsConsumed: 0n,
+      innerInstructions: undefined,
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('SvmSigner', () => {
+  afterEach(() => sinon.restore());
+
+  it('rejects a sending-only transaction signer', async () => {
+    const sendingOnlySigner: TransactionSendingSigner = {
+      address: address('11111111111111111111111111111111'),
+      signAndSendTransactions: async () => [],
+    };
+
+    await expect(
+      SvmSigner.connectWithSigner(
+        TEST_CHAIN_METADATA,
+        // @ts-expect-error Sending-only signers cannot satisfy this pipeline.
+        sendingOnlySigner,
+      ),
+    ).to.be.rejectedWith(
+      'SVM signer must implement transaction modifying or partial signing',
+    );
+  });
+
+  describe('per-chain transaction versions', () => {
+    it('rejects v1 before any RPC request without explicit chain opt-in', async () => {
+      const getLatestBlockhash = sinon
+        .stub()
+        .throws(new Error('must not call RPC'));
+      const signer = await createTestSigner(
+        createMockRpc({ getLatestBlockhash }),
+      );
+      await expect(
+        signer.send({ instructions: [], version: 1 }),
+      ).to.be.rejectedWith('maxSupportedTransactionVersion');
+      expect(getLatestBlockhash.called).to.equal(false);
+    });
+
+    it('rejects an explicit v1 send while only read support is enabled', async () => {
+      const getLatestBlockhash = sinon
+        .stub()
+        .throws(new Error('must not call RPC'));
+      const signer = await createTestSigner(
+        createMockRpc({ getLatestBlockhash }),
+        {
+          ...TEST_CHAIN_METADATA,
+          maxSupportedTransactionVersion: 1,
+        },
+      );
+      await expect(
+        signer.send({ instructions: [], version: 1 }),
+      ).to.be.rejectedWith('sealevelV1TransactionsEnabled');
+      expect(getLatestBlockhash.called).to.equal(false);
+    });
+
+    for (const embeddedLimit of [false, true]) {
+      it(`sends v1 header fees with ${embeddedLimit ? 'embedded' : 'explicit'} compute limits`, async () => {
+        const sendTransaction = sinon.stub().callsFake((encoded: unknown) => {
+          expect(typeof encoded).to.equal('string');
+          if (typeof encoded !== 'string') throw new Error('expected base64');
+          const wire = getBase64Encoder().encode(encoded);
+          const transaction = getTransactionDecoder().decode(wire);
+          expect(transaction.messageBytes[0]).to.equal(0x81);
+          const message = decompileTransactionMessage(
+            getCompiledTransactionMessageDecoder().decode(
+              transaction.messageBytes,
+            ),
+          );
+          expect(message.version).to.equal(1);
+          if (message.version !== 1) throw new Error('expected v1');
+          expect(message.config?.computeUnitLimit).to.equal(200001);
+          expect(message.config?.priorityFeeLamports).to.equal(1n);
+          expect(message.instructions).to.have.length(0);
+          return { send: async () => FAKE_SIGNATURE };
+        });
+        const signer = await createTestSigner(
+          createMockRpc({ sendTransaction }),
+          {
+            ...TEST_CHAIN_METADATA,
+            maxSupportedTransactionVersion: 1,
+            sealevelTransactionVersion: 1,
+            sealevelV1TransactionsEnabled: true,
+          },
+        );
+        await signer.send({
+          instructions: embeddedLimit
+            ? [
+                {
+                  programAddress: COMPUTE_BUDGET_PROGRAM_ID,
+                  data: new Uint8Array([2, 0x41, 0x0d, 0x03, 0x00]),
+                },
+              ]
+            : [],
+          computeUnits: embeddedLimit ? undefined : 200001,
+          priorityFeeMicroLamports: 1,
+        });
+        expect(sendTransaction.calledOnce).to.equal(true);
+      });
+    }
+
+    it('rejects ALT compression for v1 before RPC', async () => {
+      const signer = await createTestSigner(createMockRpc(), {
+        ...TEST_CHAIN_METADATA,
+        maxSupportedTransactionVersion: 1,
+      });
+      await expect(
+        signer.send({
+          instructions: [],
+          version: 1,
+          addressLookupTables: [address('11111111111111111111111111111111')],
+        }),
+      ).to.be.rejectedWith('lookup tables');
+    });
+
+    it('does not switch another SVM to v1 when read support is enabled', async () => {
+      const sendTransaction = sinon.stub().callsFake((encoded: unknown) => {
+        if (typeof encoded !== 'string') throw new Error('expected base64');
+        const transaction = getTransactionDecoder().decode(
+          getBase64Encoder().encode(encoded),
+        );
+        expect(
+          getCompiledTransactionMessageDecoder().decode(
+            transaction.messageBytes,
+          ).version,
+        ).to.equal(0);
+        return { send: async () => FAKE_SIGNATURE };
+      });
+      const signer = await createTestSigner(
+        createMockRpc({ sendTransaction }),
+        {
+          ...TEST_CHAIN_METADATA,
+          name: 'another-svm',
+          maxSupportedTransactionVersion: 1,
+        },
+      );
+      await signer.send({ instructions: [] });
+      expect(sendTransaction.calledOnce).to.equal(true);
+    });
+  });
+
+  // ---- Happy path ----
+
+  describe('send — happy path', () => {
+    it('confirms on first poll', async () => {
+      const rpc = createMockRpc();
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt.slot).to.equal(42n);
+      expect(receipt.signature).to.be.a('string').and.not.empty;
+    });
+
+    it('accepts finalized status as confirmed', async () => {
+      const rpc = createMockRpc({
+        getSignatureStatuses: () => ({
+          send: async () => ({
+            value: [
+              {
+                slot: 55n,
+                confirmationStatus: 'finalized',
+                confirmations: null,
+                err: null,
+              },
+            ],
+          }),
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+      expect(receipt.slot).to.equal(55n);
+    });
+  });
+
+  // ---- Blockhash not found retry ----
+
+  describe('send — blockhash not found retry', () => {
+    it('retries on direct SolanaError blockhash not found', async () => {
+      let sendAttempts = 0;
+      const rpc = createMockRpc({
+        sendTransaction: () => ({
+          send: async () => {
+            sendAttempts++;
+            if (sendAttempts <= 2) {
+              throw new SolanaError(
+                SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
+              );
+            }
+            return FAKE_SIGNATURE;
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt).to.have.property('signature');
+      expect(sendAttempts).to.equal(3);
+    });
+
+    it('retries on preflight failure wrapping blockhash not found', async () => {
+      let sendAttempts = 0;
+      const rpc = createMockRpc({
+        sendTransaction: () => ({
+          send: async () => {
+            sendAttempts++;
+            if (sendAttempts <= 1) {
+              throw makePreflightBlockhashError();
+            }
+            return FAKE_SIGNATURE;
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt).to.have.property('signature');
+      expect(sendAttempts).to.equal(2);
+    });
+
+    it('does not retry on non-blockhash errors', async () => {
+      let sendAttempts = 0;
+      const rpc = createMockRpc({
+        sendTransaction: () => ({
+          send: async () => {
+            sendAttempts++;
+            throw new Error('Insufficient funds');
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      await expect(signer.send(noopTx())).to.be.rejectedWith(
+        'Insufficient funds',
+      );
+      expect(sendAttempts).to.equal(1);
+    });
+
+    it('throws after exhausting all signAndSend attempts', async () => {
+      let sendAttempts = 0;
+      const rpc = createMockRpc({
+        sendTransaction: () => ({
+          send: async () => {
+            sendAttempts++;
+            throw new SolanaError(
+              SOLANA_ERROR__TRANSACTION_ERROR__BLOCKHASH_NOT_FOUND,
+            );
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      await expect(signer.send(noopTx())).to.be.rejectedWith(
+        /Blockhash not found/,
+      );
+      // signAndSend maxAttempts = 5
+      expect(sendAttempts).to.equal(5);
+    });
+  });
+
+  // ---- Transaction error propagation ----
+
+  describe('send — transaction error propagation', () => {
+    it('throws SvmTransactionError when tx fails on-chain', async () => {
+      const rpc = createMockRpc({
+        getSignatureStatuses: () => ({
+          send: async () => ({
+            value: [
+              {
+                slot: 42n,
+                confirmationStatus: 'confirmed',
+                confirmations: 10n,
+                err: { InstructionError: [0, 'ProgramFailedToComplete'] },
+              },
+            ],
+          }),
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      try {
+        await signer.send(noopTx());
+        expect.fail('should have thrown');
+      } catch (error) {
+        expect((error as Error).name).to.equal('SvmTransactionError');
+        expect((error as Error).message).to.match(/Transaction failed/);
+      }
+    });
+  });
+
+  // ---- Poll deadline ----
+
+  describe('send — block height failure safety net', () => {
+    it('exits polling after consecutive block height check failures', async function () {
+      this.timeout(10_000);
+
+      let blockHeightCalls = 0;
+      const rpc = createMockRpc({
+        // Tx never found
+        getSignatureStatuses: () => ({
+          send: async () => ({ value: [null] }),
+        }),
+        // Always fails — triggers the safety net after 3 consecutive failures
+        getBlockHeight: () => ({
+          send: async () => {
+            blockHeightCalls++;
+            throw new Error('RPC unavailable');
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      await expect(signer.send(noopTx())).to.be.rejectedWith(
+        /Transaction not confirmed after 3 blockhash attempts/,
+      );
+      // 3 blockhash attempts × 3 failures each = 9
+      expect(blockHeightCalls).to.equal(9);
+    });
+  });
+
+  // ---- Blockhash expiry and resubmit ----
+
+  describe('send — blockhash expiry and resubmit', () => {
+    it('resubmits with new blockhash when block height exceeds lastValidBlockHeight', async function () {
+      this.timeout(10_000);
+
+      let blockhashFetches = 0;
+      let statusCalls = 0;
+
+      const rpc = createMockRpc({
+        getLatestBlockhash: () => ({
+          send: async () => {
+            blockhashFetches++;
+            return {
+              value: {
+                blockhash: FAKE_BLOCKHASH,
+                lastValidBlockHeight: 100n,
+              },
+            };
+          },
+        }),
+        getSignatureStatuses: () => ({
+          send: async () => {
+            statusCalls++;
+            // Confirm on the second blockhash attempt
+            if (blockhashFetches >= 2 && statusCalls > 3) {
+              return {
+                value: [
+                  {
+                    slot: 99n,
+                    confirmationStatus: 'confirmed',
+                    confirmations: 10n,
+                    err: null,
+                  },
+                ],
+              };
+            }
+            return { value: [null] };
+          },
+        }),
+        getBlockHeight: () => ({
+          send: async () => 200n,
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt.slot).to.equal(99n);
+      expect(blockhashFetches).to.equal(2);
+    });
+
+    it('exhausts all 3 blockhash attempts and throws', async function () {
+      this.timeout(10_000);
+
+      let blockhashFetches = 0;
+      const rpc = createMockRpc({
+        getLatestBlockhash: () => ({
+          send: async () => {
+            blockhashFetches++;
+            return {
+              value: {
+                blockhash: FAKE_BLOCKHASH,
+                lastValidBlockHeight: 0n,
+              },
+            };
+          },
+        }),
+        // Tx never found
+        getSignatureStatuses: () => ({
+          send: async () => ({ value: [null] }),
+        }),
+        // Always expired
+        getBlockHeight: () => ({
+          send: async () => 9999n,
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      await expect(signer.send(noopTx())).to.be.rejectedWith(
+        /Transaction not confirmed after 3 blockhash attempts/,
+      );
+      // 3 outer attempts * signAndSend fetches
+      expect(blockhashFetches).to.equal(3);
+    });
+  });
+
+  // ---- History check ----
+
+  describe('send — history check finds confirmed tx', () => {
+    it('returns receipt from history check after blockhash expiry', async function () {
+      this.timeout(10_000);
+
+      let historyCalled = false;
+
+      const rpc = createMockRpc({
+        getSignatureStatuses: (...args: unknown[]) => ({
+          send: async () => {
+            const opts = args[1] as
+              | { searchTransactionHistory?: boolean }
+              | undefined;
+            if (opts?.searchTransactionHistory) {
+              historyCalled = true;
+              return {
+                value: [
+                  {
+                    slot: 77n,
+                    confirmationStatus: 'confirmed',
+                    confirmations: 10n,
+                    err: null,
+                  },
+                ],
+              };
+            }
+            return { value: [null] };
+          },
+        }),
+        getBlockHeight: () => ({
+          send: async () => 9999n,
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(historyCalled).to.be.true;
+      expect(receipt.slot).to.equal(77n);
+    });
+  });
+
+  // ---- History check — processed status re-polling ----
+
+  describe('send — history check with processed status', () => {
+    it('re-polls with fresh blockhash when history finds tx at processed', async function () {
+      this.timeout(10_000);
+
+      let blockhashFetches = 0;
+      let pollPhase: 'initial' | 'retry' = 'initial';
+
+      const rpc = createMockRpc({
+        getLatestBlockhash: () => ({
+          send: async () => {
+            blockhashFetches++;
+            return {
+              value: {
+                blockhash: FAKE_BLOCKHASH,
+                // Fresh blockhash on retry gives new valid height
+                lastValidBlockHeight: blockhashFetches === 1 ? 100n : 2000n,
+              },
+            };
+          },
+        }),
+        getSignatureStatuses: (...args: unknown[]) => ({
+          send: async () => {
+            const opts = args[1] as
+              | { searchTransactionHistory?: boolean }
+              | undefined;
+            if (opts?.searchTransactionHistory) {
+              // History check: tx is at processed
+              pollPhase = 'retry';
+              return {
+                value: [
+                  {
+                    slot: 88n,
+                    confirmationStatus: 'processed',
+                    confirmations: 0n,
+                    err: null,
+                  },
+                ],
+              };
+            }
+            if (pollPhase === 'retry') {
+              // During retry poll: tx now confirmed
+              return {
+                value: [
+                  {
+                    slot: 88n,
+                    confirmationStatus: 'confirmed',
+                    confirmations: 10n,
+                    err: null,
+                  },
+                ],
+              };
+            }
+            // Initial poll: not found
+            return { value: [null] };
+          },
+        }),
+        getBlockHeight: () => ({
+          send: async () => 200n,
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt.slot).to.equal(88n);
+      // 1 for signAndSend + 1 for fresh blockhash in processed retry
+      expect(blockhashFetches).to.equal(2);
+    });
+
+    it('throws if processed tx never confirms after retry poll', async function () {
+      this.timeout(10_000);
+
+      let blockhashFetches = 0;
+
+      const rpc = createMockRpc({
+        getLatestBlockhash: () => ({
+          send: async () => {
+            blockhashFetches++;
+            return {
+              value: {
+                blockhash: FAKE_BLOCKHASH,
+                lastValidBlockHeight: 100n,
+              },
+            };
+          },
+        }),
+        getSignatureStatuses: (...args: unknown[]) => ({
+          send: async () => {
+            const opts = args[1] as
+              | { searchTransactionHistory?: boolean }
+              | undefined;
+            if (opts?.searchTransactionHistory) {
+              // History: always processed, never confirms
+              return {
+                value: [
+                  {
+                    slot: 88n,
+                    confirmationStatus: 'processed',
+                    confirmations: 0n,
+                    err: null,
+                  },
+                ],
+              };
+            }
+            return { value: [null] };
+          },
+        }),
+        // Always expired
+        getBlockHeight: () => ({
+          send: async () => 200n,
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      await expect(signer.send(noopTx())).to.be.rejectedWith(
+        /was observed at 'processed' but never confirmed/,
+      );
+      // 1 signAndSend + 1 fresh blockhash for processed retry = 2
+      expect(blockhashFetches).to.equal(2);
+    });
+  });
+
+  // ---- RPC failures during polling ----
+
+  describe('send — RPC failures during polling', () => {
+    it('tolerates getSignatureStatuses failures and keeps polling', async function () {
+      this.timeout(10_000);
+
+      let statusCalls = 0;
+      const rpc = createMockRpc({
+        getSignatureStatuses: () => ({
+          send: async () => {
+            statusCalls++;
+            if (statusCalls <= 2) {
+              throw new Error('RPC unavailable');
+            }
+            return {
+              value: [
+                {
+                  slot: 42n,
+                  confirmationStatus: 'confirmed',
+                  confirmations: 10n,
+                  err: null,
+                },
+              ],
+            };
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt.slot).to.equal(42n);
+      expect(statusCalls).to.equal(3);
+    });
+
+    it('tolerates getBlockHeight failures and keeps polling', async function () {
+      this.timeout(10_000);
+
+      let statusCalls = 0;
+      let blockHeightCalls = 0;
+      const rpc = createMockRpc({
+        getSignatureStatuses: () => ({
+          send: async () => {
+            statusCalls++;
+            // Confirm on 3rd call
+            if (statusCalls >= 3) {
+              return {
+                value: [
+                  {
+                    slot: 42n,
+                    confirmationStatus: 'confirmed',
+                    confirmations: 10n,
+                    err: null,
+                  },
+                ],
+              };
+            }
+            return { value: [null] };
+          },
+        }),
+        getBlockHeight: () => ({
+          send: async () => {
+            blockHeightCalls++;
+            throw new Error('Block height RPC down');
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt.slot).to.equal(42n);
+      // 2 polls with null status hit getBlockHeight before 3rd poll confirms
+      expect(blockHeightCalls).to.equal(2);
+    });
+
+    it('throws instead of resubmitting when history check hits transient RPC error', async function () {
+      this.timeout(10_000);
+
+      let sendTxCalls = 0;
+
+      const rpc = createMockRpc({
+        sendTransaction: () => ({
+          send: async () => {
+            sendTxCalls++;
+            return FAKE_SIGNATURE;
+          },
+        }),
+        getSignatureStatuses: (...args: unknown[]) => ({
+          send: async () => {
+            const opts = args[1] as
+              | { searchTransactionHistory?: boolean }
+              | undefined;
+            if (opts?.searchTransactionHistory) {
+              throw new Error('503 Service Unavailable');
+            }
+            // Regular polls: not found
+            return { value: [null] };
+          },
+        }),
+        // Always expired so pollForConfirmation returns null
+        getBlockHeight: () => ({
+          send: async () => 9999n,
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      await expect(signer.send(noopTx())).to.be.rejectedWith(
+        /Cannot safely resubmit: history lookup failed/,
+      );
+      // Only one send — no resubmit after RPC error
+      expect(sendTxCalls).to.equal(1);
+    });
+  });
+
+  // ---- Rebroadcast ----
+
+  describe('send — rebroadcast during polling', () => {
+    it('rebroadcasts when tx is not found and blockhash is valid', async function () {
+      this.timeout(10_000);
+
+      let sendTxCalls = 0;
+      let statusCalls = 0;
+      const rpc = createMockRpc({
+        sendTransaction: () => ({
+          send: async () => {
+            sendTxCalls++;
+            return FAKE_SIGNATURE;
+          },
+        }),
+        getSignatureStatuses: () => ({
+          send: async () => {
+            statusCalls++;
+            // Confirm on 3rd poll
+            if (statusCalls >= 3) {
+              return {
+                value: [
+                  {
+                    slot: 42n,
+                    confirmationStatus: 'confirmed',
+                    confirmations: 10n,
+                    err: null,
+                  },
+                ],
+              };
+            }
+            return { value: [null] };
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt.slot).to.equal(42n);
+      // 1 initial send + 2 rebroadcasts (polls 1 & 2 return null, poll 3 confirms)
+      expect(sendTxCalls).to.equal(3);
+    });
+
+    it('does not rebroadcast when tx is at processed status', async function () {
+      this.timeout(10_000);
+
+      let sendTxCalls = 0;
+      let statusCalls = 0;
+      const rpc = createMockRpc({
+        sendTransaction: () => ({
+          send: async () => {
+            sendTxCalls++;
+            return FAKE_SIGNATURE;
+          },
+        }),
+        getSignatureStatuses: () => ({
+          send: async () => {
+            statusCalls++;
+            if (statusCalls >= 3) {
+              return {
+                value: [
+                  {
+                    slot: 42n,
+                    confirmationStatus: 'confirmed',
+                    confirmations: 10n,
+                    err: null,
+                  },
+                ],
+              };
+            }
+            // Processed — should skip rebroadcast
+            return {
+              value: [
+                {
+                  slot: 42n,
+                  confirmationStatus: 'processed',
+                  confirmations: 0n,
+                  err: null,
+                },
+              ],
+            };
+          },
+        }),
+      });
+
+      const signer = await createTestSigner(rpc);
+      const receipt = await signer.send(noopTx());
+
+      expect(receipt.slot).to.equal(42n);
+      // Only the initial send, no rebroadcasts (processed triggers continue)
+      expect(sendTxCalls).to.equal(1);
+    });
+  });
+
+  // ---- Fee payer derivation ----
+
+  // Deterministic fake addresses (valid base58, 32 bytes)
+  const OWNER_ADDRESS = address('11111111111111111111111111111112');
+  const SQUADS_VAULT_ADDRESS = address(
+    'zUeFx6cfxedG2JnFtMKkTXnxgPa5M44tyaF9RrPunCp',
+  );
+  const PROGRAM_ADDRESS = address('11111111111111111111111111111113');
+  const TOKEN_PDA_ADDRESS = address('11111111111111111111111111111114');
+
+  const base58Encoder = getBase58Encoder();
+  const messageDecoder = getCompiledTransactionMessageDecoder();
+
+  /** Decode a base58-encoded compiled message and return the fee payer (first static account). */
+  function feePayerFromMessageBase58(messageBase58: string): string {
+    const bytes = base58Encoder.encode(messageBase58);
+    const decoded = messageDecoder.decode(bytes);
+    const [feePayer] = decoded.staticAccounts;
+    assert(feePayer, 'compiled message is missing fee payer');
+    return feePayer;
+  }
+
+  describe('transactionToPrintableJson — supported transaction settings', () => {
+    it('rejects an explicit priority fee instead of silently losing it', async () => {
+      const signer = await createTestSigner(createMockRpc());
+      await expect(
+        signer.transactionToPrintableJson({
+          instructions: [],
+          priorityFeeMicroLamports: 1,
+        }),
+      ).to.be.rejectedWith('requires priority fees as SetComputeUnitPrice');
+    });
+
+    it('treats zero priority fees as absent in offline exports', async () => {
+      const signer = await createTestSigner(createMockRpc());
+      const absent = await signer.transactionToPrintableJson({
+        instructions: [],
+      });
+      const zero = await signer.transactionToPrintableJson({
+        instructions: [],
+        priorityFeeMicroLamports: 0,
+      });
+      expect(zero).to.deep.equal(absent);
+    });
+
+    it('preserves an embedded priority-price instruction in offline exports', async () => {
+      const signer = await createTestSigner(createMockRpc());
+      const data = new Uint8Array([3, 1, 0, 0, 0, 0, 0, 0, 0]);
+      const printable = await signer.transactionToPrintableJson({
+        instructions: [{ programAddress: COMPUTE_BUDGET_PROGRAM_ID, data }],
+      });
+      const message = decompileTransactionMessage(
+        getCompiledTransactionMessageDecoder().decode(
+          getBase58Encoder().encode(printable.message_base58),
+        ),
+      );
+      expect(message.instructions).to.have.length(1);
+      expect(message.instructions[0]?.programAddress).to.equal(
+        COMPUTE_BUDGET_PROGRAM_ID,
+      );
+      expect(message.instructions[0]?.data).to.deep.equal(data);
+    });
+
+    it('rejects explicit v1 but preserves unstamped offline v0', async () => {
+      const signer = await createTestSigner(createMockRpc());
+      await expect(
+        signer.transactionToPrintableJson({ instructions: [], version: 1 }),
+      ).to.be.rejectedWith('supports v0 only');
+      const v1Signer = await createTestSigner(createMockRpc(), {
+        ...TEST_CHAIN_METADATA,
+        maxSupportedTransactionVersion: 1,
+        sealevelTransactionVersion: 1,
+      });
+      const printable = await v1Signer.transactionToPrintableJson({
+        instructions: [],
+      });
+      expect(
+        getCompiledTransactionMessageDecoder().decode(
+          getBase58Encoder().encode(printable.message_base58),
+        ).version,
+      ).to.equal(0);
+    });
+
+    it('allows an explicit v0 override of a v1 chain default', async () => {
+      const signer = await createTestSigner(createMockRpc(), {
+        ...TEST_CHAIN_METADATA,
+        maxSupportedTransactionVersion: 1,
+        sealevelTransactionVersion: 1,
+      });
+      const printable = await signer.transactionToPrintableJson({
+        instructions: [],
+        version: 0,
+      });
+      const message = getCompiledTransactionMessageDecoder().decode(
+        getBase58Encoder().encode(printable.message_base58),
+      );
+      expect(message.version).to.equal(0);
+    });
+  });
+
+  describe('transactionToPrintableJson — fee payer derivation', () => {
+    it('uses explicit feePayer instead of local signer', async () => {
+      const rpc = createMockRpc();
+      const signer = await createTestSigner(rpc);
+      const signerAddress = signer.getSignerAddress();
+
+      // feePayer differs from both the local signer and instruction accounts
+      expect(signerAddress).to.not.equal(SQUADS_VAULT_ADDRESS);
+      expect(OWNER_ADDRESS).to.not.equal(SQUADS_VAULT_ADDRESS);
+
+      const tx: SvmTransaction = {
+        feePayer: SQUADS_VAULT_ADDRESS,
+        instructions: [
+          {
+            programAddress: PROGRAM_ADDRESS,
+            accounts: [
+              { address: TOKEN_PDA_ADDRESS, role: AccountRole.WRITABLE },
+              { address: OWNER_ADDRESS, role: AccountRole.READONLY_SIGNER },
+            ],
+            data: new Uint8Array([0]),
+          },
+        ],
+      };
+
+      const json = await signer.transactionToPrintableJson(tx);
+
+      expect(feePayerFromMessageBase58(json.message_base58)).to.equal(
+        SQUADS_VAULT_ADDRESS,
+      );
+    });
+
+    it('falls back to local signer when instructions have no signers', async () => {
+      const rpc = createMockRpc();
+      const signer = await createTestSigner(rpc);
+      const signerAddress = signer.getSignerAddress();
+
+      const tx: SvmTransaction = {
+        instructions: [
+          {
+            programAddress: PROGRAM_ADDRESS,
+            accounts: [
+              { address: TOKEN_PDA_ADDRESS, role: AccountRole.WRITABLE },
+            ],
+            data: new Uint8Array([0]),
+          },
+        ],
+      };
+
+      const json = await signer.transactionToPrintableJson(tx);
+
+      expect(feePayerFromMessageBase58(json.message_base58)).to.equal(
+        signerAddress,
+      );
+    });
+  });
+
+  describe('transactionToPrintableJson — waitForSlotAdvance hint', () => {
+    it('carries the sequencing hint into the exported JSON', async () => {
+      const rpc = createMockRpc();
+      const signer = await createTestSigner(rpc);
+
+      const tx: SvmTransaction = {
+        instructions: [
+          {
+            programAddress: PROGRAM_ADDRESS,
+            accounts: [
+              { address: TOKEN_PDA_ADDRESS, role: AccountRole.WRITABLE },
+            ],
+            data: new Uint8Array([0]),
+          },
+        ],
+        waitForSlotAdvance: true,
+      };
+
+      const json = await signer.transactionToPrintableJson(tx);
+
+      expect(json.waitForSlotAdvance).to.equal(true);
+    });
+
+    it('leaves the hint unset when the transaction omits it', async () => {
+      const rpc = createMockRpc();
+      const signer = await createTestSigner(rpc);
+
+      const tx: SvmTransaction = {
+        instructions: [
+          {
+            programAddress: PROGRAM_ADDRESS,
+            accounts: [
+              { address: TOKEN_PDA_ADDRESS, role: AccountRole.WRITABLE },
+            ],
+            data: new Uint8Array([0]),
+          },
+        ],
+      };
+
+      const json = await signer.transactionToPrintableJson(tx);
+
+      expect(json.waitForSlotAdvance).to.be.undefined;
+    });
+  });
+});

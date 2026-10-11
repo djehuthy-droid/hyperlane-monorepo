@@ -1,7 +1,8 @@
 import { BigNumber, ethers, utils } from 'ethers';
 
-import { addressToBytes32 } from './addresses.js';
+import { addressToBytes32, ensure0x } from './addresses.js';
 import { fromHexString, toHexString } from './strings.js';
+import { assert } from './validation.js';
 import {
   Address,
   Domain,
@@ -65,7 +66,7 @@ export function parseMessage(message: string): ParsedMessage {
   const BODY_OFFSET = 77;
 
   const buf = Buffer.from(utils.arrayify(message));
-  const version = buf.readUint8(VERSION_OFFSET);
+  const version = buf.readUInt8(VERSION_OFFSET);
   const nonce = buf.readUInt32BE(NONCE_OFFSET);
   const origin = buf.readUInt32BE(ORIGIN_OFFSET);
   const sender = utils.hexlify(buf.subarray(SENDER_OFFSET, DESTINATION_OFFSET));
@@ -91,4 +92,122 @@ export function parseWarpRouteMessage(
     recipient,
     amount,
   };
+}
+
+// Match IGP's DEFAULT_GAS_USAGE so quote and execution use same gas
+const DEFAULT_GAS_LIMIT = 50000n;
+
+export type StandardHookMetadataParams = {
+  refundAddress?: Address;
+  msgValue?: bigint;
+  gasLimit?: bigint;
+};
+
+/**
+ * JS Implementation of solidity/contracts/hooks/libs/StandardHookMetadata.sol#formatMetadata
+ * @returns Hex string of the packed hook metadata
+ */
+export function formatStandardHookMetadata({
+  refundAddress = ethers.constants.AddressZero,
+  msgValue = 0n,
+  gasLimit = DEFAULT_GAS_LIMIT,
+}: StandardHookMetadataParams): HexString {
+  return ethers.utils.solidityPack(
+    ['uint16', 'uint256', 'uint256', 'address'],
+    [1, msgValue, gasLimit, refundAddress],
+  );
+}
+
+// Offsets for StandardHookMetadata parsing
+// Format: uint16 variant (2 bytes) + uint256 msgValue (32 bytes) + uint256 gasLimit (32 bytes) + address refundAddress (20 bytes)
+const HEX_PREFIX_LEN = 2;
+const VARIANT_HEX_LEN = 4;
+const UINT256_HEX_LEN = 64;
+const ADDRESS_HEX_LEN = 40;
+const MSG_VALUE_START = HEX_PREFIX_LEN + VARIANT_HEX_LEN;
+const GAS_LIMIT_START = MSG_VALUE_START + UINT256_HEX_LEN;
+const REFUND_START = GAS_LIMIT_START + UINT256_HEX_LEN;
+const REFUND_END = REFUND_START + ADDRESS_HEX_LEN;
+
+/**
+ * Parse StandardHookMetadata bytes into its components.
+ * @returns Parsed metadata or null if invalid
+ */
+export function parseStandardHookMetadata(
+  metadata?: HexString,
+): Required<StandardHookMetadataParams> | null {
+  if (!metadata || metadata === '0x') return null;
+  if (!/^0x[0-9a-fA-F]*$/.test(metadata)) return null;
+  if (!metadata.startsWith('0x0001')) return null;
+  if (metadata.length < REFUND_END) return null;
+
+  try {
+    const msgValue = BigInt(
+      '0x' + metadata.slice(MSG_VALUE_START, GAS_LIMIT_START),
+    );
+    const gasLimit = BigInt(
+      '0x' + metadata.slice(GAS_LIMIT_START, REFUND_START),
+    );
+    const refundAddress = ethers.utils.getAddress(
+      '0x' + metadata.slice(REFUND_START, REFUND_END),
+    );
+    return { msgValue, gasLimit, refundAddress };
+  } catch {
+    return null;
+  }
+}
+
+export function extractRefundAddressFromMetadata(
+  metadata?: HexString,
+): Address | null {
+  return parseStandardHookMetadata(metadata)?.refundAddress ?? null;
+}
+
+export function hasValidRefundAddress(metadata?: HexString): boolean {
+  const refundAddress = extractRefundAddressFromMetadata(metadata);
+  return (
+    refundAddress !== null &&
+    refundAddress.toLowerCase() !== ethers.constants.AddressZero
+  );
+}
+
+/**
+ * Compute the synthetic message ID the scraper stores for a same-chain CCR swap.
+ *
+ * Format: `0x00000000 || keccak256("SameChainCCR" || txHash32 || logIndex8)[0..28]`
+ *
+ * The 4-byte zero prefix makes synthetic IDs immediately distinguishable from
+ * real Hyperlane message IDs (which are uniform keccak256 outputs).
+ *
+ * @param txHash  32-byte transaction hash (0x-prefixed hex string)
+ * @param logIndex  log index of the ReceivedTransferRemote event
+ */
+export function syntheticCcrSwapMessageId(
+  txHash: HexString,
+  logIndex: bigint | number,
+): HexString {
+  assert(
+    ethers.utils.isHexString(txHash, 32),
+    `txHash must be a 32-byte hex string, got: ${txHash}`,
+  );
+  assert(
+    (typeof logIndex === 'bigint' && logIndex >= 0n) ||
+      (typeof logIndex === 'number' &&
+        Number.isInteger(logIndex) &&
+        logIndex >= 0),
+    `logIndex must be a non-negative integer, got: ${logIndex}`,
+  );
+  const logIndexHex = ethers.utils.hexZeroPad(
+    ethers.BigNumber.from(logIndex).toHexString(),
+    8,
+  );
+  const hash = ethers.utils.keccak256(
+    ethers.utils.concat([
+      ethers.utils.toUtf8Bytes('SameChainCCR'),
+      txHash,
+      logIndexHex,
+    ]),
+  );
+  // 4 zero bytes || first 28 bytes of hash
+  return ensure0x('00'.repeat(4) + hash.slice(2, 58));
 }

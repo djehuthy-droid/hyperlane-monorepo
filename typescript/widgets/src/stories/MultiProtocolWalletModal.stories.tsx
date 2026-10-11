@@ -19,7 +19,7 @@ import React, { PropsWithChildren, useState } from 'react';
 import { WagmiProvider, createConfig, http } from 'wagmi';
 
 import { cosmoshub, ethereum, solanamainnet } from '@hyperlane-xyz/registry';
-import { MultiProtocolProvider } from '@hyperlane-xyz/sdk';
+import { MultiProtocolProvider } from '@hyperlane-xyz/sdk/providers/MultiProtocolProvider';
 import { ProtocolType } from '@hyperlane-xyz/utils';
 
 import { AccountList } from '../walletIntegrations/AccountList.js';
@@ -27,6 +27,7 @@ import { ConnectWalletButton } from '../walletIntegrations/ConnectWalletButton.j
 import { MultiProtocolWalletModal } from '../walletIntegrations/MultiProtocolWalletModal.js';
 import { getCosmosKitChainConfigs } from '../walletIntegrations/cosmos.js';
 import { getWagmiChainConfigs } from '../walletIntegrations/ethereum.js';
+import { starknetPaymasterProvider } from '../walletIntegrations/starknet.js';
 
 const multiProvider = new MultiProtocolProvider({
   ethereum,
@@ -114,7 +115,11 @@ function SolanaWalletProvider({ children }: PropsWithChildren<unknown>) {
 
 function StarknetWalletProvider({ children }: PropsWithChildren<unknown>) {
   return (
-    <StarknetConfig chains={[sepolia]} provider={publicProvider()}>
+    <StarknetConfig
+      chains={[sepolia]}
+      provider={publicProvider()}
+      paymasterProvider={starknetPaymasterProvider}
+    >
       {children}
     </StarknetConfig>
   );

@@ -8,9 +8,11 @@ import {
   Domain,
   EvmChainId,
   ProtocolType,
+  assert,
   eqAddress,
   rootLogger,
 } from '@hyperlane-xyz/utils';
+import type { ContractTransaction } from 'ethers';
 
 import {
   attachContractsMap,
@@ -27,6 +29,7 @@ import {
   CoreConfigSchema,
   DeployedCoreAddresses,
   DerivedCoreConfig,
+  shouldDeployQuotedCalls,
 } from '../core/types.js';
 import { HyperlaneProxyFactoryDeployer } from '../deploy/HyperlaneProxyFactoryDeployer.js';
 import {
@@ -64,6 +67,7 @@ export class EvmCoreModule extends HyperlaneModule<
   CoreConfig,
   DeployedCoreAddresses
 > {
+  static protocols = [ProtocolType.Ethereum, ProtocolType.Tron];
   protected logger = rootLogger.child({ module: 'EvmCoreModule' });
   protected coreReader: EvmCoreReader;
   protected evmIcaModule?: EvmIcaModule;
@@ -114,6 +118,34 @@ export class EvmCoreModule extends HyperlaneModule<
     expectedConfig: CoreConfig,
   ): Promise<AnnotatedEV5Transaction[]> {
     CoreConfigSchema.parse(expectedConfig);
+
+    // Deploy QuotedCalls if not yet present and enabled for this chain.
+    if (
+      shouldDeployQuotedCalls(expectedConfig) &&
+      !this.args.addresses.quotedCalls
+    ) {
+      const ismFactory = new HyperlaneIsmFactory(
+        attachContractsMap(
+          { [this.chainName]: this.args.addresses },
+          proxyFactoryFactories,
+        ),
+        this.multiProvider,
+      );
+      const coreDeployer = new HyperlaneCoreDeployer(
+        this.multiProvider,
+        ismFactory,
+      );
+      const quotedCalls = await coreDeployer.deployQuotedCalls(
+        this.chainName,
+        expectedConfig.permit2,
+      );
+      this.args.addresses.quotedCalls = quotedCalls.address;
+      this.logger.info(
+        { address: quotedCalls.address },
+        'Deployed QuotedCalls',
+      );
+    }
+
     const actualConfig = await this.read();
 
     const transactions: AnnotatedEV5Transaction[] = [
@@ -174,31 +206,35 @@ export class EvmCoreModule extends HyperlaneModule<
     actualConfig: DerivedHookConfig,
     expectedConfig: HookConfig,
   ): Promise<AnnotatedEV5Transaction[]> {
-    return getEvmHookUpdateTransactions(this.args.addresses.mailbox, {
-      actualConfig: actualConfig,
-      expectedConfig: expectedConfig,
-      evmChainName: this.chainName,
-      hookAndIsmFactories: extractIsmAndHookFactoryAddresses(
-        this.args.addresses,
-      ),
-      setHookFunctionCallEncoder: (newHookAddress: string) => {
-        if (setHookFunctionName === 'requiredHook') {
+    const { transactions } = await getEvmHookUpdateTransactions(
+      this.args.addresses.mailbox,
+      {
+        actualConfig: actualConfig,
+        expectedConfig: expectedConfig,
+        evmChainName: this.chainName,
+        hookAndIsmFactories: extractIsmAndHookFactoryAddresses(
+          this.args.addresses,
+        ),
+        setHookFunctionCallEncoder: (newHookAddress: string) => {
+          if (setHookFunctionName === 'requiredHook') {
+            return Mailbox__factory.createInterface().encodeFunctionData(
+              'setRequiredHook',
+              [newHookAddress],
+            );
+          }
+
           return Mailbox__factory.createInterface().encodeFunctionData(
-            'setRequiredHook',
+            'setDefaultHook',
             [newHookAddress],
           );
-        }
-
-        return Mailbox__factory.createInterface().encodeFunctionData(
-          'setDefaultHook',
-          [newHookAddress],
-        );
+        },
+        logger: this.logger,
+        mailbox: this.args.addresses.mailbox,
+        multiProvider: this.multiProvider,
+        proxyAdminAddress,
       },
-      logger: this.logger,
-      mailbox: this.args.addresses.mailbox,
-      multiProvider: this.multiProvider,
-      proxyAdminAddress,
-    });
+    );
+    return transactions;
   }
 
   /**
@@ -405,6 +441,11 @@ export class EvmCoreModule extends HyperlaneModule<
       await coreDeployer.deployValidatorAnnounce(chainName, mailbox.address)
     ).address;
 
+    const quotedCalls = shouldDeployQuotedCalls(config)
+      ? (await coreDeployer.deployQuotedCalls(chainName, config.permit2))
+          .address
+      : undefined;
+
     // Deploy timelock controller if config.upgrade is set
     let timelockController;
     if (config.upgrade) {
@@ -454,6 +495,7 @@ export class EvmCoreModule extends HyperlaneModule<
       mailbox: mailbox.address,
       interchainAccountRouter,
       validatorAnnounce,
+      quotedCalls,
       timelockController,
       testRecipient,
       merkleTreeHook,
@@ -504,14 +546,13 @@ export class EvmCoreModule extends HyperlaneModule<
     } = params;
     const chainName = multiProvider.getChainName(chain);
 
-    const domain = multiProvider.getDomainId(chainName);
-    const mailbox = await deployer.deployProxiedContract(
-      chainName,
-      'mailbox',
-      'mailbox',
-      proxyAdmin,
-      [domain],
-    );
+    const {
+      mailbox,
+      mailboxOwner,
+      signerAddress,
+      signerIsOwner,
+      configuredMailboxOwner,
+    } = await deployer.deployMailboxProxy(chainName, config, proxyAdmin);
 
     // @todo refactor when 1) IsmModule is ready
     const deployedDefaultIsm = await deployer.deployIsm(
@@ -540,17 +581,38 @@ export class EvmCoreModule extends HyperlaneModule<
       },
     );
 
-    // Initialize Mailbox
-    await multiProvider.handleTx(
-      chain,
-      mailbox.initialize(
-        config.owner,
-        deployedDefaultIsm,
-        deployedDefaultHook.address,
-        deployedRequiredHook.address,
-        multiProvider.getTransactionOverrides(chain),
-      ),
+    const overrides = multiProvider.getTransactionOverrides(chainName);
+    const configure = async (
+      current: string,
+      target: string,
+      set: () => Promise<ContractTransaction>,
+    ) => {
+      if (eqAddress(current, target)) return;
+      assert(
+        signerIsOwner,
+        `Mailbox at ${mailbox.address} on ${chainName} requires configuration but is owned by ${mailboxOwner}`,
+      );
+      await multiProvider.handleTx(chainName, await set());
+    };
+    await configure(await mailbox.defaultIsm(), deployedDefaultIsm, () =>
+      mailbox.setDefaultIsm(deployedDefaultIsm, overrides),
     );
+    await configure(
+      await mailbox.defaultHook(),
+      deployedDefaultHook.address,
+      () => mailbox.setDefaultHook(deployedDefaultHook.address, overrides),
+    );
+    await configure(
+      await mailbox.requiredHook(),
+      deployedRequiredHook.address,
+      () => mailbox.setRequiredHook(deployedRequiredHook.address, overrides),
+    );
+    if (signerIsOwner && !eqAddress(signerAddress, configuredMailboxOwner)) {
+      await multiProvider.handleTx(
+        chainName,
+        mailbox.transferOwnership(configuredMailboxOwner, overrides),
+      );
+    }
     return mailbox;
   }
 

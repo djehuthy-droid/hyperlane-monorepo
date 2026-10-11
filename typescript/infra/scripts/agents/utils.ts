@@ -1,19 +1,23 @@
 import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 
-import { concurrentMap, rootLogger } from '@hyperlane-xyz/utils';
+import { concurrentMap, mapAllSettled, rootLogger } from '@hyperlane-xyz/utils';
 
 import {
-  AgentHelmManager,
   RelayerHelmManager,
   ScraperHelmManager,
+  ScraperProxyHelmManager,
   ValidatorHelmManager,
 } from '../../src/agents/index.js';
-import { RootAgentConfig } from '../../src/config/agent/agent.js';
+import {
+  HelmRootAgentValues,
+  RootAgentConfig,
+} from '../../src/config/agent/agent.js';
 import { EnvironmentConfig } from '../../src/config/environment.js';
 import { Role } from '../../src/roles.js';
 import {
   HelmCommand,
+  HelmManager,
   PreflightDiff,
   buildHelmChartDependencies,
 } from '../../src/utils/helm.js';
@@ -26,6 +30,7 @@ import {
   withChains,
   withConcurrency,
   withContext,
+  withYes,
 } from '../agent-utils.js';
 import { getConfigsBasedOnArgs } from '../core-utils.js';
 
@@ -38,15 +43,26 @@ export class AgentCli {
   chains?: string[];
   concurrency = 1;
   skipPreflightCheck = false;
+  skipConfirmation = false;
 
   public async restartAgents() {
     await this.init();
     const managers = this.managers();
-    await refreshK8sResources(
-      Object.values(managers),
-      K8sResourceType.POD,
-      this.envConfig.environment,
+    const statefulSetManagers = Object.values(managers).filter(
+      (manager) => !(manager instanceof ScraperProxyHelmManager),
     );
+    if (statefulSetManagers.length > 0) {
+      await refreshK8sResources(
+        statefulSetManagers,
+        K8sResourceType.POD,
+        this.envConfig.environment,
+      );
+    }
+
+    const scraperProxyManager = managers[Role.ScraperProxy];
+    if (scraperProxyManager instanceof ScraperProxyHelmManager) {
+      await scraperProxyManager.restartDeployment();
+    }
   }
 
   public async runHelmCommand(command: HelmCommand) {
@@ -112,8 +128,10 @@ export class AgentCli {
 
   protected async init() {
     if (this.initialized) return;
-    const argv = await withConcurrency(
-      withChains(withAgentRolesRequired(withContext(getArgs()))),
+    const argv = await withYes(
+      withConcurrency(
+        withChains(withAgentRolesRequired(withContext(getArgs()))),
+      ),
     )
       .describe('dry-run', 'Run through the steps without making any changes')
       .boolean('dry-run')
@@ -138,34 +156,33 @@ export class AgentCli {
     this.agentConfig = agentConfig;
     this.dryRun = argv.dryRun || false;
     this.skipPreflightCheck = argv.skipPreflightCheck || false;
+    this.skipConfirmation = argv.yes || false;
     this.initialized = true;
     this.chains = argv.chains;
     this.concurrency = argv.concurrency;
   }
 
   private async runPreflightChecks(
-    managers: Record<string, AgentHelmManager>,
+    managers: Record<string, HelmManager<HelmRootAgentValues>>,
   ): Promise<boolean> {
     console.log(chalk.cyan.bold('🔍 Running pre-flight checks...\n'));
 
     const managerEntries = Object.entries(managers);
-    const diffResults = await Promise.allSettled(
-      managerEntries.map(async ([key, manager]) => ({
+    const { fulfilled, rejected } = await mapAllSettled(
+      managerEntries,
+      async ([key, manager]) => ({
         key,
         diff: await manager.getPreflightDiff(),
-      })),
+      }),
+      ([key]) => key,
     );
 
-    const diffs: Array<{ key: string; diff: PreflightDiff }> = [];
-    const failures: string[] = [];
-
-    for (const result of diffResults) {
-      if (result.status === 'fulfilled') {
-        diffs.push(result.value);
-      } else {
-        failures.push(result.reason?.message || 'Unknown error');
-      }
-    }
+    const diffs: Array<{ key: string; diff: PreflightDiff }> = [
+      ...fulfilled.values(),
+    ];
+    const failures: string[] = [...rejected.entries()].map(
+      ([key, error]) => `${key}: ${error.message || 'Unknown error'}`,
+    );
 
     if (failures.length > 0) {
       console.log(chalk.red.bold('\n❌ Failed to gather pre-flight diffs:'));
@@ -191,6 +208,13 @@ export class AgentCli {
 
     printPreflightSummaryTable(diffs);
 
+    if (this.skipConfirmation) {
+      console.log(
+        chalk.yellow('--yes set; proceeding with deployment without prompt.'),
+      );
+      return true;
+    }
+
     return confirm({
       message: chalk.yellow(
         `Proceed with deployment of ${diffs.length} agent(s)?`,
@@ -199,8 +223,8 @@ export class AgentCli {
     });
   }
 
-  private managers(): Record<string, AgentHelmManager> {
-    const managers: Record<string, AgentHelmManager> = {};
+  private managers(): Record<string, HelmManager<HelmRootAgentValues>> {
+    const managers: Record<string, HelmManager<HelmRootAgentValues>> = {};
     for (const role of this.roles) {
       switch (role) {
         case Role.Validator: {
@@ -210,7 +234,12 @@ export class AgentCli {
             : contextChainNames.filter((chain: string) =>
                 this.chains!.includes(chain),
               );
-          for (const chain of validatorChains) {
+          const configuredValidatorChains = validatorChains.filter(
+            (chain) =>
+              (this.agentConfig.validators?.chains[chain]?.validators.length ??
+                0) > 0,
+          );
+          for (const chain of configuredValidatorChains) {
             const key = `${role}-${chain}`;
             managers[key] = new ValidatorHelmManager(this.agentConfig, chain);
           }
@@ -221,6 +250,9 @@ export class AgentCli {
           break;
         case Role.Scraper:
           managers[role] = new ScraperHelmManager(this.agentConfig);
+          break;
+        case Role.ScraperProxy:
+          managers[role] = new ScraperProxyHelmManager(this.agentConfig);
           break;
         default:
           throw new Error(`Invalid role ${role}`);

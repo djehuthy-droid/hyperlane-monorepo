@@ -6,7 +6,10 @@ import { assert } from '@hyperlane-xyz/utils';
 
 import { getKeysFromKvStore } from '../utils/base-query.js';
 import { RadixBase } from '../utils/base.js';
-import { READ_ACCOUNT_HEX_PUBLIC_KEY } from '../utils/constants.js';
+import {
+  EPOCH_VALIDITY_RANGE,
+  READ_ACCOUNT_HEX_PUBLIC_KEY,
+} from '../utils/constants.js';
 import { EntityDetails, EntityField, Receipt } from '../utils/types.js';
 
 export class RadixWarpQuery {
@@ -55,6 +58,11 @@ export class RadixWarpQuery {
       resourceHolders.length === 1,
       `expected token holders of resource ${ownerResource} to be one, found ${resourceHolders.length} holders instead`,
     );
+    const [resourceHolder] = resourceHolders;
+    assert(
+      resourceHolder,
+      `Expected a token holder of resource ${ownerResource}`,
+    );
 
     const fields = (details.details as EntityDetails).state.fields;
 
@@ -64,6 +72,8 @@ export class RadixWarpQuery {
       token_type === 'Collateral' || token_type === 'Synthetic',
       `unknown token type: ${token_type}`,
     );
+    const tokenType: 'Collateral' | 'Synthetic' =
+      token_type === 'Collateral' ? 'Collateral' : 'Synthetic';
 
     const ismFields = fields.find((f) => f.field_name === 'ism')?.fields ?? [];
 
@@ -95,8 +105,8 @@ export class RadixWarpQuery {
 
     const result = {
       address: token,
-      owner: resourceHolders[0],
-      tokenType: token_type as 'Collateral' | 'Synthetic',
+      owner: resourceHolder,
+      tokenType,
       mailboxAddress:
         fields.find((f) => f.field_name === 'mailbox')?.value ?? '',
       ismAddress: ismFields[0]?.value ?? '',
@@ -152,9 +162,11 @@ export class RadixWarpQuery {
             ],
           },
         });
+      const [entry] = entries;
+      assert(entry, `found no remote router entry for key ${key.raw_hex}`);
 
       const routerFields =
-        (entries[0].value.programmatic_json as EntityField)?.fields ?? [];
+        (entry.value.programmatic_json as EntityField)?.fields ?? [];
 
       remoteRouters.push({
         receiverDomainId: parseInt(
@@ -227,7 +239,8 @@ CALL_METHOD
             use_free_credit: true,
           },
           start_epoch_inclusive: constructionMetadata.ledger_state.epoch,
-          end_epoch_exclusive: constructionMetadata.ledger_state.epoch + 2,
+          end_epoch_exclusive:
+            constructionMetadata.ledger_state.epoch + EPOCH_VALIDITY_RANGE,
         },
       });
 
@@ -238,8 +251,10 @@ CALL_METHOD
 
     const output = (response.receipt as Receipt).output;
     assert(output.length, `found no output for quote_remote_transfer method`);
+    const [methodOutput] = output;
+    assert(methodOutput, `found no output for quote_remote_transfer method`);
 
-    const programmaticJson = output[0].programmatic_json;
+    const programmaticJson = methodOutput.programmatic_json;
     assert(
       'entries' in programmaticJson,
       'programmatic_json is not in the expected format',
@@ -251,11 +266,13 @@ CALL_METHOD
       entries.length < 2,
       `quote_remote_transfer returned multiple resources`,
     );
+    const [entry] = entries;
+    assert(entry, `quote_remote_transfer returned no resources`);
 
     return {
-      denom: entries[0].key.value,
+      denom: entry.key.value,
       amount: BigInt(
-        new BigNumber(entries[0].value.value)
+        new BigNumber(entry.value.value)
           .times(new BigNumber(10).pow(18))
           .integerValue(BigNumber.ROUND_FLOOR)
           .toFixed(0),

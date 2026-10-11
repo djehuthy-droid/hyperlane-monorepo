@@ -1,15 +1,108 @@
 export {
+  DerivedCrossCollateralRoutingFeeConfig,
   DerivedRoutingFeeConfig,
   DerivedTokenFeeConfig,
   EvmTokenFeeReader,
 } from './fee/EvmTokenFeeReader.js';
 
 export {
+  type Eip712Signable,
+  type Eip712TypedDataDomain,
+  type Eip712TypedDataField,
+  isEip712Signable,
+  parseEip712Signable,
+} from './quote/Eip712Signable.js';
+export { EvmPrivateKeyQuoteSigner } from './quote/EvmPrivateKeyQuoteSigner.js';
+export { EvmQuoteArtifactManager } from './quote/EvmQuoteArtifactManager.js';
+export { EvmQuoteReader } from './quote/EvmQuoteReader.js';
+export { EvmQuoteWriter } from './quote/EvmQuoteWriter.js';
+export {
+  buildEvmSignedQuoteSignable,
+  buildEvmSignedQuoteTuple,
+  OFFCHAIN_QUOTER_DOMAIN_NAME,
+  OFFCHAIN_QUOTER_DOMAIN_VERSION,
+  SIGNED_QUOTE_TYPES,
+  type EvmSignedQuoteTuple,
+} from './quote/WarpSignedQuoteEip712.js';
+
+export {
+  buildExecuteCalldata,
+  buildQuoteCalldata,
+  type QuotedCallsTransaction,
+  type QuotedTransferParams,
+} from './quoted-calls/builder.js';
+export {
+  FeeQuotingClient,
+  FeeQuotingNoQuoteAvailableError,
+  FeeQuotingV2Client,
+} from './quoted-calls/client.js';
+export type {
+  FeeQuotingV2IgpParams,
+  FeeQuotingV2WarpParams,
+} from './quoted-calls/client.js';
+export { EvmQuotedTransferProvider } from './quoted-calls/EvmQuotedTransferProvider.js';
+export type { QuotedTransferProvider } from './quoted-calls/QuotedTransferProvider.js';
+export { SealevelQuotedTransferProvider } from './quoted-calls/SealevelQuotedTransferProvider.js';
+export type { SealevelQuotedTransferProviderOpts } from './quoted-calls/SealevelQuotedTransferProvider.js';
+export { composeSealevelTx } from './quoted-calls/composeSealevelTx.js';
+export { decodeSealevelQuoteEntry } from './quoted-calls/svmDecoder.js';
+export type {
+  DecodedSealevelQuoteEntry,
+  DecodedSvmSignedQuote,
+} from './quoted-calls/svmDecoder.js';
+export type {
+  FeeQuotingClientOptions,
+  QuoteParams as FeeQuotingQuoteParams,
+} from './quoted-calls/client.js';
+export {
+  CONTRACT_BALANCE,
+  type Quote as QuotedCallsQuote,
+  computeScopedSalt,
+  decodeQuoteExecuteResult,
+  encodeExecuteCalldata,
+  encodePermit2PermitInput,
+  encodePermit2TransferFromInput,
+  encodeQuoteExecuteCalldata,
+  encodeSubmitQuoteInput,
+  encodeSweepInput,
+  encodeTransferFromInput,
+  encodeTransferRemoteInput,
+  encodeTransferRemoteToInput,
+  extractQuoteTotals,
+  quotedCallsAbi,
+  sumQuotesByToken,
+} from './quoted-calls/codec.js';
+export {
+  type AnyQuoteV2Entry,
+  type EthereumQuoteDetails,
+  type EthereumQuoteV2Entry,
+  FeeQuotingCommand,
+  type FeeQuotingQuoteResponse,
+  NO_QUOTE_AVAILABLE_ERROR,
+  type NoQuoteAvailableError,
+  NoQuoteAvailableReason,
+  type Permit2Data,
+  type QuotedCallsParams,
+  QuotedCallsCommand,
+  QUOTE_V2_BASE_PATH,
+  QuoteV2Endpoint,
+  type QuoteV2Entry,
+  type QuoteV2Response,
+  type SealevelQuoteDetails,
+  type SealevelQuoteV2Entry,
+  type SealevelSignedQuote,
+  type SignedQuoteData,
+  type SubmitQuoteCommand,
+  TokenPullMode,
+  WARP_FEE_COMMANDS,
+} from './quoted-calls/types.js';
+
+export {
   isAddressActive,
   isContractAddress,
   assertIsContractAddress,
 } from './contracts/contracts.js';
-export { MUTABLE_HOOK_TYPE } from './hook/types.js';
+export { MUTABLE_HOOK_TYPE, OnchainHookType } from './hook/types.js';
 export { MUTABLE_ISM_TYPE } from './ism/types.js';
 
 export { HyperlaneApp } from './app/HyperlaneApp.js';
@@ -78,6 +171,7 @@ export { ICoreAdapter } from './core/adapters/types.js';
 export {
   CoreAddresses,
   CoreFactories,
+  PERMIT2_ADDRESS,
   coreFactories,
 } from './core/contracts.js';
 export { HyperlaneLifecyleEvent } from './core/events.js';
@@ -85,10 +179,7 @@ export { EvmCoreReader } from './core/EvmCoreReader.js';
 export { HyperlaneCore } from './core/HyperlaneCore.js';
 export { HyperlaneCoreChecker } from './core/HyperlaneCoreChecker.js';
 export { HyperlaneCoreDeployer } from './core/HyperlaneCoreDeployer.js';
-export {
-  HyperlaneRelayer,
-  RelayerCacheSchema,
-} from './core/HyperlaneRelayer.js';
+
 export { MultiProtocolCore } from './core/MultiProtocolCore.js';
 export { TestCoreApp } from './core/TestCoreApp.js';
 export { TestCoreDeployer } from './core/TestCoreDeployer.js';
@@ -108,6 +199,7 @@ export {
   MailboxMultisigIsmViolation,
   MailboxViolation,
   MailboxViolationType,
+  shouldDeployQuotedCalls,
   ValidatorAnnounceViolation,
 } from './core/types.js';
 export { HyperlaneAppChecker } from './deploy/HyperlaneAppChecker.js';
@@ -116,6 +208,10 @@ export {
   HyperlaneDeployer,
 } from './deploy/HyperlaneDeployer.js';
 export { HyperlaneProxyFactoryDeployer } from './deploy/HyperlaneProxyFactoryDeployer.js';
+export {
+  ProxyFactoryFactories,
+  proxyFactoryFactories,
+} from './deploy/contracts.js';
 export {
   CheckerViolation,
   OwnerViolation,
@@ -135,7 +231,19 @@ export {
 export * as verificationUtils from './deploy/verify/utils.js';
 export { ExplorerLicenseType } from './block-explorer/etherscan.js';
 export { ZKSyncContractVerifier } from './deploy/verify/ZKSyncContractVerifier.js';
-export { executeWarpDeploy, enrollCrossChainRouters } from './deploy/warp.js';
+export {
+  assertDelayedFlowRouteCoverage,
+  assertDelayedFlowRoutePreconditions,
+  buildDelayedFlowEnrollmentTxs,
+  buildFeeReadContextFromWarpDeployConfig,
+  type DelayedFlowEnrollmentTarget,
+  deriveDelayedFlowEnrollmentTargets,
+  executeWarpDeploy,
+  executeWarpRouteExtensionDeploy,
+  enrollCrossChainRouters,
+  validateWarpConfigForAltVM,
+} from './deploy/warp.js';
+export { planWarpRouteHybrids } from './deploy/warpHybridPlan.js';
 export {
   SealevelIgpAdapter,
   SealevelIgpProgramAdapter,
@@ -178,6 +286,7 @@ export {
   IgpConfig,
   IgpGasOraclesViolation,
   IgpOverheadViolation,
+  IgpTokenGasOraclesViolation,
   IgpViolation,
   IgpViolationType,
 } from './gas/types.js';
@@ -188,6 +297,10 @@ export {
   AggregationHookConfigSchema,
   ArbL2ToL1HookConfig,
   ArbL2ToL1HookSchema,
+  DelayedFlowRouterHookConfig,
+  DelayedFlowRouterHookConfigSchema,
+  DeployableHookType,
+  DerivedHookConfig,
   DomainRoutingHookConfig,
   DomainRoutingHookConfigSchema,
   FallbackRoutingHookConfig,
@@ -201,20 +314,31 @@ export {
   HookType,
   IgpHookConfig,
   IgpSchema,
+  IgpVersion,
   MerkleTreeHookConfig,
   MerkleTreeSchema,
+  NetFlowRateLimitedHookConfig,
+  NetFlowRateLimitedHookConfigSchema,
+  normalizeUnknownHookTypes,
+  OFFCHAIN_QUOTED_IGP_VERSION,
   OpStackHookConfig,
   OpStackHookSchema,
   PausableHookConfig,
   PausableHookSchema,
   ProtocolFeeHookConfig,
   ProtocolFeeSchema,
+  RateLimitedHookConfig,
+  RateLimitedHookSchema,
+  SafeParseHookConfigSchema,
 } from './hook/types.js';
-export { isHookCompatible } from './hook/utils.js';
+export {
+  collectHybridHookNodes,
+  hookTreeContainsRateLimited,
+  isHookCompatible,
+} from './hook/utils.js';
 export { EvmIsmReader } from './ism/EvmIsmReader.js';
 export { HyperlaneIsmFactory } from './ism/HyperlaneIsmFactory.js';
-export { BaseMetadataBuilder } from './ism/metadata/builder.js';
-export { decodeIsmMetadata } from './ism/metadata/decode.js';
+// Note: MetadataBuilder types are now exported from @hyperlane-xyz/relayer
 export {
   buildAggregationIsmConfigs,
   buildMultisigIsmConfigs,
@@ -248,24 +372,56 @@ export {
   AggregationIsmConfigSchema,
   ArbL2ToL1IsmConfig,
   ArbL2ToL1IsmConfigSchema,
+  CompositeAggregationNodeConfig,
+  CompositeAmountRoutingNodeConfig,
+  CompositeFallbackRoutingNodeConfig,
+  CompositeIsmConfig,
+  CompositeIsmConfigSchema,
+  CompositeIsmNodeConfig,
+  CompositeIsmNodeConfigSchema,
+  CompositeIsmNodeType,
+  CompositeMultisigMessageIdNodeConfig,
+  CompositePausableNodeConfig,
+  CompositeRateLimitedNodeConfig,
+  CompositeRoutingNodeConfig,
+  CompositeTestNodeConfig,
+  CompositeTrustedRelayerNodeConfig,
+  DelayedFlowRouterHookIsmConfig,
+  DelayedFlowRouterHookIsmConfigSchema,
+  DeployableIsmType,
   DeployedIsm,
   DeployedIsmType,
   DerivedIsmConfig,
   DomainRoutingIsmConfig,
+  isDynamicallyRoutedIsmType,
   IsmConfig,
   IsmConfigSchema,
   IsmType,
+  MailboxDefaultIsmConfig,
+  MailboxDefaultIsmConfigSchema,
   ModuleType,
   MultisigConfig,
   MultisigConfigSchema,
   MultisigIsmConfig,
   MultisigIsmConfigSchema,
+  NetFlowRateLimitedHookIsmConfig,
+  NetFlowRateLimitedHookIsmConfigSchema,
+  normalizeUnknownIsmTypes,
+  NullIsmConfig,
+  OffchainLookupIsmConfig,
   OpStackIsmConfig,
   OpStackIsmConfigSchema,
   PausableIsmConfig,
   PausableIsmConfigSchema,
   RoutingIsmConfig,
   RoutingIsmConfigSchema,
+  RoutingMessageIdMultisigIsmConfig,
+  RoutingMessageIdMultisigIsmConfigSchema,
+  SafeParseIsmConfigSchema,
+  RateLimitedIsmConfig,
+  RateLimitedIsmConfigSchema,
+  BlacklistIsmConfig,
+  BlacklistIsmConfigSchema,
   TrustedRelayerIsmConfig,
   TrustedRelayerIsmConfigSchema,
   WeightedMultisigIsmConfig,
@@ -277,6 +433,7 @@ export {
   isStaticDeploymentSupported,
   isStaticIsm,
   moduleCanCertainlyVerify,
+  offchainLookupRequestMessageHash,
 } from './ism/utils.js';
 export {
   AgentChainMetadata,
@@ -292,8 +449,10 @@ export {
   AgentSealevelPriorityFeeOracleType,
   AgentSealevelTransactionSubmitter,
   AgentSealevelTransactionSubmitterType,
+  AgentSealevelUrReveal,
   AgentSigner,
   AgentSignerAwsKey,
+  AgentSignerGcpKey,
   AgentSignerHexKey,
   AgentSignerKeyType,
   AgentSignerNode,
@@ -352,13 +511,7 @@ export {
   interchainAccountFactories,
 } from './middleware/account/contracts.js';
 export {
-  commitmentFromIcaCalls,
-  encodeIcaCalls,
   InterchainAccount,
-  normalizeCalls,
-  PostCallsSchema,
-  PostCallsType,
-  RawCallData,
   shareCallsWithPrivateRelayer,
 } from './middleware/account/InterchainAccount.js';
 export { InterchainAccountChecker } from './middleware/account/InterchainAccountChecker.js';
@@ -384,17 +537,19 @@ export {
 export {
   MultiProvider,
   MultiProviderOptions,
+  SendTransactionOptions,
 } from './providers/MultiProvider.js';
 export {
-  defaultEthersV5ProviderBuilder,
-  defaultFuelProviderBuilder,
-  defaultProviderBuilder,
   defaultProviderBuilderMap,
+  protocolToDefaultProviderBuilder,
+  ProviderBuilderMap,
+} from './providers/defaultProviderBuilderMaps.js';
+export {
+  defaultEthersV5ProviderBuilder,
+  defaultProviderBuilder,
   defaultSolProviderBuilder,
   defaultViemProviderBuilder,
-  protocolToDefaultProviderBuilder,
   ProviderBuilderFn,
-  ProviderBuilderMap,
   TypedProviderBuilderFn,
 } from './providers/providerBuilders.js';
 export {
@@ -446,6 +601,10 @@ export {
 export { HyperlaneEtherscanProvider } from './providers/SmartProvider/HyperlaneEtherscanProvider.js';
 export { HyperlaneJsonRpcProvider } from './providers/SmartProvider/HyperlaneJsonRpcProvider.js';
 export {
+  SeismicSigner,
+  type SeismicSignerContext,
+} from './providers/SeismicSigner.js';
+export {
   AllProviderMethods,
   excludeProviderMethods,
   IProviderMethods,
@@ -453,9 +612,11 @@ export {
 } from './providers/SmartProvider/ProviderMethods.js';
 export { HyperlaneSmartProvider } from './providers/SmartProvider/SmartProvider.js';
 export {
+  HyperlaneLogFilter,
   ProviderRetryOptions,
   SmartProviderOptions,
 } from './providers/SmartProvider/types.js';
+export { parseCustomRpcHeaders } from './utils/provider.js';
 export { CallData, CallDataSchema } from './providers/transactions/types.js';
 export {
   randomAddress,
@@ -464,6 +625,7 @@ export {
   randomStarknetAddress,
   randomHookConfig,
   randomIsmConfig,
+  randomDeployableIsmConfig,
 } from './test/testUtils.js';
 
 export { TxSubmitterInterface } from './providers/transactions/submitter/TxSubmitterInterface.js';
@@ -479,6 +641,9 @@ export {
   EV5ImpersonatedAccountTxSubmitterProps,
   EV5ImpersonatedAccountTxSubmitterPropsSchema,
   EvmIcaTxSubmitterProps,
+  EvmTimelockControllerSubmitterProps,
+  buildEvmIcaTxSubmitterPropsSchema,
+  buildEvmTimelockControllerSubmitterPropsSchema,
   isJsonRpcSubmitterConfig,
 } from './providers/transactions/submitter/ethersV5/types.js';
 
@@ -495,7 +660,11 @@ export {
 export { EV5GnosisSafeTxBuilder } from './providers/transactions/submitter/ethersV5/EV5GnosisSafeTxBuilder.js';
 export { EV5GnosisSafeTxSubmitter } from './providers/transactions/submitter/ethersV5/EV5GnosisSafeTxSubmitter.js';
 export { EV5ImpersonatedAccountTxSubmitter } from './providers/transactions/submitter/ethersV5/EV5ImpersonatedAccountTxSubmitter.js';
-export { EV5JsonRpcTxSubmitter } from './providers/transactions/submitter/ethersV5/EV5JsonRpcTxSubmitter.js';
+export {
+  EV5JsonRpcSubmissionError,
+  EV5JsonRpcTxSubmitter,
+  EV5SubmittedTransaction,
+} from './providers/transactions/submitter/ethersV5/EV5JsonRpcTxSubmitter.js';
 export { EV5TxSubmitterInterface } from './providers/transactions/submitter/ethersV5/EV5TxSubmitterInterface.js';
 export { EvmIcaTxSubmitter } from './providers/transactions/submitter/IcaTxSubmitter.js';
 export {
@@ -557,12 +726,14 @@ export { EvmHookModule } from './hook/EvmHookModule.js';
 export {
   DerivedIcaRouterConfig,
   DerivedIcaRouterConfigSchema,
+  FeeTokenApproval,
+  FeeTokenApprovalSchema,
   IcaRouterConfig,
   IcaRouterConfigSchema,
   IcaRouterConfig as InterchainAccountConfig,
+  IcaRouterType,
 } from './ica/types.js';
 export { EvmIsmModule } from './ism/EvmIsmModule.js';
-export { offchainLookupRequestMessageHash } from './ism/metadata/ccipread.js';
 export {
   chainMetadataToCosmosChain,
   chainMetadataToStarknetChain,
@@ -626,6 +797,7 @@ export {
   EvmHypCollateralAdapter,
   EvmMovableCollateralAdapter,
   EvmHypNativeAdapter,
+  EvmHypOwnerCollateralAdapter,
   EvmHypSyntheticAdapter,
   EvmHypVSXERC20Adapter,
   EvmHypVSXERC20LockboxAdapter,
@@ -641,11 +813,13 @@ export {
   IHypVSXERC20Adapter,
   IHypXERC20Adapter,
   InterchainGasQuote,
+  IPredicateAwareAdapter,
   ITokenAdapter,
   TransferParams,
   TransferRemoteParams,
   Quote,
   QuoteTransferRemoteParams,
+  isPredicateCapableAdapter,
 } from './token/adapters/ITokenAdapter.js';
 export {
   SealevelHypCollateralAdapter,
@@ -681,15 +855,17 @@ export {
   SealevelTransferRemoteInstruction,
   SealevelTransferRemoteSchema,
 } from './token/adapters/serialization.js';
-export { HypERC20App } from './token/app.js';
-export { HypERC20Checker } from './token/checker.js';
-export { TokenType } from './token/config.js';
+export { DeployableTokenType, TokenType } from './token/config.js';
 export {
   expandVirtualWarpDeployConfig,
   expandWarpDeployConfig,
+  filterWarpCoreConfigMapByChains,
+  getChainsFromWarpCoreConfig,
   getRouterAddressesFromWarpCoreConfig,
+  resolveWarpDeployConfigRouterKeys,
   splitWarpCoreAndExtendedConfigs,
   transformConfigToCheck,
+  warpCoreConfigMatchesChains,
 } from './token/configUtils.js';
 export {
   hypERC20contracts,
@@ -699,8 +875,37 @@ export {
   TokenFactories,
 } from './token/contracts.js';
 export { HypERC20Deployer, HypERC721Deployer } from './token/deploy.js';
-export { EvmERC20WarpModule } from './token/EvmERC20WarpModule.js';
-export { EvmERC20WarpRouteReader } from './token/EvmERC20WarpRouteReader.js';
+export {
+  EvmWarpModule,
+  MAX_LEGACY_BRIDGE_APPROVAL_VERSION,
+  bridgeApprovalGrantsMaxAllowance,
+  type WarpUpdateResult,
+} from './token/EvmWarpModule.js';
+export { EvmWarpRouteReader } from './token/EvmWarpRouteReader.js';
+export {
+  WARP_ROUTE_CHECK_SCALE_TYPE,
+  WARP_ROUTE_CHECK_TYPE,
+  checkWarpRouteDeployConfig,
+} from './token/warpCheck.js';
+export type {
+  AcceptedInactiveOwner,
+  WarpRouteCheckResult,
+  WarpRouteCheckViolation,
+} from './token/warpCheck.js';
+export {
+  EvmXERC20Reader,
+  StandardXERC20Limits,
+  VeloXERC20Limits,
+  XERC20Limits,
+  XERC20LimitsMap,
+  limitsAreZero,
+  limitsMatch,
+} from './token/EvmXERC20Reader.js';
+export {
+  EvmXERC20Module,
+  XERC20ModuleAddresses,
+  XERC20ModuleConfig,
+} from './token/EvmXERC20Module.js';
 export { IToken, TokenArgs, TokenConfigSchema } from './token/IToken.js';
 export { Token, getCollateralTokenAdapter } from './token/Token.js';
 export { TokenAmount } from './token/TokenAmount.js';
@@ -716,12 +921,14 @@ export {
 } from './token/TokenConnection.js';
 export { TokenMetadataMap } from './token/TokenMetadataMap.js';
 export {
+  ERC4626_COLLATERAL_STANDARDS,
   EVM_TOKEN_TYPE_TO_STANDARD,
   LOCKBOX_STANDARDS,
   MINT_LIMITED_STANDARDS,
   PROTOCOL_TO_NATIVE_STANDARD,
   PROTOCOL_TO_HYP_NATIVE_STANDARD,
   TOKEN_COLLATERALIZED_STANDARDS,
+  TOKEN_CROSS_COLLATERAL_STANDARDS,
   TOKEN_COSMWASM_STANDARDS,
   TOKEN_HYP_STANDARDS,
   TOKEN_MULTI_CHAIN_STANDARDS,
@@ -736,6 +943,10 @@ export {
   XERC20LimitsTokenConfig,
   CctpTokenConfig,
   CctpTokenConfigSchema,
+  DepositAddressDestinationConfig,
+  DepositAddressDestinationConfigSchema,
+  DepositAddressTokenConfig,
+  DepositAddressTokenConfigSchema,
   CollateralRebaseTokenConfigSchema,
   CollateralTokenConfig,
   CollateralTokenConfigSchema,
@@ -752,6 +963,7 @@ export {
   HypTokenRouterConfigSchema,
   HypTokenRouterVirtualConfig,
   isCollateralRebaseTokenConfig,
+  isCctpTokenConfig,
   isCollateralTokenConfig,
   isMovableCollateralTokenConfig,
   isNativeTokenConfig,
@@ -761,10 +973,16 @@ export {
   isEverclearCollateralTokenConfig,
   isEverclearEthBridgeTokenConfig,
   isEverclearTokenBridgeConfig,
+  isDepositAddressTokenConfig,
   EverclearCollateralTokenConfig,
   EverclearEthBridgeTokenConfig,
   isXERC20TokenConfig,
+  isCrossCollateralTokenConfig,
+  isOftTokenConfig,
+  CrossCollateralTokenConfig,
   NativeTokenConfig,
+  OftTokenConfig,
+  OftTokenConfigSchema,
   NativeTokenConfigSchema,
   SyntheticRebaseTokenConfig,
   SyntheticRebaseTokenConfigSchema,
@@ -781,8 +999,32 @@ export {
   XERC20Type,
   XERC20TokenExtraBridgesLimits,
   XERC20TokenMetadata,
+  PredicateWrapperConfig,
+  PredicateWrapperConfigSchema,
+  isPredicateWrapperConfig,
 } from './token/types.js';
-export { getExtraLockBoxConfigs } from './token/xerc20.js';
+export {
+  UnknownXERC20TypeError,
+  deriveBridgesConfig,
+  deriveStandardBridgesConfig,
+  deriveXERC20TokenType,
+  getExtraLockBoxConfigs,
+} from './token/xerc20.js';
+export {
+  CONFIGURATION_CHANGED_EVENT_SELECTOR,
+  XERC20_VS_ABI,
+} from './token/xerc20-abi.js';
+export {
+  PredicateApiClient,
+  PredicateAttestation,
+  PredicateAttestationRequest,
+  PredicateAttestationResponse,
+  PredicateAttestationSchema,
+} from './predicate/PredicateApiClient.js';
+export {
+  PredicateWrapperDeployer,
+  PredicateWrapperDeploymentResult,
+} from './predicate/PredicateDeployer.js';
 export {
   ChainMap,
   ChainName,
@@ -801,14 +1043,35 @@ export {
   IMultiProtocolSignerManager,
 } from './types.js';
 export { getCosmosRegistryChain } from './utils/cosmos.js';
-export { verifyScale } from './utils/decimals.js';
+export {
+  alignLocalAmountToMessage,
+  DEFAULT_SCALE,
+  localAmountFromMessage,
+  messageAmountFromLocal,
+  minLocalAmountForMessage,
+  normalizeScale,
+  scalesEqual,
+  verifyScale,
+} from './utils/decimals.js';
+export type {
+  NormalizedScale,
+  ScaleAlignment,
+  ScaleInput,
+} from './utils/decimals.js';
 export { filterByChains } from './utils/filter.js';
 export {
   ANVIL_RPC_METHODS,
   getLocalProvider,
   impersonateAccount,
+  impersonateAccounts,
+  increaseTime,
+  mine,
   resetFork,
+  revertToSnapshot,
+  setBalance,
   setFork,
+  setStorageAt,
+  snapshot,
   stopImpersonatingAccount,
 } from './utils/fork.js';
 export {
@@ -816,6 +1079,7 @@ export {
   getSafe,
   getSafeDelegates,
   getSafeService,
+  normalizeSafeTxServiceUrl,
   safeApiKeyRequired,
 } from './utils/gnosisSafe.js';
 export { HyperlaneReader } from './utils/HyperlaneReader.js';
@@ -844,6 +1108,7 @@ export {
   getValidatorFromStorageLocation,
   isValidValidatorStorageLocation,
 } from './utils/validator.js';
+export { findMatchingLogEvents } from './utils/logUtils.js';
 export {
   FeeConstantConfig,
   RouteBlacklist,
@@ -882,18 +1147,29 @@ export {
 } from './signers/svm/solana-web3js.js';
 
 export {
+  DEFAULT_ROUTER_KEY,
+  OnchainTokenFeeType,
+  onChainTypeToTokenFeeTypeMap,
   TokenFeeType,
   TokenFeeConfig,
   TokenFeeConfigSchema,
   TokenFeeConfigInputSchema,
   TokenFeeConfigInput,
   LinearFeeConfig,
+  OffchainQuotedLinearFeeConfig,
+  OffchainQuotedLinearFeeConfigSchema,
+  OffchainQuotedLinearFeeInputConfigSchema,
+  QuoteSignersSchema,
+  QuoteSignersConfig,
 } from './fee/types.js';
 export { convertToBps } from './fee/utils.js';
+export { tokenFeeInputToFeeConfig } from './fee/feeConfigMapping.js';
 
 export {
   TurnkeyClientManager,
   TurnkeyConfig,
+  TurnkeyConfigSchema,
 } from './signers/turnkeyClient.js';
 export { TurnkeyEvmSigner } from './signers/evm/turnkey.js';
 export { TurnkeySealevelSigner } from './signers/svm/turnkey.js';
+export { IMultiProtocolSigner } from './signers/types.js';

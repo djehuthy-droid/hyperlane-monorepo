@@ -10,6 +10,7 @@ import { ProtocolType } from '@hyperlane-xyz/utils';
 import { readYamlOrJson } from '../../utils/files.js';
 
 import { localTestRunCmdPrefix } from './helpers.js';
+import { syncWarpDeployConfigToRegistry } from './warp-config-sync.js';
 
 $.verbose = true;
 
@@ -74,12 +75,10 @@ export class HyperlaneE2EWarpTestCommands {
   public readRaw({
     chain,
     warpAddress,
-    symbol,
     outputPath,
     warpRouteId,
   }: {
     chain?: string;
-    symbol?: string;
     warpAddress?: string;
     warpRouteId?: string;
     outputPath?: string;
@@ -88,10 +87,9 @@ export class HyperlaneE2EWarpTestCommands {
             --registry ${this.registryPath} \
             ${warpAddress ? ['--address', warpAddress] : []} \
             ${chain ? ['--chain', chain] : []} \
-            ${symbol ? ['--symbol', symbol] : []} \
-            ${warpRouteId ? ['--warpRouteId', warpRouteId] : []} \
+            ${warpRouteId ? ['--warp-route-id', warpRouteId] : []} \
             --verbosity debug \
-            ${outputPath || this.outputPath ? ['--config', outputPath || this.outputPath] : []}`;
+            ${outputPath || this.outputPath ? ['--out', outputPath || this.outputPath] : []}`;
   }
 
   public read(chain: string, warpAddress: string): ProcessPromise {
@@ -119,31 +117,28 @@ export class HyperlaneE2EWarpTestCommands {
    * Deploys the Warp route to the specified chain using the provided config.
    */
   public deployRaw({
-    warpCorePath,
-    warpDeployPath,
     hypKey,
     skipConfirmationPrompts,
     privateKey,
     warpRouteId,
+    warpDeployPath,
     extraArgs,
   }: {
-    warpCorePath?: string;
-    warpDeployPath?: string;
     hypKey?: string;
     skipConfirmationPrompts?: boolean;
     privateKey?: string;
     warpRouteId?: string;
+    warpDeployPath?: string;
     extraArgs?: string[];
   }): ProcessPromise {
+    this.syncWarpDeployConfigToRegistry(warpRouteId, warpDeployPath);
     return $`${
       hypKey ? [`${this.hypKeyEnvName}=${hypKey}`] : []
     } ${localTestRunCmdPrefix()} hyperlane warp deploy \
           --registry ${this.registryPath} \
-          ${warpDeployPath ? ['--config', warpDeployPath] : []} \
-          ${warpCorePath ? ['--warp', warpCorePath] : []} \
           ${privateKey ? [this.privateKeyFlag, privateKey] : []} \
           --verbosity debug \
-          ${warpRouteId ? ['--warpRouteId', warpRouteId] : []} \
+          ${warpRouteId ? ['--warp-route-id', warpRouteId] : []} \
           ${skipConfirmationPrompts ? ['--yes'] : []} \
           ${extraArgs ? extraArgs : []}
           `;
@@ -153,21 +148,19 @@ export class HyperlaneE2EWarpTestCommands {
    * Deploys the Warp route to the specified chain using the provided config.
    */
   public deploy(
-    warpDeployPath: string,
     privateKey: string,
-    warpRouteId?: string,
+    warpRouteId: string,
+    warpDeployPath?: string,
   ): ProcessPromise {
     return this.deployRaw({
       privateKey,
-      warpDeployPath,
       skipConfirmationPrompts: true,
       warpRouteId,
+      warpDeployPath,
     });
   }
 
   public applyRaw({
-    warpDeployPath,
-    warpCorePath,
     strategyUrl,
     warpRouteId,
     privateKey,
@@ -175,9 +168,8 @@ export class HyperlaneE2EWarpTestCommands {
     hypKey,
     extraArgs,
     skipConfirmationPrompts,
+    registry,
   }: {
-    warpDeployPath?: string;
-    warpCorePath?: string;
     strategyUrl?: string;
     warpRouteId?: string;
     privateKey?: string;
@@ -185,19 +177,226 @@ export class HyperlaneE2EWarpTestCommands {
     relay?: boolean;
     skipConfirmationPrompts?: boolean;
     extraArgs?: string[];
+    registry?: string;
   }): ProcessPromise {
     return $` ${
       hypKey ? [`${this.hypKeyEnvName}=${hypKey}`] : []
     } ${localTestRunCmdPrefix()} hyperlane warp apply \
-          --registry ${this.registryPath} \
-          ${warpDeployPath ? ['--config', warpDeployPath] : []} \
-          ${warpCorePath ? ['--warp', warpCorePath] : []} \
+          --registry ${registry ?? this.registryPath} \
           ${strategyUrl ? ['--strategy', strategyUrl] : []} \
-          ${warpRouteId ? ['--warpRouteId', warpRouteId] : []} \
+          ${warpRouteId ? ['--warp-route-id', warpRouteId] : []} \
           ${privateKey ? [this.privateKeyFlag, privateKey] : []} \
           --verbosity debug \
           ${relay ? ['--relay'] : []} \
           ${skipConfirmationPrompts ? ['--yes'] : []} \
+          ${extraArgs ? extraArgs : []}
+          `;
+  }
+
+  public checkRaw({
+    warpRouteId,
+    registry,
+  }: {
+    warpRouteId?: string;
+    registry?: string;
+  }): ProcessPromise {
+    return $`${localTestRunCmdPrefix()} hyperlane warp check \
+          --registry ${registry ?? this.registryPath} \
+          ${warpRouteId ? ['--warp-route-id', warpRouteId] : []} \
+          --verbosity debug`;
+  }
+
+  public fork({
+    warpRouteId,
+    port,
+    forkConfigPath,
+    kill,
+  }: {
+    warpRouteId: string;
+    port: number;
+    forkConfigPath?: string;
+    kill?: boolean;
+  }): ProcessPromise {
+    return $`${localTestRunCmdPrefix()} hyperlane warp fork \
+          --registry ${this.registryPath} \
+          --warp-route-id ${warpRouteId} \
+          --port ${port} \
+          --verbosity debug \
+          ${forkConfigPath ? ['--fork-config', forkConfigPath] : []} \
+          ${kill ? ['--kill'] : []}`;
+  }
+
+  private syncWarpDeployConfigToRegistry(
+    warpRouteId?: string,
+    warpDeployPath?: string,
+  ) {
+    if (!warpRouteId || !warpDeployPath) return;
+    syncWarpDeployConfigToRegistry({
+      warpDeployPath,
+      warpRouteId,
+      registryPath: this.registryPath,
+    });
+  }
+
+  /**
+   * Creates the SVM Address Lookup Tables for a warp route and persists
+   * them to the registry. Wraps `hyperlane warp alt create`.
+   *
+   * `force` recreates warp-specific ALTs while reusing the registered
+   * core ALT; `fullForce` recreates everything.
+   */
+  public altCreate(
+    privateKey: string,
+    warpRouteId: string,
+    options?: { chain?: string; force?: boolean; fullForce?: boolean },
+  ): ProcessPromise {
+    return $`${localTestRunCmdPrefix()} hyperlane warp alt create \
+          --registry ${this.registryPath} \
+          --warp-route-id ${warpRouteId} \
+          ${options?.chain ? ['--chain', options.chain] : []} \
+          ${options?.force ? ['--force'] : []} \
+          ${options?.fullForce ? ['--full-force'] : []} \
+          ${this.privateKeyFlag} ${privateKey} \
+          --verbosity debug \
+          --yes`;
+  }
+
+  /**
+   * Reads the on-chain contents of the SVM Address Lookup Tables
+   * registered for a warp route. Wraps `hyperlane warp alt read`.
+   */
+  public altRead(warpRouteId: string, chain?: string): ProcessPromise {
+    return $`${localTestRunCmdPrefix()} hyperlane warp alt read \
+          --registry ${this.registryPath} \
+          --warp-route-id ${warpRouteId} \
+          ${chain ? ['--chain', chain] : []} \
+          --verbosity debug`;
+  }
+
+  /**
+   * Diffs the on-chain SVM Address Lookup Tables registered for a warp
+   * route against what the SDK would regenerate. Wraps
+   * `hyperlane warp alt check`.
+   */
+  public altCheck(warpRouteId: string, chain?: string): ProcessPromise {
+    return $`${localTestRunCmdPrefix()} hyperlane warp alt check \
+          --registry ${this.registryPath} \
+          --warp-route-id ${warpRouteId} \
+          ${chain ? ['--chain', chain] : []} \
+          --verbosity debug`;
+  }
+
+  /**
+   * Submits an offchain-signed standing warp fee quote. Wraps
+   * `hyperlane warp quote create` — ttl must be > 0 (the CLI rejects
+   * standalone transient quotes, which would be unusable).
+   */
+  public quoteCreate({
+    privateKey,
+    warpRouteId,
+    chain,
+    destination,
+    recipient,
+    amount,
+    maxFee,
+    halfAmount,
+    ttl,
+    quoteSignerKey,
+  }: {
+    privateKey: string;
+    warpRouteId: string;
+    chain: string;
+    destination: string;
+    recipient: string;
+    amount: string;
+    maxFee: string;
+    halfAmount: string;
+    ttl: number;
+    quoteSignerKey: string;
+  }): ProcessPromise {
+    return $`${localTestRunCmdPrefix()} hyperlane warp quote create \
+          --registry ${this.registryPath} \
+          --warp-route-id ${warpRouteId} \
+          --chain ${chain} \
+          --destination ${destination} \
+          --recipient ${recipient} \
+          --amount ${amount} \
+          --max-fee ${maxFee} \
+          --half-amount ${halfAmount} \
+          --ttl ${ttl} \
+          --quote-signer-key ${quoteSignerKey} \
+          ${this.privateKeyFlag} ${privateKey} \
+          --verbosity debug \
+          --yes`;
+  }
+
+  /**
+   * Reads standing offchain-signed warp fee quotes for a deployed warp
+   * route. Wraps `hyperlane warp quote read`.
+   */
+  public quoteRead({
+    warpRouteId,
+    chain,
+    out,
+  }: {
+    warpRouteId: string;
+    chain?: string;
+    out?: string;
+  }): ProcessPromise {
+    return $`${localTestRunCmdPrefix()} hyperlane warp quote read \
+          --registry ${this.registryPath} \
+          --warp-route-id ${warpRouteId} \
+          ${chain ? ['--chain', chain] : []} \
+          ${out ? ['--out', out] : []} \
+          --verbosity debug`;
+  }
+
+  public sendRaw({
+    origin,
+    destination,
+    warpRouteId,
+    amount,
+    recipient,
+    relay,
+    quick,
+    chains,
+    roundTrip,
+    skipValidation,
+    privateKey,
+    hypKey,
+    extraArgs,
+  }: {
+    origin?: string;
+    destination?: string;
+    warpRouteId?: string;
+    amount?: number | string;
+    recipient?: string;
+    relay?: boolean;
+    quick?: boolean;
+    chains?: string[];
+    roundTrip?: boolean;
+    skipValidation?: boolean;
+    privateKey?: string;
+    hypKey?: string;
+    extraArgs?: string[];
+  }): ProcessPromise {
+    return $`${
+      hypKey ? [`${this.hypKeyEnvName}=${hypKey}`] : []
+    } ${localTestRunCmdPrefix()} hyperlane warp send \
+          --registry ${this.registryPath} \
+          ${origin ? ['--origin', origin] : []} \
+          ${destination ? ['--destination', destination] : []} \
+          ${warpRouteId ? ['--warp-route-id', warpRouteId] : []} \
+          ${amount !== undefined ? ['--amount', amount] : []} \
+          ${recipient ? ['--recipient', recipient] : []} \
+          ${relay ? ['--relay'] : []} \
+          ${quick ? ['--quick'] : []} \
+          ${chains?.length ? ['--chains', ...chains] : []} \
+          ${roundTrip ? ['--round-trip'] : []} \
+          ${skipValidation ? ['--skip-validation'] : []} \
+          ${privateKey ? [this.privateKeyFlag, privateKey] : []} \
+          --verbosity debug \
+          --yes \
           ${extraArgs ? extraArgs : []}
           `;
   }

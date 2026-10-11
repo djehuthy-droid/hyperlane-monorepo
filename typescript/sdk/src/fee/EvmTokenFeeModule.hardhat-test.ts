@@ -1,9 +1,13 @@
 import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers.js';
 import { expect } from 'chai';
-import { constants } from 'ethers';
 import hre from 'hardhat';
+import sinon from 'sinon';
 
-import { ERC20Test, ERC20Test__factory } from '@hyperlane-xyz/core';
+import {
+  CrossCollateralRoutingFee__factory,
+  ERC20Test,
+  ERC20Test__factory,
+} from '@hyperlane-xyz/core';
 import { assert } from '@hyperlane-xyz/utils';
 
 import { TestChainName } from '../consts/testChains.js';
@@ -13,9 +17,16 @@ import { normalizeConfig } from '../utils/ism.js';
 
 import { EvmTokenFeeModule } from './EvmTokenFeeModule.js';
 import { BPS, HALF_AMOUNT, MAX_FEE } from './EvmTokenFeeReader.hardhat-test.js';
-import { TokenFeeReaderParams } from './EvmTokenFeeReader.js';
 import {
+  EvmTokenFeeReader,
+  TokenFeeReaderParams,
+} from './EvmTokenFeeReader.js';
+import {
+  CrossCollateralRoutingFeeConfigSchema,
+  DEFAULT_ROUTER_KEY,
   LinearFeeConfig,
+  OffchainQuotedLinearFeeConfig,
+  ResolvedCrossCollateralRoutingFeeConfigInput,
   ResolvedTokenFeeConfigInput,
   RoutingFeeConfig,
   TokenFeeConfig,
@@ -29,7 +40,7 @@ describe('EvmTokenFeeModule', () => {
   let multiProvider: MultiProvider;
   let signer: SignerWithAddress;
   let token: ERC20Test;
-  let config: TokenFeeConfig;
+  let config: LinearFeeConfig;
 
   before(async () => {
     [signer] = await hre.ethers.getSigners();
@@ -48,6 +59,13 @@ describe('EvmTokenFeeModule', () => {
     };
   });
 
+  async function deployCrossCollateralRoutingFee(owner: string) {
+    const factory = new CrossCollateralRoutingFee__factory(signer);
+    const ccrf = await factory.deploy(owner);
+    await ccrf.deployed();
+    return ccrf;
+  }
+
   async function expectTxsAndUpdate(
     feeModule: EvmTokenFeeModule,
     config: TokenFeeConfig,
@@ -62,6 +80,24 @@ describe('EvmTokenFeeModule', () => {
     }
   }
 
+  function getLinearBps(feeConfig: TokenFeeConfig | undefined): number {
+    assert(
+      feeConfig?.type === TokenFeeType.LinearFee,
+      `Must be ${TokenFeeType.LinearFee}`,
+    );
+    assert(feeConfig.bps !== undefined, 'LinearFee must define bps');
+    return feeConfig.bps;
+  }
+
+  function getFeeToken(feeConfig: TokenFeeConfig | undefined): string {
+    assert(feeConfig, 'Fee config must exist');
+    assert(
+      feeConfig.type !== TokenFeeType.CrossCollateralRoutingFee,
+      'CrossCollateralRoutingFee does not have a token',
+    );
+    return feeConfig.token;
+  }
+
   it('should create a new token fee', async () => {
     const module = await EvmTokenFeeModule.create({
       multiProvider,
@@ -70,7 +106,11 @@ describe('EvmTokenFeeModule', () => {
     });
     const onchainConfig = await module.read();
     expect(normalizeConfig(onchainConfig)).to.deep.equal(
-      normalizeConfig({ ...config, maxFee: MAX_FEE, halfAmount: HALF_AMOUNT }),
+      normalizeConfig({
+        ...config,
+        maxFee: MAX_FEE,
+        halfAmount: HALF_AMOUNT,
+      }),
     );
   });
 
@@ -99,8 +139,6 @@ describe('EvmTokenFeeModule', () => {
       },
       owner: signer.address,
       token: token.address,
-      maxFee: constants.MaxUint256.toBigInt(),
-      halfAmount: constants.MaxUint256.toBigInt(),
       type: TokenFeeType.RoutingFee,
     };
     const module = await EvmTokenFeeModule.create({
@@ -172,7 +210,7 @@ describe('EvmTokenFeeModule', () => {
         chain: test4Chain,
         config,
       });
-      const updatedConfig = { ...config, bps: BPS + 1n };
+      const updatedConfig = { ...config, bps: BPS + 1 };
       await expectTxsAndUpdate(module, updatedConfig, 0);
       const onchainConfig = await module.read();
       assert(
@@ -182,7 +220,7 @@ describe('EvmTokenFeeModule', () => {
       expect(onchainConfig.bps).to.eql(updatedConfig.bps);
     });
 
-    it(`should redeploy immutable fees if updating token for ${TokenFeeType.RoutingFee}`, async () => {
+    it(`should redeploy routing fees when nested fee config changes`, async () => {
       const feeContracts = {
         [test4Chain]: config,
       };
@@ -202,14 +240,25 @@ describe('EvmTokenFeeModule', () => {
         feeContracts: {
           [test4Chain]: {
             ...feeContracts[test4Chain],
-            bps: BPS + 1n,
+            bps: BPS + 1,
           },
         },
       };
 
+      // 1 tx: setFeeContract to point to redeployed sub-fee
       await expectTxsAndUpdate(module, updatedConfig, 1, {
         routingDestinations: [multiProvider.getDomainId(test4Chain)],
       });
+      const onchainConfig = await module.read({
+        routingDestinations: [multiProvider.getDomainId(test4Chain)],
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.RoutingFee,
+        `Must be ${TokenFeeType.RoutingFee}`,
+      );
+      expect(getLinearBps(onchainConfig.feeContracts[test4Chain])).to.equal(
+        BPS + 1,
+      );
     });
 
     it('should transfer ownership if they are different', async () => {
@@ -231,7 +280,7 @@ describe('EvmTokenFeeModule', () => {
       );
     });
 
-    it('should transfer ownership for each routing sub fee', async () => {
+    it('should redeploy routing fees when nested owner changes', async () => {
       const feeContracts = {
         [test4Chain]: config,
       };
@@ -248,13 +297,17 @@ describe('EvmTokenFeeModule', () => {
       });
 
       const newOwner = normalizeConfig(randomAddress());
+      // 2 txs: sub-fee ownership transfer + routing fee ownership transfer
       await expectTxsAndUpdate(
         module,
         {
           ...routingFeeConfig,
           owner: newOwner,
           feeContracts: {
-            [test4Chain]: { ...feeContracts[test4Chain], owner: newOwner },
+            [test4Chain]: {
+              ...feeContracts[test4Chain],
+              owner: newOwner,
+            },
           },
         },
         2,
@@ -271,8 +324,587 @@ describe('EvmTokenFeeModule', () => {
       );
       expect(normalizeConfig(onchainConfig).owner).to.equal(newOwner);
       expect(
-        normalizeConfig(onchainConfig.feeContracts?.[test4Chain]).owner,
+        normalizeConfig(onchainConfig.feeContracts[test4Chain]).owner,
       ).to.equal(newOwner);
+    });
+
+    it('should derive routingDestinations from target config when not provided', async () => {
+      const feeContracts = {
+        [test4Chain]: config,
+      };
+      const routingFeeConfig: TokenFeeConfig = {
+        type: TokenFeeType.RoutingFee,
+        owner: signer.address,
+        token: token.address,
+        feeContracts,
+      };
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config: routingFeeConfig,
+      });
+
+      // Update without providing routingDestinations - should derive from target config
+      const updatedConfig = {
+        ...routingFeeConfig,
+        feeContracts: {
+          [test4Chain]: {
+            ...feeContracts[test4Chain],
+            bps: BPS + 1,
+          },
+        },
+      };
+
+      // 1 tx: setFeeContract to point to redeployed sub-fee
+      const txs = await module.update(updatedConfig);
+      expect(txs.length).to.equal(1);
+      for (const tx of txs) {
+        await multiProvider.sendTransaction(test4Chain, tx);
+      }
+      const onchainConfig = await module.read({
+        routingDestinations: [multiProvider.getDomainId(test4Chain)],
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.RoutingFee,
+        `Must be ${TokenFeeType.RoutingFee}`,
+      );
+      expect(getLinearBps(onchainConfig.feeContracts[test4Chain])).to.equal(
+        BPS + 1,
+      );
+    });
+
+    it('should forward token reader params when updating routing fees', async () => {
+      const routingConfig: RoutingFeeConfig = {
+        type: TokenFeeType.RoutingFee,
+        owner: signer.address,
+        token: token.address,
+        feeContracts: {
+          [test4Chain]: config,
+        },
+      };
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config: routingConfig,
+      });
+      const routingDestination = multiProvider.getDomainId(test4Chain);
+      const actualConfig = await module.read({
+        routingDestinations: [routingDestination],
+      });
+      const readStub = sinon.stub(module, 'read').resolves(actualConfig);
+
+      try {
+        const txs = await module.update(
+          {
+            type: TokenFeeType.RoutingFee,
+            owner: signer.address,
+            feeContracts: {
+              [test4Chain]: {
+                type: TokenFeeType.LinearFee,
+                owner: signer.address,
+                bps: BPS,
+              },
+            },
+          },
+          {
+            routingDestinations: [routingDestination],
+          },
+        );
+
+        expect(txs).to.have.lengthOf(0);
+        expect(readStub.calledOnce).to.be.true;
+        expect(readStub.firstCall.args[0]).to.deep.equal({
+          routingDestinations: [routingDestination],
+        });
+      } finally {
+        readStub.restore();
+      }
+    });
+
+    it('should update CCRF owner when reader params are provided', async () => {
+      const initialSubFeeModule = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config,
+      });
+      const ccrf = await deployCrossCollateralRoutingFee(signer.address);
+      const routingDestination = multiProvider.getDomainId(test4Chain);
+      await ccrf.setCrossCollateralRouterFeeContracts(
+        [routingDestination],
+        [await ccrf.DEFAULT_ROUTER()],
+        [initialSubFeeModule.serialize().deployedFee],
+      );
+
+      const routingConfig: RoutingFeeConfig = {
+        type: TokenFeeType.RoutingFee,
+        owner: signer.address,
+        token: token.address,
+        feeContracts: {},
+      };
+      const module = new EvmTokenFeeModule(multiProvider, {
+        chain: test4Chain,
+        config: routingConfig,
+        addresses: { deployedFee: ccrf.address },
+      });
+
+      const newOwner = randomAddress();
+      const txs = await module.update(
+        {
+          type: TokenFeeType.CrossCollateralRoutingFee,
+          owner: newOwner,
+          feeContracts: {
+            [test4Chain]: {
+              [DEFAULT_ROUTER_KEY]: {
+                type: TokenFeeType.LinearFee,
+                owner: signer.address,
+                bps: BPS,
+              },
+            },
+          },
+        },
+        {
+          routingDestinations: [routingDestination],
+          crossCollateralRouters: {
+            [routingDestination]: [],
+          },
+        },
+      );
+
+      expect(txs).to.have.lengthOf(1);
+      await multiProvider.sendTransaction(test4Chain, txs[0]);
+      expect(await ccrf.owner()).to.equal(
+        hre.ethers.utils.getAddress(newOwner),
+      );
+    });
+
+    it('should update CCRF sub-fee when fee contracts differ', async () => {
+      const initialSubFeeModule = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config,
+      });
+      const ccrf = await deployCrossCollateralRoutingFee(signer.address);
+
+      const routingDestination = multiProvider.getDomainId(test4Chain);
+      await ccrf.setCrossCollateralRouterFeeContracts(
+        [routingDestination],
+        [await ccrf.DEFAULT_ROUTER()],
+        [initialSubFeeModule.serialize().deployedFee],
+      );
+
+      const routingConfig: RoutingFeeConfig = {
+        type: TokenFeeType.RoutingFee,
+        owner: signer.address,
+        token: token.address,
+        feeContracts: {},
+      };
+      const module = new EvmTokenFeeModule(multiProvider, {
+        chain: test4Chain,
+        config: routingConfig,
+        addresses: { deployedFee: ccrf.address },
+      });
+
+      const txs = await module.update(
+        {
+          type: TokenFeeType.CrossCollateralRoutingFee,
+          owner: signer.address,
+          feeContracts: {
+            [test4Chain]: {
+              [DEFAULT_ROUTER_KEY]: {
+                type: TokenFeeType.LinearFee,
+                owner: signer.address,
+                bps: BPS + 1,
+              },
+            },
+          },
+        },
+        {
+          routingDestinations: [routingDestination],
+        },
+      );
+
+      expect(txs).to.have.lengthOf(1);
+      expect(module.serialize().deployedFee).to.equal(ccrf.address);
+      await multiProvider.sendTransaction(test4Chain, txs[0]);
+
+      const onchainConfig = await module.read({
+        routingDestinations: [routingDestination],
+        crossCollateralRouters: {
+          [routingDestination]: [],
+        },
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.CrossCollateralRoutingFee,
+        `Must be ${TokenFeeType.CrossCollateralRoutingFee}`,
+      );
+      assert(
+        onchainConfig.feeContracts[test4Chain]?.[DEFAULT_ROUTER_KEY]?.type ===
+          TokenFeeType.LinearFee,
+        `Must be ${TokenFeeType.LinearFee}`,
+      );
+      expect(
+        onchainConfig.feeContracts[test4Chain]?.[DEFAULT_ROUTER_KEY]?.bps,
+      ).to.equal(BPS + 1);
+    });
+
+    it('should update an empty CCRF using explicitly resolved child tokens', async () => {
+      const emptyCcrf = await deployCrossCollateralRoutingFee(signer.address);
+      const routingDestination = multiProvider.getDomainId(test4Chain);
+      const module = new EvmTokenFeeModule(multiProvider, {
+        chain: test4Chain,
+        config: CrossCollateralRoutingFeeConfigSchema.parse({
+          type: TokenFeeType.CrossCollateralRoutingFee,
+          owner: signer.address,
+          feeContracts: {},
+        }),
+        addresses: { deployedFee: emptyCcrf.address },
+      });
+
+      const targetConfig: ResolvedCrossCollateralRoutingFeeConfigInput = {
+        type: TokenFeeType.CrossCollateralRoutingFee,
+        owner: signer.address,
+        feeContracts: {
+          [test4Chain]: {
+            [DEFAULT_ROUTER_KEY]: {
+              type: TokenFeeType.LinearFee,
+              owner: signer.address,
+              token: token.address,
+              bps: BPS,
+            },
+          },
+        },
+      };
+
+      const txs = await module.update(targetConfig, {
+        routingDestinations: [routingDestination],
+        crossCollateralRouters: {
+          [routingDestination]: [],
+        },
+      });
+
+      expect(txs).to.have.lengthOf(1);
+      expect(module.serialize().deployedFee).to.equal(emptyCcrf.address);
+      await multiProvider.sendTransaction(test4Chain, txs[0]);
+
+      const onchainConfig = await module.read({
+        routingDestinations: [routingDestination],
+        crossCollateralRouters: {
+          [routingDestination]: [],
+        },
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.CrossCollateralRoutingFee,
+        `Must be ${TokenFeeType.CrossCollateralRoutingFee}`,
+      );
+      expect(
+        getFeeToken(
+          onchainConfig.feeContracts[test4Chain]?.[DEFAULT_ROUTER_KEY],
+        ),
+      ).to.equal(token.address);
+    });
+
+    it('should preserve caller-provided CCR routers when diffing for update', async () => {
+      const initialSubFeeModule = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config,
+      });
+      const ccrf = await deployCrossCollateralRoutingFee(signer.address);
+      const routerKey = hre.ethers.utils.hexZeroPad(signer.address, 32);
+      const routingDestination = multiProvider.getDomainId(test4Chain);
+
+      await ccrf.setCrossCollateralRouterFeeContracts(
+        [routingDestination],
+        [routerKey],
+        [initialSubFeeModule.serialize().deployedFee],
+      );
+
+      const module = new EvmTokenFeeModule(multiProvider, {
+        chain: test4Chain,
+        config: {
+          type: TokenFeeType.CrossCollateralRoutingFee,
+          owner: signer.address,
+          feeContracts: {
+            [test4Chain]: {
+              [routerKey]: config,
+            },
+          },
+        },
+        addresses: { deployedFee: ccrf.address },
+      });
+
+      const txs = await module.update(
+        {
+          type: TokenFeeType.CrossCollateralRoutingFee,
+          owner: signer.address,
+          feeContracts: {
+            [test4Chain]: {
+              [DEFAULT_ROUTER_KEY]: {
+                type: TokenFeeType.LinearFee,
+                owner: signer.address,
+                bps: BPS,
+              },
+            },
+          },
+        },
+        {
+          crossCollateralRouters: {
+            [routingDestination]: [routerKey],
+          },
+        },
+      );
+
+      // 2 txs: one to wire DEFAULT_ROUTER_KEY, one to clear the removed routerKey
+      expect(txs).to.have.lengthOf(2);
+      expect(module.serialize().deployedFee).to.equal(ccrf.address);
+      await multiProvider.sendTransaction(test4Chain, txs[0]);
+      await multiProvider.sendTransaction(test4Chain, txs[1]);
+
+      const onchainConfig = await module.read({
+        crossCollateralRouters: {
+          [routingDestination]: [],
+        },
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.CrossCollateralRoutingFee,
+        `Must be ${TokenFeeType.CrossCollateralRoutingFee}`,
+      );
+      expect(
+        onchainConfig.feeContracts[test4Chain]?.[DEFAULT_ROUTER_KEY]?.type,
+      ).to.equal(TokenFeeType.LinearFee);
+      // Verify the orphan routerKey pointer was actually cleared on-chain
+      expect(await ccrf.feeContracts(routingDestination, routerKey)).to.equal(
+        hre.ethers.constants.AddressZero,
+      );
+    });
+
+    it('should deploy a fresh sub-fee when two routers sharing an address diverge in target config', async () => {
+      // Arrange: one shared sub-fee; both router keys wired to it
+      const sharedSubFeeModule = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config, // bps: BPS
+      });
+      const sharedSubFeeAddr = sharedSubFeeModule.serialize().deployedFee;
+
+      const ccrf = await deployCrossCollateralRoutingFee(signer.address);
+      const routingDestination = multiProvider.getDomainId(test4Chain);
+      const routerKeyA = hre.ethers.utils.hexZeroPad('0x01', 32);
+      const routerKeyB = hre.ethers.utils.hexZeroPad('0x02', 32);
+
+      await ccrf.setCrossCollateralRouterFeeContracts(
+        [routingDestination, routingDestination],
+        [routerKeyA, routerKeyB],
+        [sharedSubFeeAddr, sharedSubFeeAddr],
+      );
+
+      const module = new EvmTokenFeeModule(multiProvider, {
+        chain: test4Chain,
+        config: CrossCollateralRoutingFeeConfigSchema.parse({
+          type: TokenFeeType.CrossCollateralRoutingFee,
+          owner: signer.address,
+          feeContracts: {},
+        }),
+        addresses: { deployedFee: ccrf.address },
+      });
+
+      // routerKeyA keeps config (bps: BPS), routerKeyB diverges — processed in A-first order
+      const txs = await module.update({
+        type: TokenFeeType.CrossCollateralRoutingFee,
+        owner: signer.address,
+        feeContracts: {
+          [test4Chain]: {
+            [routerKeyA]: config, // unchanged
+            [routerKeyB]: { ...config, bps: BPS + 5 }, // diverged
+          },
+        },
+      });
+
+      // routerKeyA: config matches, pointer stays → no tx for A
+      // routerKeyB: diverges from cached A config → split deploy, pointer updated → 1 tx
+      expect(txs).to.have.lengthOf(1);
+      await multiProvider.sendTransaction(test4Chain, txs[0]);
+
+      const addrA = await ccrf.feeContracts(routingDestination, routerKeyA);
+      const addrB = await ccrf.feeContracts(routingDestination, routerKeyB);
+
+      // routerKeyA retained the shared address (no change needed)
+      expect(addrA.toLowerCase()).to.equal(sharedSubFeeAddr.toLowerCase());
+      // routerKeyB received a fresh contract
+      expect(addrB.toLowerCase()).to.not.equal(sharedSubFeeAddr.toLowerCase());
+
+      // Both have the correct on-chain configs
+      const onchainConfig = await module.read({
+        crossCollateralRouters: {
+          [routingDestination]: [routerKeyA, routerKeyB],
+        },
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.CrossCollateralRoutingFee,
+        `Must be ${TokenFeeType.CrossCollateralRoutingFee}`,
+      );
+      expect(
+        getLinearBps(onchainConfig.feeContracts[test4Chain]?.[routerKeyA]),
+      ).to.equal(BPS);
+      expect(
+        getLinearBps(onchainConfig.feeContracts[test4Chain]?.[routerKeyB]),
+      ).to.equal(BPS + 5);
+    });
+
+    it('should produce correct per-router configs regardless of split iteration order', async () => {
+      // Same scenario as above but routerKeyB appears first in the feeContracts object,
+      // so the update loop processes it first — exercising the opposite split code path
+      // (B triggers the "first time" update+cache, A is the split deployment).
+      const sharedSubFeeModule = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config, // bps: BPS
+      });
+      const sharedSubFeeAddr = sharedSubFeeModule.serialize().deployedFee;
+
+      const ccrf = await deployCrossCollateralRoutingFee(signer.address);
+      const routingDestination = multiProvider.getDomainId(test4Chain);
+      const routerKeyA = hre.ethers.utils.hexZeroPad('0x01', 32);
+      const routerKeyB = hre.ethers.utils.hexZeroPad('0x02', 32);
+
+      await ccrf.setCrossCollateralRouterFeeContracts(
+        [routingDestination, routingDestination],
+        [routerKeyA, routerKeyB],
+        [sharedSubFeeAddr, sharedSubFeeAddr],
+      );
+
+      const module = new EvmTokenFeeModule(multiProvider, {
+        chain: test4Chain,
+        config: CrossCollateralRoutingFeeConfigSchema.parse({
+          type: TokenFeeType.CrossCollateralRoutingFee,
+          owner: signer.address,
+          feeContracts: {},
+        }),
+        addresses: { deployedFee: ccrf.address },
+      });
+
+      // B-first iteration order: routerKeyB processed before routerKeyA
+      const txs = await module.update({
+        type: TokenFeeType.CrossCollateralRoutingFee,
+        owner: signer.address,
+        feeContracts: {
+          [test4Chain]: {
+            [routerKeyB]: { ...config, bps: BPS + 5 }, // B first in insertion order
+            [routerKeyA]: config,
+          },
+        },
+      });
+
+      // B triggers a redeploy (bps changed), A then sees B's cached config ≠ A's config → split.
+      // Both pointers change → both packed into 1 setCrossCollateralRouterFeeContracts tx.
+      expect(txs).to.have.lengthOf(1);
+      await multiProvider.sendTransaction(test4Chain, txs[0]);
+
+      const addrA = await ccrf.feeContracts(routingDestination, routerKeyA);
+      const addrB = await ccrf.feeContracts(routingDestination, routerKeyB);
+
+      // Both routers now have their own unique contracts (neither retained sharedAddr)
+      expect(addrA.toLowerCase()).to.not.equal(sharedSubFeeAddr.toLowerCase());
+      expect(addrB.toLowerCase()).to.not.equal(sharedSubFeeAddr.toLowerCase());
+      expect(addrA.toLowerCase()).to.not.equal(addrB.toLowerCase());
+
+      // Config correctness: same outcome as A-first order
+      const onchainConfig = await module.read({
+        crossCollateralRouters: {
+          [routingDestination]: [routerKeyA, routerKeyB],
+        },
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.CrossCollateralRoutingFee,
+        `Must be ${TokenFeeType.CrossCollateralRoutingFee}`,
+      );
+      expect(
+        getLinearBps(onchainConfig.feeContracts[test4Chain]?.[routerKeyA]),
+      ).to.equal(BPS);
+      expect(
+        getLinearBps(onchainConfig.feeContracts[test4Chain]?.[routerKeyB]),
+      ).to.equal(BPS + 5);
+    });
+
+    it('should redeploy when fee type changes', async () => {
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config,
+      });
+      const initialFeeAddress = module.serialize().deployedFee;
+      const routingDestination = multiProvider.getDomainId(test4Chain);
+      const txs = await module.update({
+        type: TokenFeeType.RoutingFee,
+        owner: signer.address,
+        feeContracts: {
+          [test4Chain]: {
+            type: TokenFeeType.LinearFee,
+            owner: signer.address,
+            bps: BPS,
+          },
+        },
+      });
+
+      expect(txs).to.have.lengthOf(0);
+      expect(module.serialize().deployedFee).to.not.equal(initialFeeAddress);
+      const onchainConfig = await module.read({
+        routingDestinations: [routingDestination],
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.RoutingFee,
+        `Must be ${TokenFeeType.RoutingFee}`,
+      );
+    });
+
+    it('should redeploy routing fee when adding a new destination', async () => {
+      // Create a routing fee with one destination
+      const initialFeeContracts = {
+        [test4Chain]: config,
+      };
+      const routingFeeConfig: TokenFeeConfig = {
+        type: TokenFeeType.RoutingFee,
+        owner: signer.address,
+        token: token.address,
+        feeContracts: initialFeeContracts,
+      };
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config: routingFeeConfig,
+      });
+
+      // Update with an additional destination (test1)
+      const test1Chain = TestChainName.test1;
+      const updatedConfig: RoutingFeeConfig = {
+        ...routingFeeConfig,
+        feeContracts: {
+          [test4Chain]: initialFeeContracts[test4Chain],
+          [test1Chain]: {
+            ...config,
+            // New destination - should trigger deployment
+          },
+        },
+      };
+
+      // 1 tx: setFeeContract for the new destination
+      const txs = await module.update(updatedConfig);
+      expect(txs.length).to.equal(1);
+      for (const tx of txs) {
+        await multiProvider.sendTransaction(test4Chain, tx);
+      }
+
+      const onchainConfig = await module.read({
+        routingDestinations: [
+          multiProvider.getDomainId(test4Chain),
+          multiProvider.getDomainId(test1Chain),
+        ],
+      });
+      assert(
+        onchainConfig.type === TokenFeeType.RoutingFee,
+        `Must be ${TokenFeeType.RoutingFee}`,
+      );
+      expect(onchainConfig.feeContracts[test1Chain]).to.not.be.undefined;
     });
   });
 
@@ -286,7 +918,7 @@ describe('EvmTokenFeeModule', () => {
         type: TokenFeeType.LinearFee,
         owner: signer.address,
         token: zeroSupplyToken.address,
-        bps: 8n,
+        bps: 8,
       };
 
       const expandedConfig = await EvmTokenFeeModule.expandConfig({
@@ -299,16 +931,16 @@ describe('EvmTokenFeeModule', () => {
         expandedConfig.type === TokenFeeType.LinearFee,
         `Must be ${TokenFeeType.LinearFee}`,
       );
-      const linearConfig = expandedConfig as LinearFeeConfig;
-      expect(linearConfig.maxFee > 0n).to.be.true;
-      expect(linearConfig.halfAmount > 0n).to.be.true;
-      expect(linearConfig.bps).to.equal(8n);
+
+      expect(expandedConfig.maxFee > 0n).to.be.true;
+      expect(expandedConfig.halfAmount > 0n).to.be.true;
+      expect(expandedConfig.bps).to.equal(8);
 
       const roundTripBps = convertToBps(
-        linearConfig.maxFee,
-        linearConfig.halfAmount,
+        expandedConfig.maxFee,
+        expandedConfig.halfAmount,
       );
-      expect(roundTripBps).to.equal(8n);
+      expect(roundTripBps).to.equal(8);
     });
 
     it('should expand nested RoutingFee config for zero-supply token', async () => {
@@ -325,7 +957,7 @@ describe('EvmTokenFeeModule', () => {
             type: TokenFeeType.LinearFee,
             owner: signer.address,
             token: zeroSupplyToken.address,
-            bps: 8n,
+            bps: 8,
           },
         },
       };
@@ -341,7 +973,7 @@ describe('EvmTokenFeeModule', () => {
         `Must be ${TokenFeeType.RoutingFee}`,
       );
       const routingConfig = expandedConfig as RoutingFeeConfig;
-      const nestedFee = routingConfig.feeContracts?.[test4Chain];
+      const nestedFee = routingConfig.feeContracts[test4Chain];
       assert(nestedFee, 'Nested fee must exist');
       assert(
         nestedFee.type === TokenFeeType.LinearFee,
@@ -351,7 +983,7 @@ describe('EvmTokenFeeModule', () => {
       const linearFee = nestedFee as LinearFeeConfig;
       expect(linearFee.maxFee > 0n).to.be.true;
       expect(linearFee.halfAmount > 0n).to.be.true;
-      expect(linearFee.bps).to.equal(8n);
+      expect(linearFee.bps).to.equal(8);
     });
 
     it('should expand config with explicit maxFee/halfAmount (no bps) and preserve values', async () => {
@@ -379,11 +1011,10 @@ describe('EvmTokenFeeModule', () => {
         expandedConfig.type === TokenFeeType.LinearFee,
         `Must be ${TokenFeeType.LinearFee}`,
       );
-      const linearConfig = expandedConfig as LinearFeeConfig;
 
-      expect(linearConfig.maxFee).to.equal(explicitMaxFee);
-      expect(linearConfig.halfAmount).to.equal(explicitHalfAmount);
-      expect(linearConfig.bps).to.equal(expectedBps);
+      expect(expandedConfig.maxFee).to.equal(explicitMaxFee);
+      expect(expandedConfig.halfAmount).to.equal(explicitHalfAmount);
+      expect(expandedConfig.bps).to.equal(expectedBps);
     });
 
     it('should expand nested RoutingFee with explicit maxFee/halfAmount in child LinearFee', async () => {
@@ -404,7 +1035,7 @@ describe('EvmTokenFeeModule', () => {
             halfAmount: explicitHalfAmount,
           },
         },
-      } as ResolvedTokenFeeConfigInput;
+      } as unknown as ResolvedTokenFeeConfigInput;
 
       const expandedConfig = await EvmTokenFeeModule.expandConfig({
         config: inputConfig,
@@ -417,7 +1048,7 @@ describe('EvmTokenFeeModule', () => {
         `Must be ${TokenFeeType.RoutingFee}`,
       );
       const routingConfig = expandedConfig as RoutingFeeConfig;
-      const nestedFee = routingConfig.feeContracts?.[test4Chain];
+      const nestedFee = routingConfig.feeContracts[test4Chain];
       assert(nestedFee, 'Nested fee must exist');
       assert(
         nestedFee.type === TokenFeeType.LinearFee,
@@ -438,10 +1069,10 @@ describe('EvmTokenFeeModule', () => {
           [test4Chain]: {
             type: TokenFeeType.LinearFee,
             owner: signer.address,
-            bps: 8n,
+            bps: 8,
           },
         },
-      } as ResolvedTokenFeeConfigInput;
+      } as unknown as ResolvedTokenFeeConfigInput;
 
       const expandedConfig = await EvmTokenFeeModule.expandConfig({
         config: inputConfig,
@@ -454,9 +1085,153 @@ describe('EvmTokenFeeModule', () => {
         `Must be ${TokenFeeType.RoutingFee}`,
       );
       const routingConfig = expandedConfig as RoutingFeeConfig;
-      const nestedFee = routingConfig.feeContracts?.[test4Chain];
+      const nestedFee = routingConfig.feeContracts[test4Chain];
       assert(nestedFee, 'Nested fee must exist');
-      expect(nestedFee.token).to.equal(token.address);
+      expect(getFeeToken(nestedFee)).to.equal(token.address);
+    });
+
+    it('should expand config with fractional bps (1.5)', async () => {
+      const reader = new EvmTokenFeeReader(multiProvider, test4Chain);
+      const expected = reader.convertFromBps(1.5);
+
+      const inputConfig: ResolvedTokenFeeConfigInput = {
+        type: TokenFeeType.LinearFee,
+        owner: signer.address,
+        token: token.address,
+        bps: 1.5,
+      };
+
+      const expandedConfig = await EvmTokenFeeModule.expandConfig({
+        config: inputConfig,
+        multiProvider,
+        chainName: test4Chain,
+      });
+
+      assert(
+        expandedConfig.type === TokenFeeType.LinearFee,
+        `Must be ${TokenFeeType.LinearFee}`,
+      );
+
+      expect(expandedConfig.maxFee).to.equal(expected.maxFee);
+      expect(expandedConfig.halfAmount).to.equal(expected.halfAmount);
+      expect(expandedConfig.bps).to.equal(1.5);
+    });
+  });
+
+  describe('OffchainQuotedLinearFee', () => {
+    let offchainConfig: OffchainQuotedLinearFeeConfig;
+
+    before(() => {
+      offchainConfig = TokenFeeConfigSchema.parse({
+        type: TokenFeeType.OffchainQuotedLinearFee,
+        owner: signer.address,
+        token: token.address,
+        maxFee: MAX_FEE,
+        halfAmount: HALF_AMOUNT,
+        bps: BPS,
+        quoteSigners: [signer.address],
+      }) as OffchainQuotedLinearFeeConfig;
+    });
+
+    it('should create and read OffchainQuotedLinearFee', async () => {
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config: offchainConfig,
+      });
+      const onchainConfig = await module.read();
+      expect(normalizeConfig(onchainConfig)).to.deep.equal(
+        normalizeConfig(offchainConfig),
+      );
+    });
+
+    it('should not update if configs are the same', async () => {
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config: offchainConfig,
+      });
+      const txs = await module.update(offchainConfig);
+      expect(txs).to.have.lengthOf(0);
+    });
+
+    it('should redeploy if fee params change', async () => {
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config: offchainConfig,
+      });
+      const updatedConfig = { ...offchainConfig, bps: BPS + 1 };
+      await expectTxsAndUpdate(module, updatedConfig, 0);
+      const onchainConfig = await module.read();
+      assert(
+        onchainConfig.type === TokenFeeType.OffchainQuotedLinearFee,
+        `Must be ${TokenFeeType.OffchainQuotedLinearFee}`,
+      );
+      expect(onchainConfig.bps).to.eql(updatedConfig.bps);
+    });
+
+    it('should redeploy when transitioning from LinearFee to OffchainQuotedLinearFee', async () => {
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config, // LinearFee
+      });
+      // 0 txs because redeploy happens inline
+      await expectTxsAndUpdate(module, offchainConfig, 0);
+      const onchainConfig = await module.read();
+      assert(
+        onchainConfig.type === TokenFeeType.OffchainQuotedLinearFee,
+        `Must be ${TokenFeeType.OffchainQuotedLinearFee}`,
+      );
+    });
+
+    it('should update signers without redeploying', async () => {
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config: offchainConfig,
+      });
+      const [, otherSigner] = await hre.ethers.getSigners();
+      const updatedConfig: OffchainQuotedLinearFeeConfig = {
+        ...offchainConfig,
+        quoteSigners: [signer.address, otherSigner.address],
+      };
+      // 1 tx to add the new signer
+      await expectTxsAndUpdate(module, updatedConfig, 1);
+      const onchainConfig = await module.read();
+      assert(
+        onchainConfig.type === TokenFeeType.OffchainQuotedLinearFee,
+        `Must be ${TokenFeeType.OffchainQuotedLinearFee}`,
+      );
+      expect(onchainConfig.quoteSigners).to.have.lengthOf(2);
+      expect(onchainConfig.quoteSigners).to.include(otherSigner.address);
+    });
+
+    it('should remove signers without redeploying', async () => {
+      const [, otherSigner] = await hre.ethers.getSigners();
+      const twoSignerConfig: OffchainQuotedLinearFeeConfig = {
+        ...offchainConfig,
+        quoteSigners: [signer.address, otherSigner.address],
+      };
+      const module = await EvmTokenFeeModule.create({
+        multiProvider,
+        chain: test4Chain,
+        config: twoSignerConfig,
+      });
+      const updatedConfig: OffchainQuotedLinearFeeConfig = {
+        ...offchainConfig,
+        quoteSigners: [signer.address],
+      };
+      // 1 tx to remove the other signer
+      await expectTxsAndUpdate(module, updatedConfig, 1);
+      const onchainConfig = await module.read();
+      assert(
+        onchainConfig.type === TokenFeeType.OffchainQuotedLinearFee,
+        `Must be ${TokenFeeType.OffchainQuotedLinearFee}`,
+      );
+      expect(onchainConfig.quoteSigners).to.have.lengthOf(1);
+      expect(onchainConfig.quoteSigners).to.include(signer.address);
     });
   });
 });

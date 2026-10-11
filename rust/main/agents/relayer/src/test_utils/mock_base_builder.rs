@@ -10,9 +10,10 @@ use hyperlane_base::{
 };
 use hyperlane_core::{
     accumulator::merkle::Proof, AggregationIsm, CcipReadIsm, Checkpoint, HyperlaneDomain,
-    HyperlaneMessage, InterchainSecurityModule, Mailbox, MultisigIsm, RoutingIsm, H256,
+    HyperlaneMessage, InterchainSecurityModule, Mailbox, MultisigIsm, RoutingIsm, H256, H512,
 };
 use hyperlane_ethereum::Signers;
+use hyperlane_sealevel::SealevelCompositeIsm;
 use hyperlane_test::mocks::MockMailboxContract;
 
 use crate::{
@@ -191,6 +192,12 @@ impl BuildsBaseMetadata for MockBaseMetadataBuilder {
             .pop_front()
             .expect("No mock get_merkle_leaf_id_by_message_id response set")
     }
+    async fn retrieve_origin_tx_hash_by_message_id(
+        &self,
+        _message_id: H256,
+    ) -> eyre::Result<Option<H512>> {
+        Ok(None)
+    }
     async fn build_ism(&self, address: H256) -> eyre::Result<Box<dyn InterchainSecurityModule>> {
         self.responses
             .build_ism
@@ -237,6 +244,12 @@ impl BuildsBaseMetadata for MockBaseMetadataBuilder {
             .pop_front()
             .expect("No mock build_ccip_read_ism response set")
     }
+    async fn build_sealevel_composite_ism(
+        &self,
+        _address: H256,
+    ) -> eyre::Result<Arc<SealevelCompositeIsm>> {
+        unimplemented!("SealevelCompositeIsm not mocked")
+    }
     async fn build_checkpoint_syncer(
         &self,
         _message: &HyperlaneMessage,
@@ -278,7 +291,8 @@ pub fn build_mock_base_builder(
                 None,
             )])),
             "test-app-context".to_string(),
-        )],
+        )]
+        .into(),
     );
     base_builder.responses.app_context_classifier = Some(app_context_classifier);
     base_builder.responses.ism_cache_policy_classifier = Some(IsmCachePolicyClassifier::new(

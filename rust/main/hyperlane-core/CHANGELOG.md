@@ -1,3 +1,28 @@
+## [2.3.0] - 2026-07-20
+
+* chore: jun 5 deprecations (21 chains) (#8860)
+* chore: remove july 2026 deprecated chains (#9043)
+* feat: apr 6 deprecations (#8518)
+* feat: deploy to seismictestnet (#8852)
+* feat: faster polling for validator signatures (#8843)
+* feat: index same chain ccr swaps (#8796)
+* feat: relayer api (#8364)
+* feat: sealevel metaswaps reveals (#8930)
+* fix(agents): scale wallet balance metric by configured native token decimals (#9017)
+* fix: relay api gas payments (#8690)
+* fix: retry ICA reveal messages when commit is not yet confirmed (#8836)
+* refactor(evm): remove evm tron techstack (#8408)
+
+## [2.1.0] - 2026-03-04
+
+* chore: enable modetestnet again (#8057)
+* feat(agents): add chain configuration metrics (#8185)
+* feat(tron): add ethereum compatibility & tron aws signer (#8222)
+* feat(tron): protocol type (#7827)
+* fix: aleo metadata builder (#7954)
+* fix: use correct decimals for Aleo wallet balance metric (#8097)
+* tidying up
+
 ## [2.0.0] - 2026-01-06
 
 * chore: aleo testnet deployment (#7589)

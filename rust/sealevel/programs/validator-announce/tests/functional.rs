@@ -8,13 +8,13 @@ use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey,
     pubkey::Pubkey,
-    system_program,
 };
 use solana_program_test::*;
 use solana_sdk::{
     instruction::InstructionError, signature::Signer, signer::keypair::Keypair,
     transaction::TransactionError,
 };
+use solana_system_interface::program as system_program;
 
 use hyperlane_sealevel_validator_announce::{
     accounts::{
@@ -29,6 +29,8 @@ use hyperlane_sealevel_validator_announce::{
     validator_storage_locations_pda_seeds,
 };
 use hyperlane_test_utils::{assert_transaction_error, process_instruction};
+use serializable_account_meta::SimulationReturnData;
+use solana_sdk::{message::Message, transaction::Transaction};
 
 // The Ethereum mailbox & domain chosen for easy testing
 const TEST_MAILBOX: &str = "00000000000000000000000035231d4c2d8b8adcb5617a638a0c4548684c7c70";
@@ -40,7 +42,8 @@ fn validator_announce_id() -> Pubkey {
 
 fn get_test_mailbox() -> Pubkey {
     let mailbox_bytes = hex::decode(TEST_MAILBOX).unwrap();
-    Pubkey::new(&mailbox_bytes[..])
+    let mailbox_array: [u8; 32] = mailbox_bytes.try_into().unwrap();
+    Pubkey::new_from_array(mailbox_array)
 }
 
 fn get_test_announcements() -> Vec<(Announcement, Vec<u8>)> {
@@ -248,8 +251,7 @@ async fn assert_successful_announcement(
     assert_eq!(
         validator_storage_locations_account.data.len(),
         // Plus 1 for the initialized byte
-        expected_validator_storage_locations
-            .try_to_vec()
+        borsh::to_vec(&expected_validator_storage_locations)
             .unwrap()
             .len()
             + 1,
@@ -379,4 +381,42 @@ async fn test_announce() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_get_program_version() {
+    let program_id = validator_announce_id();
+    let (banks_client, payer, _recent_blockhash) = ProgramTest::new(
+        "hyperlane_sealevel_validator_announce",
+        program_id,
+        processor!(validator_announce_process_instruction),
+    )
+    .start()
+    .await;
+
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &package_versioned::get_program_version_instruction_data(),
+        vec![],
+    );
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await.unwrap();
+    let simulation = banks_client
+        .simulate_transaction(Transaction::new_unsigned(Message::new_with_blockhash(
+            &[ix],
+            Some(&payer.pubkey()),
+            &recent_blockhash,
+        )))
+        .await
+        .unwrap();
+
+    assert!(simulation.result.unwrap().is_ok());
+    let return_data = simulation
+        .simulation_details
+        .unwrap()
+        .return_data
+        .expect("no return data");
+    let result: SimulationReturnData<String> =
+        borsh::from_slice(&return_data.data).expect("failed to deserialize");
+    assert_eq!(result.return_data, package_versioned::PACKAGE_VERSION);
 }

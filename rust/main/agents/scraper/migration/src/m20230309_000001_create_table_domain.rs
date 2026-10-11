@@ -256,14 +256,6 @@ const DOMAINS: &[RawDomain] = &[
         is_deprecated: false,
     },
     RawDomain {
-        name: "moonbeam",
-        token: "GLMR",
-        domain: 1284,
-        chain_id: 1284,
-        is_test_net: false,
-        is_deprecated: false,
-    },
-    RawDomain {
         name: "neutron",
         token: "NTRN",
         domain: 1853125230,
@@ -301,22 +293,6 @@ const DOMAINS: &[RawDomain] = &[
         domain: 80002,
         chain_id: 80002,
         is_test_net: true,
-        is_deprecated: false,
-    },
-    RawDomain {
-        name: "polygonzkevm",
-        token: "ETH",
-        domain: 1101,
-        chain_id: 1101,
-        is_test_net: false,
-        is_deprecated: false,
-    },
-    RawDomain {
-        name: "scroll",
-        token: "ETH",
-        domain: 534352,
-        chain_id: 534352,
-        is_test_net: false,
         is_deprecated: false,
     },
     RawDomain {
@@ -415,14 +391,6 @@ const DOMAINS: &[RawDomain] = &[
         is_test_net: false,
         is_deprecated: false,
     },
-    RawDomain {
-        name: "zoramainnet",
-        token: "ETH",
-        domain: 7777777,
-        chain_id: 7777777,
-        is_test_net: false,
-        is_deprecated: false,
-    },
     // ---------- End: Mainnets and Testnets (alphabetically sorted) ---------------
     // ---------- Begin: E2E tests chains ------------------------------------------
     RawDomain {
@@ -482,6 +450,14 @@ const DOMAINS: &[RawDomain] = &[
         is_deprecated: false,
     },
     RawDomain {
+        name: "sealeveltest3",
+        token: "SOL",
+        domain: 13377,
+        chain_id: 13377,
+        is_test_net: true,
+        is_deprecated: false,
+    },
+    RawDomain {
         name: "cosmostestnative1",
         token: "KYVE",
         domain: 75898670,
@@ -528,6 +504,22 @@ const DOMAINS: &[RawDomain] = &[
         chain_id: 9913375,
         is_test_net: true,
         is_deprecated: false,
+    },
+    RawDomain {
+        name: "trontest1",
+        token: "TRX",
+        domain: 1212538670,
+        chain_id: 1212538670,
+        is_test_net: true,
+        is_deprecated: false,
+    },
+    RawDomain {
+        name: "trontest2",
+        token: "TRX",
+        domain: 1212538671,
+        chain_id: 1212538671,
+        is_test_net: true,
+        is_deprecated: false,
     }, // ---------- End: E2E tests chains ----------------
 ];
 
@@ -552,7 +544,7 @@ impl MigrationTrait for Migration {
                         ColumnDef::new(Domain::TimeCreated)
                             .timestamp()
                             .not_null()
-                            .default("NOW()"),
+                            .default(SimpleExpr::Custom("NOW()".to_owned())),
                     )
                     .col(ColumnDef::new(Domain::TimeUpdated).timestamp().not_null())
                     .col(ColumnDef::new(Domain::Name).text().not_null())

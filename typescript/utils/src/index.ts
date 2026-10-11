@@ -1,4 +1,5 @@
 export {
+  hexToBech32mPrefix,
   hexToRadixCustomPrefix,
   addressToByteHexString,
   addressToBytes,
@@ -9,6 +10,7 @@ export {
   addressToBytesStarknet,
   addressToBytesRadix,
   addressToBytesAleo,
+  addressToBytesTron,
   bytes32ToAddress,
   bytesToAddressCosmos,
   bytesToAddressEvm,
@@ -16,6 +18,7 @@ export {
   bytesToAddressStarknet,
   bytesToAddressRadix,
   bytesToAddressAleo,
+  bytesToAddressTron,
   bytesToProtocolAddress,
   capitalizeAddress,
   convertToProtocolAddress,
@@ -27,6 +30,8 @@ export {
   eqAddressStarknet,
   eqAddressRadix,
   eqAddressAleo,
+  eqOptionalAddress,
+  eqAddressTron,
   getAddressProtocolType,
   isAddress,
   isAddressCosmos,
@@ -36,6 +41,7 @@ export {
   isAddressStarknet,
   isAddressRadix,
   isAddressAleo,
+  isAddressTron,
   isValidAddress,
   isValidAddressCosmos,
   isValidAddressEvm,
@@ -43,6 +49,7 @@ export {
   isValidAddressStarknet,
   isValidAddressRadix,
   isValidAddressAleo,
+  isValidAddressTron,
   isPrivateKeyEvm,
   isValidTransactionHash,
   isValidTransactionHashCosmos,
@@ -51,7 +58,10 @@ export {
   isValidTransactionHashStarknet,
   isValidTransactionHashRadix,
   isValidTransactionHashAleo,
+  isValidTransactionHashTron,
+  isEmptyAddress,
   isZeroishAddress,
+  isZeroishAddressEvm,
   normalizeAddress,
   normalizeAddressCosmos,
   normalizeAddressEvm,
@@ -59,6 +69,7 @@ export {
   normalizeAddressStarknet,
   normalizeAddressRadix,
   normalizeAddressAleo,
+  normalizeAddressTron,
   padBytesToLength,
   shortenAddress,
   strip0x,
@@ -75,16 +86,29 @@ export {
   toWei,
   tryParseAmount,
 } from './amount.js';
-export { chunk, exclude, randomElement, arrayEqual } from './arrays.js';
 export {
+  chunk,
+  exclude,
+  randomElement,
+  arrayEqual,
+  isNonEmptyArray,
+  nonEmptyArray,
+  type NonEmptyArray,
+} from './arrays.js';
+export {
+  AllSettledResult,
   concurrentMap,
   fetchWithTimeout,
+  LazyAsync,
+  mapAllSettled,
   pollAsync,
   raceWithContext,
   retryAsync,
   runWithTimeout,
   sleep,
+  timedAsync,
   timeout,
+  tryFn,
 } from './async.js';
 export { base58ToBuffer, bufferToBase58, hexOrBase58ToHex } from './base58.js';
 export { fromBase64, toBase64 } from './base64.js';
@@ -122,11 +146,17 @@ export {
 export type { Logger } from './logging.js';
 export { mean, median, randomInt, stdDev, sum } from './math.js';
 export {
+  extractRefundAddressFromMetadata,
   formatMessage,
+  formatStandardHookMetadata,
+  hasValidRefundAddress,
   messageId,
   parseMessage,
+  parseStandardHookMetadata,
   parseWarpRouteMessage,
+  syntheticCcrSwapMessageId,
 } from './messages.js';
+export type { StandardHookMetadataParams } from './messages.js';
 export {
   formatLegacyMultisigIsmMetadata,
   parseLegacyMultisigIsmMetadata,
@@ -162,11 +192,16 @@ export {
 } from './objects.js';
 export { Result, failure, success } from './result.js';
 export {
+  applyRpcUrlOverridesFromEnv,
+  type ChainMetadataWithRpcUrls,
+} from './rpc.js';
+export {
   difference,
   intersection,
   setEquality,
   symmetricDifference,
 } from './sets.js';
+export { formatError } from './errors.js';
 export {
   errorToString,
   fromHexString,
@@ -191,6 +226,7 @@ export {
   Domain,
   EvmChainId,
   HexString,
+  KnownProtocolType,
   MerkleProof,
   MessageStatus,
   Numberish,
@@ -198,6 +234,7 @@ export {
   ParsedMessage,
   ProtocolSmallestUnit,
   ProtocolType,
+  isEVMLike,
   ProtocolTypeValue,
   ReorgEvent,
   S3Announcement,
@@ -206,10 +243,19 @@ export {
   SignatureLike,
   TokenCaip19Id,
   ValidatorMetadata,
+  ValidatorMetadataRpcEntry,
   WithAddress,
+  validatorMetadataRpcUrlHash,
 } from './types.js';
 export { isHttpsUrl, isRelativeUrl, isUrl } from './url.js';
 export { assert } from './validation.js';
 export { BaseValidator, ValidatorConfig } from './validator.js';
-export { tryParseJsonOrYaml } from './yaml.js';
+export {
+  tryParseJsonOrYaml,
+  sortNestedArrays,
+  sortObjectKeys,
+  transformYaml,
+  WARP_YAML_SORT_CONFIG,
+} from './yaml.js';
+export type { ArraySortConfig } from './yaml.js';
 export { createServiceLogger } from './logging.js';

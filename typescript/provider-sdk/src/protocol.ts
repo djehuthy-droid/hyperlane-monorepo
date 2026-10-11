@@ -1,38 +1,21 @@
-import { assert } from '@hyperlane-xyz/utils';
+import { type NonEmptyArray, assert } from '@hyperlane-xyz/utils';
 
 import { IProvider, ISigner } from './altvm.js';
-import { ChainMetadataForAltVM } from './chain.js';
+import type { ChainMetadataForAltVM } from './chain.js';
+import { IRawHookArtifactManager } from './hook.js';
 import { IRawIsmArtifactManager } from './ism.js';
+import { IRawMailboxArtifactManager } from './mailbox.js';
 import { MinimumRequiredGasByAction } from './mingas.js';
 import { AnnotatedTx, TxReceipt } from './module.js';
+import { ProtocolType } from './protocolType.js';
 import {
   ITransactionSubmitter,
   JsonRpcSubmitterConfig,
   TransactionSubmitterConfig,
 } from './submitter.js';
-
-export enum ProtocolType {
-  Ethereum = 'ethereum',
-  Sealevel = 'sealevel',
-  Cosmos = 'cosmos',
-  CosmosNative = 'cosmosnative',
-  Starknet = 'starknet',
-  Radix = 'radix',
-  Aleo = 'aleo',
-}
-
-// A type that also allows for literal values of the enum
-export type ProtocolTypeValue = `${ProtocolType}`;
-
-export const ProtocolSmallestUnit = {
-  [ProtocolType.Ethereum]: 'wei',
-  [ProtocolType.Sealevel]: 'lamports',
-  [ProtocolType.Cosmos]: 'uATOM',
-  [ProtocolType.CosmosNative]: 'uATOM',
-  [ProtocolType.Starknet]: 'fri',
-  [ProtocolType.Radix]: 'attos',
-  [ProtocolType.Aleo]: 'microcredits',
-};
+import { type FeeReadContext, IRawFeeArtifactManager } from './fee.js';
+import { IRawWarpArtifactManager } from './warp.js';
+import { IRawValidatorAnnounceArtifactManager } from './validator-announce.js';
 
 export type SignerConfig = Pick<
   JsonRpcSubmitterConfig,
@@ -61,11 +44,85 @@ export interface ProtocolProvider {
    * that handle ISM operations using the Artifact API pattern.
    *
    * @param chainMetadata Chain metadata for the target chain
+   * @param context Optional context. `knownDomainIds` lists the origin domains a
+   * reader should probe for ISMs that hold per-domain state which cannot be
+   * enumerated from chain (e.g. routingMessageIdMultisigIsm)
    * @returns A protocol-specific ISM artifact manager
    */
   createIsmArtifactManager(
     chainMetadata: ChainMetadataForAltVM,
+    context?: { knownDomainIds?: NonEmptyArray<number> },
   ): IRawIsmArtifactManager;
+
+  /**
+   * Creates a Hook artifact manager for the protocol.
+   * The artifact manager provides protocol-specific readers and writers
+   * that handle Hook operations using the Artifact API pattern.
+   *
+   * @param chainMetadata Chain metadata for the target chain
+   * @param context Optional deployment context (mailbox address, etc.) needed by some hook types
+   * @returns A protocol-specific Hook artifact manager
+   */
+  createHookArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+    context?: { mailbox?: string },
+  ): IRawHookArtifactManager;
+
+  /**
+   * Creates a Warp artifact manager for the protocol.
+   * The artifact manager provides protocol-specific readers and writers
+   * that handle warp token operations using the Artifact API pattern.
+   *
+   * @param chainMetadata Chain metadata for the target chain
+   * @param context Optional deployment context (mailbox address, etc.)
+   * @returns A protocol-specific Warp artifact manager
+   */
+  createWarpArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+    context?: { mailbox?: string },
+  ): IRawWarpArtifactManager;
+
+  /**
+   * Creates a Mailbox artifact manager for the protocol.
+   * The artifact manager provides protocol-specific readers and writers
+   * that handle Mailbox operations using the Artifact API pattern.
+   *
+   * @param chainMetadata Chain metadata for the target chain
+   * @returns A protocol-specific Mailbox artifact manager
+   */
+  createMailboxArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+  ): IRawMailboxArtifactManager;
+
+  /**
+   * Creates a Validator Announce artifact manager for the protocol.
+   * The artifact manager provides protocol-specific readers and writers
+   * that handle Validator Announce operations using the Artifact API pattern.
+   *
+   * Not all protocols support validator announce (e.g., Cosmos does not).
+   *
+   * @param chainMetadata Chain metadata for the target chain
+   * @returns A protocol-specific Validator Announce artifact manager, or null if not supported
+   */
+  createValidatorAnnounceArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+  ): IRawValidatorAnnounceArtifactManager | null;
+
+  /**
+   * Creates a Fee artifact manager for the protocol.
+   * The artifact manager provides protocol-specific readers and writers
+   * that handle fee operations using the Artifact API pattern.
+   *
+   * Not all protocols support fee programs.
+   *
+   * @param chainMetadata Chain metadata for the target chain
+   * @param context Fee read context with known routers per domain
+   * @returns A protocol-specific Fee artifact manager, or null if not supported
+   */
+  createFeeArtifactManager(
+    chainMetadata: ChainMetadataForAltVM,
+    context: FeeReadContext,
+  ): IRawFeeArtifactManager | null;
 
   getMinGas(): MinimumRequiredGasByAction;
 }

@@ -10,6 +10,7 @@ use snarkvm::prelude::{
     Authorization, Network, Plaintext, Program, ProgramID, StatePath, Transaction,
 };
 use snarkvm_console_account::Field;
+use snarkvm_console_account::ToBytes;
 use tokio::runtime::Handle;
 use tokio::task::block_in_place;
 use url::Url;
@@ -17,8 +18,11 @@ use url::Url;
 use aleo_serialize::AleoSerialize;
 use hyperlane_core::{ChainResult, H512};
 
-use crate::utils::get_tx_id;
-use crate::{CurrentNetwork, HyperlaneAleoError, ProvingRequest, ProvingResponse};
+use crate::utils::{encrypt_message, get_tx_id};
+use crate::{
+    CurrentNetwork, EncryptedProvingRequest, HyperlaneAleoError, ProvingRequest, ProvingResponse,
+    X25519PublicKey,
+};
 
 /// Aleo Http Client trait alias
 pub trait AleoClient: HttpClient + Clone + std::fmt::Debug + Send + Sync + 'static {}
@@ -39,6 +43,13 @@ pub trait HttpClient {
         path: &str,
         query: impl Into<Option<serde_json::Value>> + Send,
     ) -> ChainResult<T>;
+
+    /// Makes a GET request where HTTP 404 means the resource does not exist.
+    async fn request_optional<T: DeserializeOwned + Send>(
+        &self,
+        path: &str,
+        query: impl Into<Option<serde_json::Value>> + Send,
+    ) -> ChainResult<Option<T>>;
 
     /// Makes a GET request to the API in a blocking manner
     fn request_blocking<T: DeserializeOwned + Send>(
@@ -236,6 +247,16 @@ impl<Client: HttpClient> RpcClient<Client> {
             .await
     }
 
+    /// Gets a confirmed transaction by ID, returning `None` when it is not found.
+    pub async fn get_confirmed_transaction_optional(
+        &self,
+        transaction_id: H512,
+    ) -> ChainResult<Option<ConfirmedTransaction<CurrentNetwork>>> {
+        let tx_id = get_tx_id::<CurrentNetwork>(transaction_id)?;
+        self.request_optional(&format!("transaction/confirmed/{tx_id}"), None)
+            .await
+    }
+
     /// Gets an unconfirmed transaction by ID from the mempool
     pub async fn get_unconfirmed_transaction(
         &self,
@@ -243,6 +264,16 @@ impl<Client: HttpClient> RpcClient<Client> {
     ) -> ChainResult<Transaction<CurrentNetwork>> {
         let tx_id = crate::utils::get_tx_id::<CurrentNetwork>(transaction_id)?;
         self.request(&format!("transaction/unconfirmed/{tx_id}"), None)
+            .await
+    }
+
+    /// Gets an unconfirmed transaction by ID, returning `None` when it is not found.
+    pub async fn get_unconfirmed_transaction_optional(
+        &self,
+        transaction_id: H512,
+    ) -> ChainResult<Option<Transaction<CurrentNetwork>>> {
+        let tx_id = crate::utils::get_tx_id::<CurrentNetwork>(transaction_id)?;
+        self.request_optional(&format!("transaction/unconfirmed/{tx_id}"), None)
             .await
     }
 
@@ -262,23 +293,38 @@ impl<Client: HttpClient> RpcClient<Client> {
 pub struct ProvingClient<Client: HttpClient>(Client);
 
 impl<Client: HttpClient> ProvingClient<Client> {
+    /// Requests a public key used to encrypt the proving request.
+    pub async fn get_public_key(&self) -> ChainResult<X25519PublicKey> {
+        self.0.request("pubkey", None).await
+    }
+
     /// Makes a POST request to the API
     pub async fn proving_request<N: Network>(
         &self,
         authorization: Authorization<N>,
         fee: Authorization<N>,
     ) -> ChainResult<Transaction<N>> {
-        let authorization = serde_json::to_value(authorization)?;
-        let fee_authorization = serde_json::to_value(fee)?;
-
-        let request = ProvingRequest {
+        let plain_request = ProvingRequest::<N> {
             authorization,
-            fee_authorization: Some(fee_authorization),
+            fee_authorization: Some(fee),
             broadcast: false,
         };
-        let body = serde_json::to_value(request).map_err(HyperlaneAleoError::from)?;
 
-        let response: ProvingResponse = self.0.request_post("prove", &body).await?;
+        let bytes = plain_request
+            .to_bytes_le()
+            .map_err(HyperlaneAleoError::from)?;
+
+        // Fetch a fresh public key after authorization, then encrypt and submit the request.
+        // The caller performs an earlier preflight request to fail cheaply during outages.
+        let public_key = self.get_public_key().await?;
+        let ciphertext = encrypt_message(&public_key.public_key, &bytes)?;
+
+        let request = serde_json::to_value(EncryptedProvingRequest {
+            key_id: public_key.key_id,
+            ciphertext,
+        })?;
+
+        let response: ProvingResponse = self.0.request_post("prove/encrypted", &request).await?;
 
         Ok(
             serde_json::from_value::<Transaction<N>>(response.transaction)
@@ -326,8 +372,8 @@ impl<Client: HttpClient, N: Network> QueryTrait<N> for RpcClient<Client> {
             .join(",");
         Ok(self
             .request_blocking(
-                &format!("statePaths?commitments={commitments_string}"),
-                None,
+                "statePaths",
+                serde_json::json!({ "commitments": commitments_string }),
             )
             .unwrap_or_default())
     }
@@ -344,8 +390,8 @@ impl<Client: HttpClient, N: Network> QueryTrait<N> for RpcClient<Client> {
             .join(",");
         Ok(self
             .request(
-                &format!("statePaths?commitments={commitments_string}"),
-                None,
+                "statePaths",
+                serde_json::json!({ "commitments": commitments_string }),
             )
             .await
             .unwrap_or_default())

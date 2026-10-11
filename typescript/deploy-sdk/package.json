@@ -1,13 +1,13 @@
 {
   "name": "@hyperlane-xyz/deploy-sdk",
-  "version": "1.1.0",
+  "version": "11.0.1",
   "description": "Deployer SDK for the Hyperlane Protocol",
-  "repository": "https://github.com/hyperlane-xyz/hyperlane-monorepo",
   "license": "Apache-2.0",
-  "type": "module",
+  "repository": "https://github.com/hyperlane-xyz/hyperlane-monorepo",
   "files": [
     "dist"
   ],
+  "type": "module",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": "./dist/index.js",
@@ -17,9 +17,9 @@
     "build": "tsc",
     "check": "tsc --noEmit",
     "dev": "tsc --watch",
-    "lint": "eslint",
+    "lint": "oxlint -c ../../oxlint.json",
     "clean": "rm -rf ./dist",
-    "prettier": "prettier --write .",
+    "format": "oxfmt --write .",
     "test": "mocha --config .mocharc.json './src/**/*.test.ts' --exit"
   },
   "dependencies": {
@@ -27,12 +27,15 @@
     "@hyperlane-xyz/cosmos-sdk": "workspace:*",
     "@hyperlane-xyz/provider-sdk": "workspace:*",
     "@hyperlane-xyz/radix-sdk": "workspace:*",
+    "@hyperlane-xyz/sealevel-sdk": "workspace:*",
+    "@hyperlane-xyz/starknet-sdk": "workspace:*",
+    "@hyperlane-xyz/tron-sdk": "workspace:*",
     "@hyperlane-xyz/utils": "workspace:*",
     "zod": "catalog:"
   },
   "devDependencies": {
-    "@hyperlane-xyz/eslint-config": "workspace:^",
     "@hyperlane-xyz/tsconfig": "workspace:^",
+    "@types/chai": "catalog:",
     "@types/chai-as-promised": "catalog:",
     "@types/mocha": "catalog:",
     "@types/node": "catalog:",
@@ -40,10 +43,12 @@
     "@types/sinon-chai": "catalog:",
     "chai": "catalog:",
     "chai-as-promised": "catalog:",
-    "eslint": "catalog:",
     "mocha": "catalog:",
     "sinon": "catalog:",
     "tsx": "catalog:",
     "typescript": "catalog:"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

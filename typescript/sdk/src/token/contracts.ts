@@ -1,6 +1,8 @@
 import { ContractFactory } from 'ethers';
 
 import {
+  AtomicLocalRebalancingBridge__factory,
+  CrossCollateralRouter__factory,
   EverclearEthBridge__factory,
   EverclearTokenBridge__factory,
   HypERC20Collateral__factory,
@@ -18,11 +20,13 @@ import {
   HypXERC20__factory,
   OpL1V1NativeTokenBridge__factory,
   OpL2NativeTokenBridge__factory,
+  TokenBridgeOft__factory,
   TokenBridgeCctpV1__factory,
   TokenBridgeCctpV2__factory,
+  TokenBridgeDepositAddress__factory,
 } from '@hyperlane-xyz/core';
 
-import { TokenType } from './config.js';
+import { DeployableTokenType, TokenType } from './config.js';
 
 export const hypERC20contracts = {
   [TokenType.synthetic]: 'HypERC20',
@@ -43,11 +47,15 @@ export const hypERC20contracts = {
   [TokenType.nativeScaled]: 'HypNative',
   [TokenType.ethEverclear]: 'EverclearEthBridge',
   [TokenType.collateralEverclear]: 'EverclearTokenBridge',
-} as const satisfies Record<TokenType, string>;
+  [TokenType.collateralDepositAddress]: 'TokenBridgeDepositAddress',
+  [TokenType.collateralOft]: 'TokenBridgeOft',
+  [TokenType.atomicLocalRebalancing]: 'AtomicLocalRebalancingBridge',
+  [TokenType.crossCollateral]: 'CrossCollateralRouter',
+} as const satisfies Record<DeployableTokenType, string>;
 export type HypERC20contracts = typeof hypERC20contracts;
 
 type HypERC20TokenType = Exclude<
-  TokenType,
+  DeployableTokenType,
   typeof TokenType.syntheticUri | typeof TokenType.collateralUri
 >;
 
@@ -70,6 +78,12 @@ export const hypERC20factories = {
 
   [TokenType.ethEverclear]: new EverclearEthBridge__factory(),
   [TokenType.collateralEverclear]: new EverclearTokenBridge__factory(),
+  [TokenType.collateralDepositAddress]:
+    new TokenBridgeDepositAddress__factory(),
+  [TokenType.collateralOft]: new TokenBridgeOft__factory(),
+  [TokenType.atomicLocalRebalancing]:
+    new AtomicLocalRebalancingBridge__factory(),
+  [TokenType.crossCollateral]: new CrossCollateralRouter__factory(),
 } as const satisfies Record<HypERC20TokenType, ContractFactory>;
 export type HypERC20Factories = typeof hypERC20factories;
 

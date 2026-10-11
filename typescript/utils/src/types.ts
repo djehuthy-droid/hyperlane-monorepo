@@ -9,9 +9,17 @@ export enum ProtocolType {
   Starknet = 'starknet',
   Radix = 'radix',
   Aleo = 'aleo',
+  Tron = 'tron',
+  Unknown = 'unknown',
 }
 // A type that also allows for literal values of the enum
 export type ProtocolTypeValue = `${ProtocolType}`;
+// All protocol types except Unknown - for use in mappings that only support known protocols
+export type KnownProtocolType = Exclude<ProtocolType, ProtocolType.Unknown>;
+
+export function isEVMLike(protocol: ProtocolType): boolean {
+  return protocol === ProtocolType.Ethereum || protocol === ProtocolType.Tron;
+}
 
 export const ProtocolSmallestUnit = {
   [ProtocolType.Ethereum]: 'wei',
@@ -21,6 +29,8 @@ export const ProtocolSmallestUnit = {
   [ProtocolType.Starknet]: 'fri',
   [ProtocolType.Radix]: 'attos',
   [ProtocolType.Aleo]: 'microcredits',
+  [ProtocolType.Tron]: 'SUN',
+  [ProtocolType.Unknown]: 'unknown',
 };
 
 /********* BASIC TYPES *********/
@@ -125,11 +135,30 @@ export type Annotated<T> = T & {
   annotation?: string;
 };
 
+export type ValidatorMetadataRpcEntry = {
+  url_hash: string;
+  host_hash: string;
+};
+
 export type ValidatorMetadata = {
   git_sha: string;
-  rpcs?: string[];
+  /** Current validators (agents-v1.6.0+) publish `{ url_hash, host_hash }`
+   * entries; pre-v1.6.0 validators published a flat array of URL hash
+   * strings. Metadata blobs are unversioned, so a rolling fleet or
+   * historical blob can be in either shape -- narrow before use, e.g. via
+   * `validatorMetadataRpcUrlHash`. */
+  rpcs?: Array<string | ValidatorMetadataRpcEntry>;
   allows_public_rpcs?: boolean;
 };
+
+/** The URL hash of a `ValidatorMetadata.rpcs` entry, regardless of which of the
+ * two historical wire shapes (bare hash string, or `{ url_hash, host_hash }`)
+ * it was serialized in. */
+export function validatorMetadataRpcUrlHash(
+  entry: string | ValidatorMetadataRpcEntry,
+): string {
+  return typeof entry === 'string' ? entry : entry.url_hash;
+}
 
 export type ReorgEvent = {
   /** the merkle root built from this agent's indexed events */

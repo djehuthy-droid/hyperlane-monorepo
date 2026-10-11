@@ -1,18 +1,17 @@
 import { AltVM, ProtocolType } from '@hyperlane-xyz/provider-sdk';
-import {
+import type {
   RadixSDKReceipt,
   RadixSDKTransaction,
-  RadixSigner,
-} from '@hyperlane-xyz/radix-sdk';
+} from '@hyperlane-xyz/radix-sdk/runtime';
+import { RadixSigner } from '@hyperlane-xyz/radix-sdk/runtime';
 
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
+import { SendTransactionOptions } from '../../providers/MultiProvider.js';
 import { RadixTransaction } from '../../providers/ProviderType.js';
 import { ChainName } from '../../types.js';
 import { IMultiProtocolSigner } from '../types.js';
 
-export class RadixMultiProtocolSignerAdapter
-  implements IMultiProtocolSigner<ProtocolType.Radix>
-{
+export class RadixMultiProtocolSignerAdapter implements IMultiProtocolSigner<ProtocolType.Radix> {
   constructor(
     private readonly chainName: ChainName,
     private readonly signer: AltVM.ISigner<
@@ -24,13 +23,11 @@ export class RadixMultiProtocolSignerAdapter
   static async init(
     chainName: ChainName,
     privateKey: string,
-    multiProtocolProvider: MultiProtocolProvider,
+    multiProtocolProvider: MultiProviderAdapter,
   ): Promise<RadixMultiProtocolSignerAdapter> {
     const metadata = multiProtocolProvider.getChainMetadata(chainName);
 
-    const signer = await RadixSigner.connectWithSigner([], privateKey, {
-      metadata,
-    });
+    const signer = await RadixSigner.connectWithSigner(metadata, privateKey);
 
     return new RadixMultiProtocolSignerAdapter(chainName, signer);
   }
@@ -39,7 +36,10 @@ export class RadixMultiProtocolSignerAdapter
     return this.signer.getSignerAddress();
   }
 
-  async sendAndConfirmTransaction(tx: RadixTransaction): Promise<string> {
+  async sendAndConfirmTransaction(
+    tx: RadixTransaction,
+    _options?: SendTransactionOptions,
+  ): Promise<string> {
     try {
       await this.signer.estimateTransactionFee({
         transaction: tx.transaction,

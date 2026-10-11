@@ -1,37 +1,49 @@
 import { Wallet, ethers } from 'ethers';
 import { Wallet as ZkSyncWallet } from 'zksync-ethers';
 
+import { TronWallet } from '@hyperlane-xyz/tron-sdk/runtime';
 import { Address, ProtocolType, assert } from '@hyperlane-xyz/utils';
 
-import { ChainTechnicalStack } from '../../index.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
-import { MultiProvider } from '../../providers/MultiProvider.js';
+import { ChainTechnicalStack } from '../../metadata/chainMetadataTypes.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
+import {
+  MultiProvider,
+  SendTransactionOptions,
+} from '../../providers/MultiProvider.js';
 import { EthersV5Transaction } from '../../providers/ProviderType.js';
 import { ChainName } from '../../types.js';
 import { IMultiProtocolSigner } from '../types.js';
 
-export class EvmMultiProtocolSignerAdapter
-  implements IMultiProtocolSigner<ProtocolType.Ethereum>
-{
+export class EvmMultiProtocolSignerAdapter implements IMultiProtocolSigner<ProtocolType.Ethereum> {
   private readonly multiProvider: MultiProvider;
 
   constructor(
     private readonly chainName: ChainName,
     privateKey: string,
-    multiProtocolProvider: MultiProtocolProvider,
+    multiProtocolProvider: MultiProviderAdapter,
   ) {
     const multiProvider = multiProtocolProvider.toMultiProvider();
-    const { technicalStack } = multiProvider.getChainMetadata(chainName);
+    const { protocol, technicalStack, rpcUrls } =
+      multiProvider.getChainMetadata(chainName);
 
     assert(
       ethers.utils.isHexString(privateKey),
       `Private key for chain ${chainName} should be a hex string`,
     );
 
-    const wallet =
-      technicalStack === ChainTechnicalStack.ZkSync
-        ? new ZkSyncWallet(privateKey)
-        : new Wallet(privateKey);
+    let wallet: Wallet;
+    if (technicalStack === ChainTechnicalStack.ZkSync) {
+      wallet = new ZkSyncWallet(privateKey);
+    } else if (protocol === ProtocolType.Tron) {
+      assert(
+        rpcUrls.length > 0,
+        `No RPC URLs configured for Tron chain ${chainName}`,
+      );
+      wallet = new TronWallet(privateKey, rpcUrls[0].http);
+    } else {
+      wallet = new Wallet(privateKey);
+    }
+
     multiProvider.setSigner(this.chainName, wallet);
     this.multiProvider = multiProvider;
   }
@@ -40,10 +52,14 @@ export class EvmMultiProtocolSignerAdapter
     return this.multiProvider.getSignerAddress(this.chainName);
   }
 
-  async sendAndConfirmTransaction(tx: EthersV5Transaction): Promise<string> {
+  async sendAndConfirmTransaction(
+    tx: EthersV5Transaction,
+    options?: SendTransactionOptions,
+  ): Promise<string> {
     const res = await this.multiProvider.sendTransaction(
       this.chainName,
       tx.transaction,
+      options,
     );
 
     return res.transactionHash;

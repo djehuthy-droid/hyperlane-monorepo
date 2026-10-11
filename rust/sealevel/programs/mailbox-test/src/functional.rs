@@ -17,15 +17,13 @@ use hyperlane_sealevel_test_send_receiver::{
     test_client::TestSendReceiverTestClient,
 };
 use hyperlane_test_utils::{
-    assert_transaction_error, clone_keypair, get_process_account_metas, get_recipient_ism,
-    initialize_mailbox, mailbox_id, new_funded_keypair, process, process_instruction,
-    process_with_accounts,
+    assert_transaction_error, get_process_account_metas, get_recipient_ism, initialize_mailbox,
+    mailbox_id, new_funded_keypair, process, process_instruction, process_with_accounts,
 };
 use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     rent::Rent,
-    system_program,
 };
 use solana_program_test::*;
 use solana_sdk::{
@@ -35,6 +33,7 @@ use solana_sdk::{
     signer::keypair::Keypair,
     transaction::{Transaction, TransactionError},
 };
+use solana_system_interface::program as system_program;
 
 use crate::utils::{
     assert_dispatched_message, assert_inbox, assert_message_not_processed, assert_outbox,
@@ -59,7 +58,19 @@ async fn setup_client() -> (
         processor!(hyperlane_sealevel_mailbox::processor::process_instruction),
     );
 
-    program_test.add_program("spl_noop", spl_noop::id(), processor!(spl_noop::noop));
+    // spl_noop just logs data and returns success - provide a simple processor
+    fn noop_processor(
+        _program_id: &Pubkey,
+        _accounts: &[solana_program::account_info::AccountInfo],
+        _instruction_data: &[u8],
+    ) -> solana_program::entrypoint::ProgramResult {
+        Ok(())
+    }
+    program_test.add_program(
+        "spl_noop",
+        account_utils::SPL_NOOP_PROGRAM_ID,
+        processor!(noop_processor),
+    );
 
     let mailbox_program_id = mailbox_id();
     program_test.add_program(
@@ -82,10 +93,10 @@ async fn setup_client() -> (
 
     let (banks_client, payer, _recent_blockhash) = program_test.start().await;
 
-    let test_ism = TestIsmTestClient::new(banks_client.clone(), clone_keypair(&payer));
+    let test_ism = TestIsmTestClient::new(banks_client.clone(), payer.insecure_clone());
 
     let mut test_send_receiver =
-        TestSendReceiverTestClient::new(banks_client.clone(), clone_keypair(&payer));
+        TestSendReceiverTestClient::new(banks_client.clone(), payer.insecure_clone());
     test_send_receiver.init().await.unwrap();
     test_send_receiver
         .set_ism(
@@ -420,6 +431,151 @@ async fn test_protocol_fee() {
 }
 
 #[tokio::test]
+// solana-rent 3.1 has no replacement constructor for changing the rental rate.
+#[allow(deprecated)]
+async fn test_claim_protocol_fees_after_rent_reduction() {
+    let program_id = mailbox_id();
+    let mut program_test = ProgramTest::new(
+        "hyperlane_sealevel_mailbox",
+        program_id,
+        processor!(hyperlane_sealevel_mailbox::processor::process_instruction),
+    );
+    program_test.add_program(
+        "hyperlane_sealevel_test_ism",
+        hyperlane_sealevel_test_ism::id(),
+        processor!(hyperlane_sealevel_test_ism::program::process_instruction),
+    );
+    let mut ctx = program_test.start_with_context().await;
+    let payer = ctx.payer.insecure_clone();
+    // ProgramTest changes the sysvar but retains its default bank rent collector.
+    // Start above that floor so both simulated reductions remain runtime-valid.
+    let mut original_rent = ctx.banks_client.get_sysvar::<Rent>().await.unwrap();
+    original_rent.lamports_per_byte_year *= 4;
+    ctx.set_sysvar(&original_rent);
+    let beneficiary = new_funded_keypair(&mut ctx.banks_client, &payer, 1_000_000)
+        .await
+        .pubkey();
+    let mailbox = initialize_mailbox(
+        &mut ctx.banks_client,
+        &program_id,
+        &payer,
+        LOCAL_DOMAIN,
+        MAX_PROTOCOL_FEE,
+        ProtocolFee {
+            fee: PROTOCOL_FEE,
+            beneficiary,
+        },
+    )
+    .await
+    .unwrap();
+    let source = mailbox.outbox;
+    // Claims include accrued fees as well as newly available rent excess.
+    hyperlane_test_utils::transfer_lamports(&mut ctx.banks_client, &payer, &source, 123_456).await;
+    let claim = |destination| {
+        Instruction::new_with_borsh(
+            program_id,
+            &MailboxInstruction::ClaimProtocolFees,
+            vec![
+                AccountMeta::new(source, false),
+                AccountMeta::new(destination, false),
+            ],
+        )
+    };
+    // Model different SVM rent settings and a repeated claim without assuming
+    // the activation schedule or constants of any particular chain.
+    let before = ctx.banks_client.get_account(source).await.unwrap().unwrap();
+    for divisor in [2, 4, 4] {
+        let rent = Rent {
+            lamports_per_byte_year: original_rent.lamports_per_byte_year / divisor,
+            ..original_rent
+        };
+        ctx.set_sysvar(&rent);
+        let minimum = rent.minimum_balance(before.data.len());
+        let source_balance = ctx.banks_client.get_balance(source).await.unwrap();
+        let beneficiary_balance = ctx.banks_client.get_balance(beneficiary).await.unwrap();
+        // A distinct fee payer also makes repeated transactions distinct.
+        let caller = new_funded_keypair(&mut ctx.banks_client, &payer, 1_000_000).await;
+
+        assert_transaction_error(
+            process_instruction(
+                &mut ctx.banks_client,
+                claim(caller.pubkey()),
+                &caller,
+                &[&caller],
+            )
+            .await,
+            TransactionError::InstructionError(0, InstructionError::InvalidArgument),
+        );
+        assert_eq!(
+            ctx.banks_client.get_balance(source).await.unwrap(),
+            source_balance
+        );
+        process_instruction(
+            &mut ctx.banks_client,
+            claim(beneficiary),
+            &caller,
+            &[&caller],
+        )
+        .await
+        .unwrap();
+
+        let after = ctx.banks_client.get_account(source).await.unwrap().unwrap();
+        assert_eq!(after.lamports, minimum);
+        assert_eq!(after.data, before.data);
+        assert_eq!(
+            ctx.banks_client.get_balance(beneficiary).await.unwrap() - beneficiary_balance,
+            source_balance - minimum,
+        );
+    }
+    // Restoring a higher minimum blocks claims until rent backing is replenished.
+    ctx.set_sysvar(&original_rent);
+    let restored_minimum = original_rent.minimum_balance(before.data.len());
+    let caller = new_funded_keypair(&mut ctx.banks_client, &payer, 1_000_000).await;
+    let beneficiary_balance = ctx.banks_client.get_balance(beneficiary).await.unwrap();
+    assert_transaction_error(
+        process_instruction(
+            &mut ctx.banks_client,
+            claim(beneficiary),
+            &caller,
+            &[&caller],
+        )
+        .await,
+        TransactionError::InstructionError(0, InstructionError::AccountNotRentExempt),
+    );
+    let below_floor = ctx.banks_client.get_account(source).await.unwrap().unwrap();
+    assert_eq!(below_floor.data, before.data);
+    assert_eq!(
+        ctx.banks_client.get_balance(beneficiary).await.unwrap(),
+        beneficiary_balance
+    );
+    let top_up = restored_minimum - below_floor.lamports;
+    hyperlane_test_utils::transfer_lamports(
+        &mut ctx.banks_client,
+        &payer,
+        &source,
+        top_up + 123_456,
+    )
+    .await;
+    // A new caller avoids replaying the identical failed transaction.
+    let caller = new_funded_keypair(&mut ctx.banks_client, &payer, 1_000_000).await;
+    process_instruction(
+        &mut ctx.banks_client,
+        claim(beneficiary),
+        &caller,
+        &[&caller],
+    )
+    .await
+    .unwrap();
+    let restored = ctx.banks_client.get_account(source).await.unwrap().unwrap();
+    assert_eq!(restored.lamports, restored_minimum);
+    assert_eq!(restored.data, before.data);
+    assert_eq!(
+        ctx.banks_client.get_balance(beneficiary).await.unwrap() - beneficiary_balance,
+        123_456
+    );
+}
+
+#[tokio::test]
 async fn test_setting_valid_protocol_fee_config_works() {
     let program_id = mailbox_id();
     let (mut banks_client, payer, _, _) = setup_client().await;
@@ -692,7 +848,7 @@ async fn test_dispatch_returns_message_id() {
             AccountMeta::new(mailbox_accounts.outbox, false),
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_noop::id(), false),
+            AccountMeta::new_readonly(account_utils::SPL_NOOP_PROGRAM_ID, false),
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(unique_message_account_keypair.pubkey(), true),
             AccountMeta::new(dispatched_message_account_key, false),
@@ -855,7 +1011,7 @@ async fn test_get_recipient_ism_errors_with_malformatted_recipient_ism_return_da
     assert!(matches!(
         result,
         Err(BanksClientError::TransactionError(
-            TransactionError::InstructionError(_, InstructionError::BorshIoError(_))
+            TransactionError::InstructionError(_, InstructionError::BorshIoError)
         ))
     ));
 }
@@ -1419,4 +1575,118 @@ async fn test_inbox_set_default_ism_errors_if_owner_not_signer() {
         result,
         TransactionError::InstructionError(0, InstructionError::MissingRequiredSignature),
     );
+}
+
+#[tokio::test]
+async fn test_get_program_version() {
+    use serializable_account_meta::SimulationReturnData;
+
+    let program_id = mailbox_id();
+    let (banks_client, payer, _, _) = setup_client().await;
+
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &package_versioned::get_program_version_instruction_data(),
+        vec![],
+    );
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await.unwrap();
+    let simulation = banks_client
+        .simulate_transaction(Transaction::new_unsigned(Message::new_with_blockhash(
+            &[ix],
+            Some(&payer.pubkey()),
+            &recent_blockhash,
+        )))
+        .await
+        .unwrap();
+
+    assert!(simulation.result.unwrap().is_ok());
+    let return_data = simulation
+        .simulation_details
+        .unwrap()
+        .return_data
+        .expect("no return data");
+    let result = SimulationReturnData::<String>::try_from_slice(&return_data.data)
+        .expect("failed to deserialize");
+    assert_eq!(result.return_data, package_versioned::PACKAGE_VERSION);
+}
+
+#[tokio::test]
+async fn test_outbox_get_latest_checkpoint() {
+    use serializable_account_meta::SimulationReturnData;
+
+    let program_id = mailbox_id();
+    let (mut banks_client, payer, _, _) = setup_client().await;
+
+    let mailbox_accounts = initialize_mailbox(
+        &mut banks_client,
+        &program_id,
+        &payer,
+        LOCAL_DOMAIN,
+        MAX_PROTOCOL_FEE,
+        test_protocol_fee_config(),
+    )
+    .await
+    .unwrap();
+
+    // Dispatch a message so the outbox tree holds a real, non-default root.
+    let recipient = H256::random();
+    let message_body = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    dispatch_from_payer(
+        &mut banks_client,
+        &payer,
+        &mailbox_accounts,
+        OutboxDispatch {
+            sender: payer.pubkey(),
+            destination_domain: REMOTE_DOMAIN,
+            recipient,
+            message_body: message_body.clone(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let dispatched_message = HyperlaneMessage {
+        version: 3,
+        nonce: 0,
+        origin: LOCAL_DOMAIN,
+        sender: payer.pubkey().to_bytes().into(),
+        destination: REMOTE_DOMAIN,
+        recipient,
+        body: message_body,
+    };
+    let mut expected_tree = MerkleTree::default();
+    expected_tree.ingest(dispatched_message.id());
+
+    let ix = Instruction::new_with_borsh(
+        program_id,
+        &MailboxInstruction::OutboxGetLatestCheckpoint,
+        vec![AccountMeta::new_readonly(mailbox_accounts.outbox, false)],
+    );
+
+    let recent_blockhash = banks_client.get_latest_blockhash().await.unwrap();
+    let simulation = banks_client
+        .simulate_transaction(Transaction::new_unsigned(Message::new_with_blockhash(
+            &[ix],
+            Some(&payer.pubkey()),
+            &recent_blockhash,
+        )))
+        .await
+        .unwrap();
+
+    // Regression: the getter copied the 32-byte root into a 31-byte slice,
+    // panicking before any return data was set.
+    assert!(simulation.result.unwrap().is_ok());
+
+    let return_data = simulation
+        .simulation_details
+        .unwrap()
+        .return_data
+        .expect("no return data");
+    let result = SimulationReturnData::<Vec<u8>>::try_from_slice(&return_data.data)
+        .expect("failed to deserialize");
+
+    assert_eq!(result.return_data.len(), 36);
+    assert_eq!(&result.return_data[0..32], expected_tree.root().as_ref());
+    assert_eq!(&result.return_data[32..36], &1u32.to_le_bytes());
 }

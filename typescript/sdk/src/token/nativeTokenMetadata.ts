@@ -1,9 +1,10 @@
 import { ProtocolType } from '@hyperlane-xyz/utils';
 
 import { NativeToken } from '../metadata/chainMetadataTypes.js';
+import { KnownProtocolType } from '../providers/ProviderType.js';
 
 export const PROTOCOL_TO_DEFAULT_NATIVE_TOKEN: Record<
-  ProtocolType,
+  KnownProtocolType,
   NativeToken
 > = {
   [ProtocolType.Ethereum]: {
@@ -43,8 +44,14 @@ export const PROTOCOL_TO_DEFAULT_NATIVE_TOKEN: Record<
   },
   [ProtocolType.Aleo]: {
     decimals: 6,
-    denom: '0field',
+    denom: 'credits',
     name: 'Aleo',
     symbol: 'ALEO',
+  },
+  [ProtocolType.Tron]: {
+    decimals: 6,
+    denom: 'SUN',
+    name: 'Tron',
+    symbol: 'TRX',
   },
 };

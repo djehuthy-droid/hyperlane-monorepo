@@ -1,7 +1,13 @@
 import { expect } from 'chai';
-import { Signer } from 'ethers';
+import { Signer, ethers } from 'ethers';
 import hre from 'hardhat';
 
+import {
+  CONTRACTS_PACKAGE_VERSION,
+  InterchainGasPaymaster__factory,
+  PausableHook__factory,
+  RateLimitedHook__factory,
+} from '@hyperlane-xyz/core';
 import {
   Address,
   WithAddress,
@@ -38,9 +44,11 @@ import {
   HookConfig,
   HookType,
   IgpHookConfig,
+  IgpVersion,
   MUTABLE_HOOK_TYPE,
   PausableHookConfig,
   ProtocolFeeHookConfig,
+  RateLimitedHookConfig,
 } from './types.js';
 
 const hookTypes = Object.values(HookType);
@@ -89,7 +97,7 @@ describe('EvmHookModule', async () => {
     );
 
     // mailbox and proxy admin for the core deploy
-    const { mailbox, proxyAdmin, validatorAnnounce } = (
+    const { mailbox, proxyAdmin, validatorAnnounce, quotedCalls } = (
       await testCoreDeployer.deployApp()
     ).getContracts(chain);
 
@@ -97,6 +105,7 @@ describe('EvmHookModule', async () => {
       mailbox: mailbox.address,
       proxyAdmin: proxyAdmin.address,
       validatorAnnounce: validatorAnnounce.address,
+      quotedCalls: quotedCalls.address,
     };
 
     // reusable for routing/fallback routing specific tests
@@ -160,7 +169,7 @@ describe('EvmHookModule', async () => {
       chain,
       config,
       proxyFactoryFactories: proxyFactoryAddresses,
-      coreAddresses,
+      coreAddresses: { ...coreAddresses, rateLimitedSender: randomAddress() },
       multiProvider,
     });
     testHook = hook;
@@ -196,6 +205,23 @@ describe('EvmHookModule', async () => {
     it('deploys a hook of type CUSTOM', async () => {
       const config: HookConfig = randomAddress();
       await createHook(config);
+    });
+
+    it('deploys a pausable hook in the configured paused state', async () => {
+      const config: PausableHookConfig = {
+        owner: randomAddress(),
+        type: HookType.PAUSABLE,
+        paused: true,
+      };
+
+      const { initialHookAddress } = await createHook(config);
+      const hook = PausableHook__factory.connect(
+        initialHookAddress,
+        multiProvider.getProvider(chain),
+      );
+
+      expect(await hook.paused()).to.be.true;
+      expect(eqAddress(await hook.owner(), config.owner)).to.be.true;
     });
 
     // random configs upto depth 2
@@ -667,6 +693,254 @@ describe('EvmHookModule', async () => {
       await expectTxsAndUpdate(hook, config, 1);
     });
 
+    it('should not update IGP only because igpVersion is legacy', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      const { hook } = await createHook(config);
+
+      await expectTxsAndUpdate(
+        hook,
+        { ...config, igpVersion: IgpVersion.Legacy },
+        0,
+      );
+    });
+
+    it('should not update routing hooks only because nested IGP is legacy', async () => {
+      const igpConfig = await createDeployerOwnedIgpHookConfig();
+      const config: FallbackRoutingHookConfig = {
+        owner: await multiProvider.getSignerAddress(chain),
+        domains: {
+          [TestChainName.test1]: {
+            type: HookType.AGGREGATION,
+            hooks: [{ type: HookType.MERKLE_TREE }, igpConfig],
+          },
+        },
+        type: HookType.FALLBACK_ROUTING,
+        fallback: { type: HookType.MERKLE_TREE },
+      };
+      const { hook } = await createHook(config);
+      const legacyConfig = deepCopy(config);
+      (
+        (legacyConfig.domains[TestChainName.test1] as AggregationHookConfig)
+          .hooks[1] as IgpHookConfig
+      ).igpVersion = IgpVersion.Legacy;
+
+      await expectTxsAndUpdate(hook, legacyConfig, 0);
+    });
+
+    it('should add quote signers to IGP', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.contractVersion = CONTRACTS_PACKAGE_VERSION;
+
+      // create a new hook
+      const { hook } = await createHook(config);
+
+      // add quote signers (contractVersion needed to confirm IGP supports them)
+      config.quoteSigners = [randomAddress(), randomAddress()];
+
+      // expect 2 txs to add quote signers
+      await expectTxsAndUpdate(hook, config, 2);
+    });
+
+    it('should remove quote signers from IGP', async () => {
+      const signerA = randomAddress();
+      const signerB = randomAddress();
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.quoteSigners = [signerA, signerB];
+
+      // create a new hook with signers
+      const { hook } = await createHook(config);
+
+      // remove one signer
+      config.quoteSigners = [signerA];
+
+      // expect 1 tx to remove a signer
+      await expectTxsAndUpdate(hook, config, 1);
+    });
+
+    it('should deploy IGP with quote signers and read them back', async () => {
+      const signerA = randomAddress();
+      const signerB = randomAddress();
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.quoteSigners = [signerA, signerB];
+
+      const { hook } = await createHook(config);
+      const readConfig = normalizeConfig(await hook.read());
+
+      expect(readConfig.quoteSigners).to.have.lengthOf(2);
+      expect(readConfig.quoteSigners).to.include(signerA.toLowerCase());
+      expect(readConfig.quoteSigners).to.include(signerB.toLowerCase());
+    });
+
+    it('should not update IGP if quote signers unchanged', async () => {
+      const signerAddr = randomAddress();
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.quoteSigners = [signerAddr];
+
+      const { hook } = await createHook(config);
+
+      // same config, no updates
+      await expectTxsAndUpdate(hook, config, 0);
+    });
+
+    it('should not remove existing quote signers when target omits the field', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.contractVersion = CONTRACTS_PACKAGE_VERSION;
+      config.quoteSigners = [randomAddress()];
+
+      const { hook } = await createHook(config);
+
+      // omit quoteSigners from target — should not generate remove txs
+      delete config.quoteSigners;
+
+      // expect 0 txs since omitting quoteSigners means "don't change"
+      await expectTxsAndUpdate(hook, config, 0);
+    });
+
+    it('should reject quote signers for legacy IGP configs', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      const { hook } = await createHook(config);
+      const legacyTarget = {
+        ...config,
+        igpVersion: IgpVersion.Legacy,
+        quoteSigners: [randomAddress()],
+      };
+
+      try {
+        await hook.update(legacyTarget);
+        throw new Error('Expected legacy IGP quote signer update to fail');
+      } catch (error: unknown) {
+        assert(error instanceof Error, 'Expected Error');
+        expect(error.message).to.include(
+          'IGP quoteSigners require contract version >= 11.3.0',
+        );
+      }
+    });
+
+    const randomTokenOracleConfig = (withTypicalCost = false) =>
+      Object.fromEntries(
+        testChains.map((c) => [
+          c,
+          {
+            tokenExchangeRate: randomInt(1234567891234).toString(),
+            gasPrice: randomInt(1234567891234).toString(),
+            tokenDecimals: DEFAULT_TOKEN_DECIMALS,
+            ...(withTypicalCost
+              ? {
+                  typicalCost: {
+                    handleGasAmount: 50_000,
+                    totalGasAmount: 200_000,
+                    totalUsdCost: 1,
+                  },
+                }
+              : {}),
+          },
+        ]),
+      );
+
+    it('should deploy IGP with token gas oracles and wire them on-chain', async () => {
+      const feeToken = randomAddress();
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.tokenOracleConfig = { [feeToken]: randomTokenOracleConfig() };
+
+      const { hook } = await createHook(config);
+
+      // The token oracle mapping is read back from chain (not derivable via the
+      // reader), so assert it directly: a dedicated oracle is wired per remote.
+      const igp = InterchainGasPaymaster__factory.connect(
+        hook.serialize().deployedHook,
+        multiProvider.getProvider(chain),
+      );
+      const oracles = await Promise.all(
+        testChains.map((c) =>
+          igp.tokenGasOracles(feeToken, multiProvider.getDomainId(c)),
+        ),
+      );
+      for (const oracle of oracles) {
+        expect(eqAddress(oracle, ethers.constants.AddressZero)).to.be.false;
+      }
+      // All destinations of a fee token share a single oracle instance.
+      expect(oracles.every((o) => eqAddress(o, oracles[0]))).to.be.true;
+    });
+
+    it('should set token gas oracles on update', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.contractVersion = CONTRACTS_PACKAGE_VERSION;
+      const { hook } = await createHook(config);
+
+      // add a token oracle config; oracle is deployed eagerly, leaving a single
+      // setTokenGasOracles tx to wire the mapping.
+      config.tokenOracleConfig = {
+        [randomAddress()]: randomTokenOracleConfig(true),
+      };
+      await expectTxsAndUpdate(hook, config, 1);
+
+      // re-applying the same config is a no-op (mapping already wired on-chain)
+      await expectTxsAndUpdate(hook, config, 0);
+    });
+
+    it('should reject token gas oracle remotes without native gas config', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.contractVersion = CONTRACTS_PACKAGE_VERSION;
+      const { hook } = await createHook(config);
+
+      const target = deepCopy(config);
+      const [remoteWithoutNativeConfig] = testChains;
+      delete target.overhead[remoteWithoutNativeConfig];
+      target.tokenOracleConfig = {
+        [randomAddress()]: randomTokenOracleConfig(),
+      };
+
+      try {
+        await hook.update(target);
+        throw new Error('Expected token oracle remote validation to fail');
+      } catch (error: unknown) {
+        assert(error instanceof Error, 'Expected Error');
+        expect(error.message).to.include(
+          `includes remotes without native gas oracle config: ${remoteWithoutNativeConfig}`,
+        );
+      }
+    });
+
+    it('should reject token gas oracles for legacy IGP configs', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      const { hook } = await createHook(config);
+      const legacyTarget = {
+        ...config,
+        igpVersion: IgpVersion.Legacy,
+        tokenOracleConfig: { [randomAddress()]: randomTokenOracleConfig() },
+      };
+
+      try {
+        await hook.update(legacyTarget);
+        throw new Error('Expected legacy IGP token oracle update to fail');
+      } catch (error: unknown) {
+        assert(error instanceof Error, 'Expected Error');
+        expect(error.message).to.include(
+          'IGP tokenOracleConfig requires contract version >= 11.3.0',
+        );
+      }
+    });
+
+    it('should not upgrade IGP when contractVersion is not in config', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      const { hook, initialHookAddress } = await createHook(config);
+
+      // no contractVersion in config, should produce no upgrade txs
+      await expectTxsAndUpdate(hook, config, 0);
+      expect(hook.serialize().deployedHook).to.equal(initialHookAddress);
+    });
+
+    it('should not upgrade IGP when contractVersion matches', async () => {
+      const config = await createDeployerOwnedIgpHookConfig();
+      config.contractVersion = CONTRACTS_PACKAGE_VERSION;
+
+      const { hook, initialHookAddress } = await createHook(config);
+
+      // version matches, no upgrade needed
+      await expectTxsAndUpdate(hook, config, 0);
+      expect(hook.serialize().deployedHook).to.equal(initialHookAddress);
+    });
+
     it('should update protocol fee in protocol fee hook', async () => {
       const config: ProtocolFeeHookConfig = {
         owner: await multiProvider.getSignerAddress(chain),
@@ -727,6 +1001,56 @@ describe('EvmHookModule', async () => {
 
       // expect 1 tx to update the paused state
       await expectTxsAndUpdate(hook, config, 1);
+    });
+
+    it('should update maxCapacity on RateLimitedHook in place via setRefillRate', async () => {
+      const owner = await multiProvider.getSignerAddress(chain);
+      const config: RateLimitedHookConfig = {
+        owner,
+        type: HookType.RATE_LIMITED,
+        maxCapacity: (86400n * 100n).toString(),
+        duration: 86400n,
+      };
+
+      const { hook, initialHookAddress } = await createHook(config);
+
+      config.maxCapacity = (86400n * 200n).toString();
+
+      // exactly 1 tx — setRefillRate, not a redeploy
+      await expectTxsAndUpdate(hook, config, 1);
+
+      // address unchanged: in-place update, not a new deployment
+      expect(hook.serialize().deployedHook).to.equal(initialHookAddress);
+    });
+
+    it('redeploys a new RateLimitedHook on duration change (immutable)', async () => {
+      const owner = await multiProvider.getSignerAddress(chain);
+      const config: RateLimitedHookConfig = {
+        owner,
+        type: HookType.RATE_LIMITED,
+        maxCapacity: '86400',
+        duration: 86400n,
+      };
+
+      const { hook, initialHookAddress } = await createHook(config);
+
+      // duration is immutable on-chain; changing it must redeploy a fresh hook.
+      // keep maxCapacity a multiple of the new duration (schema constraint).
+      config.duration = 3600n;
+      config.maxCapacity = '3600';
+
+      // update() redeploys internally and emits no txs
+      await expectTxsAndUpdate(hook, config, 0);
+
+      // different contract address — redeployed
+      expect(eqAddress(initialHookAddress, hook.serialize().deployedHook)).to.be
+        .false;
+
+      const rateLimitedHook = RateLimitedHook__factory.connect(
+        hook.serialize().deployedHook,
+        multiProvider.getProvider(chain),
+      );
+      expect((await rateLimitedHook.DURATION()).toString()).to.equal('3600');
     });
 
     for (const type of [HookType.ROUTING, HookType.FALLBACK_ROUTING]) {
@@ -875,16 +1199,21 @@ describe('EvmHookModule', async () => {
           },
         ],
       };
-      const { hook } = await createHook(hookConfig);
-      const deployedHookBefore =
-        (await hook.read()) as WithAddress<AggregationHookConfig>;
+      const { hook, initialHookAddress } = await createHook(hookConfig);
 
-      // expect 0 updates, but actually deploys a new hook
-      await expectTxsAndUpdate(hook, hookConfig, 0);
-      const deployedHookAfter =
+      // Read the deployed config and use the child hook's address for update
+      // This follows the same pattern as other similar tests
+      const deployedHook =
         (await hook.read()) as WithAddress<AggregationHookConfig>;
+      const childHook = deployedHook.hooks[0] as DerivedHookConfig;
+      const expectedConfig: AggregationHookConfig = {
+        type: HookType.AGGREGATION,
+        hooks: [childHook.address],
+      };
 
-      expect(deployedHookBefore.address).to.equal(deployedHookAfter.address);
+      // expect 0 updates when using the deployed hook's address
+      await expectTxsAndUpdate(hook, expectedConfig, 0);
+      expect(initialHookAddress).to.equal(hook.serialize().deployedHook);
     });
 
     // generate a random config for each ownable hook type
@@ -924,8 +1253,8 @@ describe('EvmHookModule', async () => {
 
       it(`update owner in an existing ${config.type} not owned by deployer`, async () => {
         // hook owner is not the deployer
-        config.owner = randomAddress();
-        const originalOwner = config.owner;
+        const originalOwner = randomAddress();
+        config.owner = originalOwner;
 
         // create a new hook
         const { hook, initialHookAddress } = await createHook(config);
@@ -944,8 +1273,8 @@ describe('EvmHookModule', async () => {
 
       it(`update owner in an existing ${config.type} not owned by deployer and no change`, async () => {
         // hook owner is not the deployer
-        config.owner = randomAddress();
-        const originalOwner = config.owner;
+        const originalOwner = randomAddress();
+        config.owner = originalOwner;
 
         // create a new hook
         const { hook, initialHookAddress } = await createHook(config);

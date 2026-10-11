@@ -1,23 +1,26 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use hyperlane_core::{ChainCommunicationError, KnownHyperlaneDomain};
-use hyperlane_sealevel::{SealevelKeypair, SealevelTxCostEstimate, TransactionSubmitter};
-use solana_client::rpc_response::RpcSimulateTransactionResult;
-use solana_sdk::{
-    compute_budget::ComputeBudgetInstruction, hash::Hash,
-    instruction::Instruction as SealevelInstruction, message::Message, pubkey::Pubkey,
-    signature::Signature, signer::Signer, system_instruction,
-    transaction::Transaction as SealevelTransaction,
+use hyperlane_sealevel::{
+    SealevelKeypair, SealevelTransactionFormat, SealevelTxCostEstimate, SealevelTxType,
+    TransactionSubmitter,
 };
+use solana_client::rpc_response::RpcSimulateTransactionResult;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_sdk::{
+    hash::Hash, instruction::Instruction as SealevelInstruction, message::Message, pubkey::Pubkey,
+    signature::Signature, signer::Signer, transaction::Transaction as SealevelTransaction,
+};
+use solana_system_interface::instruction as system_instruction;
 use tokio::{select, sync::mpsc};
-use tracing::info;
 use tracing_test::traced_test;
 
 use crate::{
     adapter::{
         chains::sealevel::{
             adapter::tests::tests_common::{
-                encoded_svm_transaction, svm_block, MockClient, MockOracle, MockSubmitter,
+                finalized_signature_status, processed_signature_status,
+                signature_statuses_response, svm_block, MockClient, MockOracle, MockSubmitter,
                 MockSvmProvider,
             },
             transaction::{Precursor, TransactionFactory},
@@ -42,7 +45,7 @@ async fn test_svm_inclusion_happy_path() {
 
     let mut client = MockClient::new();
     mock_simulate_transaction(&mut client);
-    mock_get_transaction_with_commitment(&mut client);
+    mock_get_signature_statuses_finalized(&mut client, 1);
     mock_get_block_with_commitment(&mut client);
     let oracle = MockOracle::new();
     let mut provider = MockSvmProvider::new();
@@ -71,8 +74,6 @@ async fn test_svm_inclusion_happy_path() {
         ExpectedSvmTxState {
             compute_units: 1400000,
             compute_unit_price_micro_lamports: 0,
-            // final status is `Finalized` because `get_transaction_with_commitment` returns an `Ok` response
-            // regardless of the commitment level it's called with
             status: TransactionStatus::Finalized,
             retries: 1,
         },
@@ -97,7 +98,7 @@ async fn test_svm_inclusion_gas_spike() {
     provider
         .expect_get_estimated_costs_for_instruction()
         .returning(
-            move |_instruction, _payer, _tx_submitter, _priority_fee_oracle| {
+            move |_instruction, _payer, _tx_submitter, _priority_fee_oracle, _alt_address| {
                 fee_call_counter += 1;
                 let compute_unit_price_micro_lamports = match fee_call_counter {
                     1 => 500, // Initial fee
@@ -112,26 +113,19 @@ async fn test_svm_inclusion_gas_spike() {
             },
         );
 
-    let mut commitment_call_counter = 0;
+    let mut status_call_counter = 0;
     client
-        .expect_get_transaction_with_commitment()
-        .returning(move |_, commitment| {
-            commitment_call_counter += 1;
-            info!(
-                ?commitment_call_counter,
-                "calling get_transaction_with_commitment"
-            );
-            // when a transaction is not yet included, the status check makes 3 calls (one with each commitment level in inverse order: finalized, confirmed, processed).
-            // it takes 3 unsuccessful tx statuses to escalate twice
-            if commitment.is_finalized() && commitment_call_counter > 9 {
-                return Ok(encoded_svm_transaction()); // Simulate transaction being included at the `finalized` level after 4 retries
-            }
-            if commitment.is_processed() {
-                return Ok(encoded_svm_transaction()); // Simulate transaction being processed
-            }
-            Err(ChainCommunicationError::from_other(
-                LanderError::TxHashNotFound("Not included yet".to_string()),
-            ))
+        .expect_get_signature_statuses_with_history()
+        .times(4)
+        .returning(move |signatures| {
+            assert_eq!(signatures.len(), 1);
+            status_call_counter += 1;
+            let status = if status_call_counter == 4 {
+                finalized_signature_status()
+            } else {
+                processed_signature_status()
+            };
+            signature_statuses_response(vec![Some(status)])
         });
 
     let mut submitter = MockSubmitter::new();
@@ -195,22 +189,30 @@ async fn test_svm_inclusion_escalate_but_old_hash_finalized() {
     mock_simulate_transaction(&mut client);
     mock_get_block_with_commitment(&mut client);
 
-    // Mock `get_transaction_with_commitment` to simulate the first signature being finalized
-    let mut commitment_call_counter = 0;
+    // Simulate the first signature being finalized after two resubmission scans.
+    let mut status_call_counter = 0;
     client
-        .expect_get_transaction_with_commitment()
-        .returning(move |sig, commitment| {
-            commitment_call_counter += 1;
-
-            if commitment.is_finalized() && sig == signature1 && commitment_call_counter > 6 {
-                Ok(encoded_svm_transaction()) // First signature is finalized after 2 calls
-            } else if commitment.is_processed() {
-                Ok(encoded_svm_transaction()) // Simulate both signatures being processed
+        .expect_get_signature_statuses_with_history()
+        .times(3)
+        .returning(move |signatures| {
+            status_call_counter += 1;
+            if status_call_counter == 1 {
+                assert_eq!(signatures, &[signature1]);
             } else {
-                Err(ChainCommunicationError::from_other(
-                    LanderError::TxHashNotFound("Not included yet".to_string()),
-                ))
+                assert_eq!(signatures, &[signature1, signature2]);
             }
+            signature_statuses_response(
+                signatures
+                    .iter()
+                    .map(|signature| {
+                        Some(if status_call_counter == 3 && *signature == signature1 {
+                            finalized_signature_status()
+                        } else {
+                            processed_signature_status()
+                        })
+                    })
+                    .collect(),
+            )
         });
 
     let oracle = MockOracle::new();
@@ -222,7 +224,7 @@ async fn test_svm_inclusion_escalate_but_old_hash_finalized() {
     provider
         .expect_get_estimated_costs_for_instruction()
         .returning(
-            move |_instruction, _payer, _tx_submitter, _priority_fee_oracle| {
+            move |_instruction, _payer, _tx_submitter, _priority_fee_oracle, _alt_address| {
                 fee_call_counter += 1;
                 let compute_unit_price_micro_lamports = match fee_call_counter {
                     1 => 500, // Initial fee
@@ -301,7 +303,7 @@ async fn test_svm_inclusion_send_returns_blockhash_not_found() {
     let mut client = MockClient::new();
     mock_simulate_transaction(&mut client);
     mock_get_block_with_commitment(&mut client);
-    mock_get_transaction_with_commitment(&mut client);
+    mock_get_signature_statuses_finalized(&mut client, 1);
 
     let oracle = MockOracle::new();
     let mut provider = MockSvmProvider::new();
@@ -310,7 +312,7 @@ async fn test_svm_inclusion_send_returns_blockhash_not_found() {
     // Mock estimated costs to always return static values
     provider
         .expect_get_estimated_costs_for_instruction()
-        .returning(|_, _, _, _| {
+        .returning(|_, _, _, _, _| {
             Ok(SealevelTxCostEstimate {
                 compute_units: 1400000,
                 compute_unit_price_micro_lamports: 100, // Static cost
@@ -372,7 +374,7 @@ async fn test_svm_failure_to_estimate_costs_causes_tx_to_be_dropped() {
     let mut client = MockClient::new();
     mock_simulate_transaction(&mut client);
     mock_get_block_with_commitment(&mut client);
-    mock_get_transaction_with_commitment(&mut client);
+    mock_get_signature_statuses_finalized(&mut client, 0);
 
     let oracle = MockOracle::new();
     let mut provider = MockSvmProvider::new();
@@ -381,7 +383,7 @@ async fn test_svm_failure_to_estimate_costs_causes_tx_to_be_dropped() {
     // Mock estimated costs to return an error
     provider
         .expect_get_estimated_costs_for_instruction()
-        .returning(|_, _, _, _| {
+        .returning(|_, _, _, _, _| {
             Err(ChainCommunicationError::from_other(
                 LanderError::EstimationFailed,
             ))
@@ -532,7 +534,7 @@ async fn mock_svm_tx(
 ) -> Transaction {
     let mut payload = FullPayload::random();
     payload.status = PayloadStatus::InTransaction(status.clone());
-    let data = serde_json::to_vec(&mock_svm_instruction()).unwrap();
+    let data = serde_json::to_vec(&mock_svm_payload()).unwrap();
     payload.data = data;
     payload_db.store_payload_by_uuid(&payload).await.unwrap();
     let precursor = SealevelTxPrecursor::from_payload(&payload);
@@ -541,11 +543,15 @@ async fn mock_svm_tx(
     tx
 }
 
-fn mock_svm_instruction() -> SealevelInstruction {
-    system_instruction::allocate(
+fn mock_svm_payload() -> hyperlane_sealevel::SealevelProcessPayload {
+    let instruction = system_instruction::allocate(
         &Pubkey::new_unique(), // random pubkey
         10,
-    )
+    );
+    hyperlane_sealevel::SealevelProcessPayload {
+        instruction,
+        alt_addresses: SealevelTransactionFormat::Legacy,
+    }
 }
 
 fn mock_create_transaction_for_instruction(mock_provider: &mut MockSvmProvider) {
@@ -557,7 +563,9 @@ fn mock_create_transaction_for_instruction(mock_provider: &mut MockSvmProvider) 
              instruction: SealevelInstruction,
              payer: &SealevelKeypair,
              tx_submitter: Arc<dyn TransactionSubmitter>,
-             _sign: bool| {
+             _sign: bool,
+             _alt_addresses: &SealevelTransactionFormat,
+             _additional_signers: &[&SealevelKeypair]| {
                 let instructions = vec![
                     // Set the compute unit limit.
                     ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
@@ -577,7 +585,7 @@ fn mock_create_transaction_for_instruction(mock_provider: &mut MockSvmProvider) 
                     &recent_blockhash,
                 ));
 
-                Ok(tx)
+                Ok(SealevelTxType::Legacy(tx))
             },
         );
 }
@@ -586,7 +594,7 @@ fn mock_get_estimated_costs_for_instruction(mock_provider: &mut MockSvmProvider)
     mock_provider
         .expect_get_estimated_costs_for_instruction()
         .returning(
-            |_instruction, _payer, _tx_submitter, _priority_fee_oracle| {
+            |_instruction, _payer, _tx_submitter, _priority_fee_oracle, _alt_address| {
                 Ok(SealevelTxCostEstimate::default())
             },
         );
@@ -612,6 +620,35 @@ fn mock_simulate_transaction(mock_provider: &mut MockClient) {
                 accounts: None,
                 units_consumed: None,
                 return_data: None,
+                replacement_blockhash: None,
+                inner_instructions: None,
+                fee: None,
+                loaded_accounts_data_size: None,
+                loaded_addresses: None,
+                post_balances: None,
+                post_token_balances: None,
+                pre_balances: None,
+                pre_token_balances: None,
+            })
+        });
+    mock_provider
+        .expect_simulate_versioned_transaction()
+        .returning(|_tx| {
+            Ok(RpcSimulateTransactionResult {
+                err: None,
+                logs: None,
+                accounts: None,
+                units_consumed: None,
+                return_data: None,
+                replacement_blockhash: None,
+                inner_instructions: None,
+                fee: None,
+                loaded_accounts_data_size: None,
+                loaded_addresses: None,
+                post_balances: None,
+                post_token_balances: None,
+                pre_balances: None,
+                pre_token_balances: None,
             })
         });
 }
@@ -635,10 +672,13 @@ fn mock_confirm_transaction(mock_submitter: &mut MockSubmitter) {
         .returning(move |_, _| Ok(true));
 }
 
-fn mock_get_transaction_with_commitment(mock_provider: &mut MockClient) {
+fn mock_get_signature_statuses_finalized(mock_provider: &mut MockClient, times: usize) {
     mock_provider
-        .expect_get_transaction_with_commitment()
-        .returning(|_, _| Ok(encoded_svm_transaction()));
+        .expect_get_signature_statuses_with_history()
+        .times(times)
+        .returning(|signatures| {
+            signature_statuses_response(vec![Some(finalized_signature_status()); signatures.len()])
+        });
 }
 
 fn mock_get_block_with_commitment(mock_provider: &mut MockClient) {

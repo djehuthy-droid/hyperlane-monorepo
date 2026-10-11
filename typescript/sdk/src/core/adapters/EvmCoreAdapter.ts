@@ -3,7 +3,7 @@ import { Address, HexString } from '@hyperlane-xyz/utils';
 
 import { BaseEvmAdapter } from '../../app/MultiProtocolApp.js';
 import { HyperlaneContractsMap } from '../../contracts/types.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
 import {
   ProviderType,
   TypedTransactionReceipt,
@@ -22,7 +22,7 @@ export class EvmCoreAdapter extends BaseEvmAdapter implements ICoreAdapter {
 
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { mailbox: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -40,10 +40,13 @@ export class EvmCoreAdapter extends BaseEvmAdapter implements ICoreAdapter {
     );
   }
 
-  extractMessageIds(
+  async extractMessageIds(
     sourceTx: TypedTransactionReceipt,
-  ): Array<{ messageId: string; destination: ChainName }> {
-    if (sourceTx.type !== ProviderType.EthersV5) {
+  ): Promise<Array<{ messageId: string; destination: ChainName }>> {
+    if (
+      sourceTx.type !== ProviderType.EthersV5 &&
+      sourceTx.type !== ProviderType.Tron
+    ) {
       throw new Error(
         `Unsupported provider type for EvmCoreAdapter ${sourceTx.type}`,
       );
@@ -67,5 +70,13 @@ export class EvmCoreAdapter extends BaseEvmAdapter implements ICoreAdapter {
       delayMs,
       maxAttempts,
     );
+  }
+
+  async isDelivered(
+    messageId: HexString,
+    blockTag?: string | number,
+  ): Promise<boolean> {
+    const mailbox = this.core.getContracts(this.chainName).mailbox;
+    return mailbox.delivered(messageId, { blockTag });
   }
 }

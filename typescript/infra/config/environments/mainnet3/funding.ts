@@ -6,6 +6,9 @@ import { Contexts } from '../../contexts.js';
 import { DockerImageRepos, mainnetDockerTags } from '../../docker.js';
 
 import desiredRebalancerBalances from './balances/desiredRebalancerBalances.json' with { type: 'json' };
+import desiredInventoryRebalancerBalances from './balances/desiredInventoryRebalancerBalances.json' with { type: 'json' };
+import desiredQuoteSubmitterBalances from './balances/desiredQuoteSubmitterBalances.json' with { type: 'json' };
+import desiredStableswapInventoryRebalancerBalances from './balances/desiredStableswapInventoryRebalancerBalances.json' with { type: 'json' };
 import desiredRelayerBalances from './balances/desiredRelayerBalances.json' with { type: 'json' };
 import lowUrgencyKeyFunderBalances from './balances/lowUrgencyKeyFunderBalance.json' with { type: 'json' };
 import { environment } from './chains.js';
@@ -25,6 +28,25 @@ const desiredRebalancerBalancePerChain = objMap(
   (_, balance) => balance.toString(),
 ) as Record<DesiredRebalancerBalanceChains, string>;
 
+type DesiredInventoryRebalancerBalanceChains =
+  keyof typeof desiredInventoryRebalancerBalances;
+const desiredInventoryRebalancerBalancePerChain = objMap(
+  desiredInventoryRebalancerBalances,
+  (_, balance) => balance.toString(),
+) as Record<DesiredInventoryRebalancerBalanceChains, string>;
+
+const desiredQuoteSubmitterBalancePerChain = objMap(
+  desiredQuoteSubmitterBalances,
+  (_, balance) => balance.toString(),
+);
+
+type DesiredStableswapInventoryRebalancerBalanceChains =
+  keyof typeof desiredStableswapInventoryRebalancerBalances;
+const desiredStableswapInventoryRebalancerBalancePerChain = objMap(
+  desiredStableswapInventoryRebalancerBalances,
+  (_, balance) => balance.toString(),
+) as Record<DesiredStableswapInventoryRebalancerBalanceChains, string>;
+
 type LowUrgencyKeyFunderBalanceChains =
   keyof typeof lowUrgencyKeyFunderBalances;
 const lowUrgencyKeyFunderBalancePerChain = objMap(
@@ -36,7 +58,7 @@ export const keyFunderConfig: KeyFunderConfig<
   typeof mainnet3SupportedChainNames
 > = {
   docker: {
-    repo: DockerImageRepos.MONOREPO,
+    repo: DockerImageRepos.NODE_SERVICES,
     tag: mainnetDockerTags.keyFunder,
   },
   // We're currently using the same deployer/key funder key as mainnet2.
@@ -48,65 +70,29 @@ export const keyFunderConfig: KeyFunderConfig<
     'http://prometheus-prometheus-pushgateway.monitoring.svc.cluster.local:9091',
   contextFundingFrom: Contexts.Hyperlane,
   contextsAndRolesToFund: {
-    [Contexts.Hyperlane]: [Role.Relayer, Role.Kathy, Role.Rebalancer],
-    [Contexts.ReleaseCandidate]: [Role.Relayer, Role.Kathy],
+    [Contexts.Hyperlane]: [
+      Role.Relayer,
+      Role.Rebalancer,
+      Role.InventoryRebalancer,
+      Role.QuoteSubmitter,
+      Role.StableswapInventoryRebalancer,
+    ],
+    [Contexts.ReleaseCandidate]: [Role.Relayer],
+    [Contexts.FastPath]: [Role.Relayer],
   },
-  chainsToSkip: [],
+  chainsToSkip: ['forma', 'mocachain', 'nesa'],
   // desired balance config, must be set for each chain
   desiredBalancePerChain: desiredRelayerBalancePerChain,
-  // if not set, keyfunder defaults to 0
-  desiredKathyBalancePerChain: {
-    ancient8: '0',
-    arbitrum: '0.1',
-    avalanche: '6',
-    base: '0.05',
-    blast: '0',
-    bob: '0',
-    bsc: '0.35',
-    celo: '150',
-    cyber: '0',
-    degenchain: '0',
-    endurance: '0',
-    ethereum: '0.4',
-    fraxtal: '0',
-    fusemainnet: '0',
-    gnosis: '100',
-    linea: '0',
-    lisk: '0',
-    lukso: '0',
-    mantapacific: '0',
-    mantle: '0',
-    merlin: '0',
-    metis: '0',
-    mode: '0',
-    moonbeam: '250',
-    optimism: '0.1',
-    polygon: '85',
-    polygonzkevm: '0.05',
-    redstone: '0',
-    scroll: '0.05',
-    sei: '0',
-    taiko: '0',
-    tangle: '0',
-    viction: '0.05',
-    worldchain: '0',
-    xai: '0',
-    xlayer: '0',
-    zetachain: '0',
-    zircuit: '0',
-    zoramainnet: '0',
-    // ignore non-evm chains
-    eclipsemainnet: '0',
-    neutron: '0',
-    solanamainnet: '0',
-    soon: '0',
-    sonicsvm: '0',
-  },
   // desired rebalancer balance config
   desiredRebalancerBalancePerChain,
+  // desired inventory rebalancer balance config
+  desiredInventoryRebalancerBalancePerChain,
+  // desired quote submitter balance config
+  desiredQuoteSubmitterBalancePerChain,
+  // desired stableswap inventory rebalancer balance config
+  desiredStableswapInventoryRebalancerBalancePerChain,
   // if not set, keyfunder defaults to using desired balance * 0.2 as the threshold
   igpClaimThresholdPerChain: {
-    ancient8: '0.1',
     arbitrum: '0.1',
     avalanche: '2',
     base: '0.1',
@@ -114,47 +100,30 @@ export const keyFunderConfig: KeyFunderConfig<
     bob: '0.1',
     bsc: '0.3',
     celo: '5',
-    cyber: '0.025',
-    degenchain: '50',
-    endurance: '10',
     ethereum: '0.2',
     fraxtal: '0.1',
-    fusemainnet: '10',
     gnosis: '5',
     linea: '0.1',
     lisk: '0.025',
     lukso: '10',
-    mantapacific: '0.1',
     mantle: '10',
-    merlin: '0.001',
     metis: '1',
     mode: '0.1',
-    moonbeam: '5',
     optimism: '0.1',
     polygon: '20',
-    polygonzkevm: '0.1',
-    redstone: '0.1',
-    scroll: '0.1',
-    sei: '5',
-    taiko: '0.1',
-    tangle: '1',
     viction: '2',
     worldchain: '0.1',
-    xai: '10',
     xlayer: '0.25',
-    zetachain: '20',
-    zircuit: '0.01',
-    zoramainnet: '0.1',
     // ignore non-evm chains
     eclipsemainnet: '0',
-    neutron: '0',
     solanamainnet: '0',
-    soon: '0',
     sonicsvm: '0',
   },
+  // Temporarily disabled while the sweep destination is moved to Turnkey treasury custody.
+  sweepEnabled: false,
   // Low urgency key funder balance thresholds for sweep calculations
-  // Automatic sweep enabled by default for all chains with these thresholds
-  // Defaults: sweep to 0x478be6076f31E9666123B9721D0B6631baD944AF when balance > 2x threshold, leave 1.5x threshold
+  // Used for sweep calculations when automatic sweeping is enabled.
+  // Defaults: sweep to 0x5b73A98165778BCCE72979B4EE3faCdb31728b8E when balance > 2x threshold, leave 1.5x threshold
   lowUrgencyKeyFunderBalances: lowUrgencyKeyFunderBalancePerChain,
   // Per-chain overrides for sweep (optional)
   sweepOverrides: {},

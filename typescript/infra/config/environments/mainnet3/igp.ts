@@ -1,112 +1,153 @@
 import {
   ChainMap,
   ChainName,
-  ChainTechnicalStack,
   HookType,
   IgpConfig,
+  IgpVersion,
 } from '@hyperlane-xyz/sdk';
 import { exclude, objMap } from '@hyperlane-xyz/utils';
 
 import {
   AllStorageGasOracleConfigs,
   getAllStorageGasOracleConfigs,
-  getOverhead,
+  getOverheadWithOverrides,
 } from '../../../src/config/gas-oracle.js';
-import { getChain } from '../../registry.js';
+import { legacyIgpChains } from '../../../src/config/chain.js';
 
+import { getEdenIgpConfig } from './eden.js';
+import { getTronIgpConfig } from './tron.js';
 import gasPrices from './gasPrices.json' with { type: 'json' };
 import { DEPLOYER, chainOwners } from './owners.js';
 import { supportedChainNames } from './supportedChainNames.js';
+import { getTokenGasOracleConfigs } from './tokenGasOracles.js';
 import rawTokenPrices from './tokenPrices.json' with { type: 'json' };
 
 const tokenPrices: ChainMap<string> = rawTokenPrices;
 
-export function getOverheadWithOverrides(local: ChainName, remote: ChainName) {
-  let overhead = getOverhead(local, remote);
-
-  if (remote === 'megaeth') {
-    overhead *= 10;
-  }
-
-  // Moonbeam/Torus gas usage can be up to 4x higher than vanilla EVM
-  if (remote === 'moonbeam' || remote === 'torus') {
-    overhead *= 4;
-  }
-
-  // Somnia gas usage is higher than the EVM and tends to give high
-  // estimates. We double the overhead to help account for this.
-  if (remote === 'somnia') {
-    overhead *= 2;
-  }
-
-  // ZkSync gas usage is different from the EVM and tends to give high
-  // estimates. We double the overhead to help account for this.
-  if (
-    getChain(remote).technicalStack === ChainTechnicalStack.ZkSync ||
-    remote === 'adichain'
-  ) {
-    overhead *= 2;
-
-    // Zero Network gas usage has changed recently and now requires
-    // another 3x multiplier on top of the ZKSync overhead.
-    if (remote === 'zeronetwork') {
-      overhead *= 3;
-    }
-  }
-
-  return overhead;
-}
-
 function getOracleConfigWithOverrides(origin: ChainName) {
-  const oracleConfig = storageGasOracleConfig[origin];
+  const oracleConfig = getStorageGasOracleConfig()[origin];
 
-  // WORKAROUND for Sealevel IGP decimal bug (solaxy-specific):
-  // The Rust Sealevel IGP code hardcodes SOL_DECIMALS = 9, but solaxy has 6 decimals.
-  // Rather than trying to calculate the correct workaround values, we hardcode
-  // the values that are already set on-chain and known to work.
+  // Solaxy's SOLX uses six native decimals, while the deployed Sealevel IGP
+  // converts remote costs to nine decimals. These per-leg rates compensate
+  // for that difference; tokenDecimals must still describe the remote token.
+  // Keep this desired configuration in sync with the Sealevel deployment JSON.
+  // Applying changes on-chain requires a separate owner-authorized update.
   if (origin === 'solaxy') {
     oracleConfig.ethereum = {
-      gasPrice: '9',
-      tokenExchangeRate: '15000000000000000000',
-      tokenDecimals: 6,
+      gasPrice: '2000000000',
+      tokenExchangeRate: '691771710368053885013231',
+      tokenDecimals: 18,
     };
+    // Sealevel divides gas * price * rate by 10^19. At 900,000 gas this
+    // quotes 15,038.681741 SOLX (six decimals), or ~$0.488 at the configured
+    // $0.00003243 SOLX price. The regression test checks the $0.45 floor.
     oracleConfig.solanamainnet = {
-      gasPrice: '1',
-      tokenExchangeRate: '15000000000000000000',
-      tokenDecimals: 6,
+      gasPrice: '6',
+      tokenExchangeRate: '27849410632667789280000',
+      tokenDecimals: 9,
     };
+  }
+
+  // Price-elasticity experiment: +20% on two price-insensitive bsc lanes
+  // (bsc→ethereum, bsc→base). Scales the market-derived exchange rate by 1.2 so
+  // the bump tracks live prices and stays isolated to these origin→remote pairs.
+  // Revert to end the test.
+  if (origin === 'bsc') {
+    for (const remote of ['ethereum', 'base'] as const) {
+      const laneConfig = oracleConfig[remote];
+      if (laneConfig) {
+        oracleConfig[remote] = {
+          ...laneConfig,
+          tokenExchangeRate: (
+            (BigInt(laneConfig.tokenExchangeRate.toString()) * 6n) /
+            5n
+          ).toString(),
+          // Keep the derived typicalCost metadata in sync with the +20% bump so
+          // dry-run/monitoring output matches the on-chain quote (gas amounts
+          // are unchanged; only the USD cost scales).
+          ...(laneConfig.typicalCost
+            ? {
+                typicalCost: {
+                  ...laneConfig.typicalCost,
+                  totalUsdCost: (laneConfig.typicalCost.totalUsdCost * 6) / 5,
+                },
+              }
+            : {}),
+        };
+      }
+    }
   }
 
   return oracleConfig;
 }
 
-const storageGasOracleConfig: AllStorageGasOracleConfigs =
-  getAllStorageGasOracleConfigs(
-    supportedChainNames,
-    tokenPrices,
-    gasPrices,
-    (local, remote) => getOverheadWithOverrides(local, remote),
-    true,
-  );
+// Lazily computes the full storage gas oracle config matrix (every local x
+// remote chain pair). This is expensive and emits precision-rebalance warnings,
+// so it is deferred until first use rather than run at module import time —
+// otherwise any script that merely imports the environment config pays for it.
+// Memoized so repeated access is cheap.
+let storageGasOracleConfigCache: AllStorageGasOracleConfigs | undefined;
+function getStorageGasOracleConfig(): AllStorageGasOracleConfigs {
+  if (!storageGasOracleConfigCache) {
+    storageGasOracleConfigCache = getAllStorageGasOracleConfigs(
+      supportedChainNames,
+      tokenPrices,
+      gasPrices,
+      (local, remote) => getOverheadWithOverrides(local, remote),
+      true,
+    );
+  }
+  return storageGasOracleConfigCache;
+}
 
-export const igp: ChainMap<IgpConfig> = objMap(
-  chainOwners,
-  (local, owner): IgpConfig => ({
-    type: HookType.INTERCHAIN_GAS_PAYMASTER,
-    ...owner,
-    ownerOverrides: {
-      ...owner.ownerOverrides,
-      interchainGasPaymaster: DEPLOYER,
-      storageGasOracle: DEPLOYER,
-    },
-    oracleKey: DEPLOYER,
-    beneficiary: DEPLOYER,
-    overhead: Object.fromEntries(
-      exclude(local, supportedChainNames).map((remote) => [
-        remote,
-        getOverheadWithOverrides(local, remote),
-      ]),
-    ),
-    oracleConfig: getOracleConfigWithOverrides(local),
-  }),
-);
+// Lazily builds the IGP config map. Deferred (and memoized) for the same reason
+// as the gas oracle config above.
+let igpCache: ChainMap<IgpConfig> | undefined;
+export function getIgp(): ChainMap<IgpConfig> {
+  if (igpCache) {
+    return igpCache;
+  }
+  const tokenGasOracleConfigs = getTokenGasOracleConfigs();
+  igpCache = objMap(chainOwners, (local, owner): IgpConfig => {
+    const tokenOracleConfig = tokenGasOracleConfigs[local];
+    if (local === 'eden') {
+      return {
+        ...getEdenIgpConfig(owner, getStorageGasOracleConfig()),
+        ...(tokenOracleConfig ? { tokenOracleConfig } : {}),
+      };
+    }
+
+    if (local === 'tron') {
+      return {
+        ...getTronIgpConfig(owner, getStorageGasOracleConfig()),
+        ...(tokenOracleConfig ? { tokenOracleConfig } : {}),
+      };
+    }
+
+    return {
+      type: HookType.INTERCHAIN_GAS_PAYMASTER,
+      ...(legacyIgpChains.includes(local)
+        ? { igpVersion: IgpVersion.Legacy }
+        : {}),
+      ...owner,
+      ownerOverrides: {
+        ...owner.ownerOverrides,
+        interchainGasPaymaster: DEPLOYER,
+        storageGasOracle: DEPLOYER,
+      },
+      oracleKey: DEPLOYER,
+      beneficiary: DEPLOYER,
+      overhead: Object.fromEntries(
+        exclude(local, supportedChainNames).map((remote) => [
+          remote,
+          getOverheadWithOverrides(local, remote),
+        ]),
+      ),
+      oracleConfig: getOracleConfigWithOverrides(local),
+      // Per-fee-token gas oracles for token-denominated IGP fees; configured in
+      // tokenGasOracles.ts.
+      ...(tokenOracleConfig ? { tokenOracleConfig } : {}),
+    };
+  });
+  return igpCache;
+}

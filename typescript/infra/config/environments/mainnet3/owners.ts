@@ -20,12 +20,25 @@ export const timelocks: ChainMap<Address> = {
 export const icaOwnerChain = 'ethereum';
 export const DEPLOYER = '0xa7ECcdb9Be08178f896c26b7BbD8C3D4E844d9Ba';
 
+// Dedicated Haggis deployer key (GCP secret `mainnet3-haggis-deployer-key`).
+// Staging routes are owned by this address so Haggis can iterate on them without
+// governance, using the same key it deploys and runs `warp apply` with.
+export const HAGGIS_DEPLOYER = '0x22EA0e66c9aFe2879135f4d16B5627454C53877e';
+
+// Dedicated Turnkey pauser: pause() can be signed solo by services, unpause()
+// requires rootUser approval. Any pausable module owned by this address is covered.
+export const PAUSER = '0x60Cc386C85717CB51C2827A75e14826883dF5da4';
+
+// Celestia multisig that owns the eden core deployment.
+// IGP/oracle ownership stays with the deployer.
+export const EDEN_CORE_OWNER = '0x260eDfa1d9f7Ec832E079f90c043360d394d2ce4';
+
 export const ethereumChainOwners: ChainMap<OwnableConfig> = Object.fromEntries(
   ethereumChainNames.map((local) => {
     const owner =
+      regularSafes[local] ??
       regularIcas[local] ??
       regularIcasLegacy[local] ??
-      regularSafes[local] ??
       awIcasLegacy[local] ??
       awSafes[local] ??
       DEPLOYER;
@@ -55,27 +68,11 @@ export const chainOwners: ChainMap<OwnableConfig> = {
     // Squads multisig
     owner: 'E4TncCw3WMqQZbkACVcomX3HqcSzLfNyhTnqKN1DimGr',
   },
-  neutron: {
-    // Da0Da0 multisig
-    owner: 'neutron1fqf5mprg3f5hytvzp3t7spmsum6rjrw80mq8zgkc0h6rxga0dtzqws3uu7',
-  },
-  // We intentionally cause issues if these were to be used, but satisfy the types
-  // and ensure there's an entry for each supported chain.
-  stride: {
-    owner: 'n/a - nothing owned here',
-  },
-  milkyway: {
-    owner: 'TODO: configure milkyway owner',
-  },
   paradex: {
     owner: '0x41e326bf455461926b9c334d02039cb0d4f09698c5158ef8d939b33b240a0e0',
   },
   kyve: {
     owner: 'TODO: configure kyve owner',
-  },
-  soon: {
-    // Squads vault
-    owner: 'E3QPSn2Upk2EiidSsUqSQpRCc7BhzWZCKpVncemz3p62',
   },
   sonicsvm: {
     // Will move to a Squads once it's live
@@ -86,9 +83,6 @@ export const chainOwners: ChainMap<OwnableConfig> = {
   },
   solaxy: {
     owner: '9bRSUPjfS3xS6n5EfkJzHFTRDa4AHLda8BU2pP4HoWnf',
-  },
-  noble: {
-    owner: 'TODO: configure noble owner',
   },
   celestia: {
     owner: 'TODO: configure celestia owner',

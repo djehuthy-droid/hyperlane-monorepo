@@ -14,7 +14,7 @@ import { Address, Domain, assert } from '@hyperlane-xyz/utils';
 
 import { BaseSealevelAdapter } from '../../app/MultiProtocolApp.js';
 import { SEALEVEL_PRIORITY_FEES } from '../../consts/sealevel.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
 import { ChainName } from '../../types.js';
 import {
   SealevelAccountDataWrapper,
@@ -28,6 +28,7 @@ import {
   SealevelGasOverheadConfig,
   SealevelIgpData,
   SealevelIgpDataSchema,
+  SealevelIgpFeeConfig,
   SealevelIgpInstruction,
   SealevelIgpQuoteGasPaymentInstruction,
   SealevelIgpQuoteGasPaymentResponse,
@@ -40,6 +41,7 @@ import {
   SealevelSetDestinationGasOverheadsInstructionSchema,
   SealevelSetGasOracleConfigsInstruction,
   SealevelSetGasOracleConfigsInstructionSchema,
+  decodeTrailingIgpFeeConfig,
 } from './serialization.js';
 
 export interface IgpPaymentKeys {
@@ -53,7 +55,7 @@ export abstract class SealevelIgpProgramAdapter extends BaseSealevelAdapter {
 
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { programId: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -199,7 +201,7 @@ export class SealevelIgpAdapter extends SealevelIgpProgramAdapter {
 
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { igp: Address; programId: Address },
   ) {
     super(chainName, multiProvider, addresses);
@@ -226,7 +228,25 @@ export class SealevelIgpAdapter extends SealevelIgpProgramAdapter {
       SealevelAccountDataWrapper,
       accountInfo.data,
     );
-    return accountData.data as SealevelIgpData;
+
+    const data = accountData.data;
+    assert(
+      data instanceof SealevelIgpData,
+      'Decoded wrapper.data is not SealevelIgpData',
+    );
+
+    const consumedSize = serialize(SealevelIgpDataSchema, accountData).length;
+    data.fee_config = decodeTrailingIgpFeeConfig(
+      Buffer.from(accountInfo.data),
+      consumedSize,
+    );
+    return data;
+  }
+
+  async getFeeConfig(): Promise<SealevelIgpFeeConfig | undefined> {
+    const { fee_config } = await this.getAccountInfo();
+
+    return fee_config;
   }
 
   // Should match https://github.com/hyperlane-xyz/hyperlane-monorepo/blob/main/rust/sealevel/programs/hyperlane-sealevel-igp/src/processor.rs#L536-L581
@@ -242,9 +262,10 @@ export class SealevelIgpAdapter extends SealevelIgpProgramAdapter {
   }
 
   /**
-   * Constructs a Transaction for .
+   * Claims all lamports above the chain's current rent-exempt minimum,
+   * including accrued gas payments and excess rent deposits.
    * @param {PublicKey} beneficiary - The IGP's configured beneficiary.
-   * @returns {Promise<TransactionInstruction>} The claim instruction.
+   * @returns {Promise<Transaction>} The unsigned claim transaction.
    */
   async populateClaimTx(beneficiary: PublicKey): Promise<Transaction> {
     const igpData = await this.getAccountInfo();
@@ -375,7 +396,7 @@ export class SealevelOverheadIgpAdapter extends SealevelIgpProgramAdapter {
 
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { overheadIgp: Address; programId: Address },
   ) {
     super(chainName, multiProvider, addresses);

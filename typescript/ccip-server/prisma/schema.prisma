@@ -2,24 +2,33 @@
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
 generator client {
-  provider = "prisma-client-js"
-  output   = "../src/generated/prisma"
+  provider      = "prisma-client"
+  output        = "../src/generated/prisma"
+  compilerBuild = "small"
 }
 
-// DATABASE_URL is required for prisma generate but actual connection is handled in code
+// DATABASE_URL is now configured in prisma.config.ts (Prisma 7 requirement)
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model Commitment {
-  commitment           String
-  revealMessageId      String   @id
-  calls                Json
-  relayers             Json
-  salt                 String
-  ica                  String
-  commitmentDispatchTx String
-  originDomain         Int
-  createdAt            DateTime @default(now())
+  commitment   String   @id
+  calls        Json
+  relayers     Json
+  salt         String
+  ica          String
+  originDomain Int
+  createdAt    DateTime @default(now())
+}
+
+model Calldata {
+  commitment         String   @id
+  originDomain       Int
+  data               String
+  salt               String
+  relayers           Json
+  destinationAccount String
+  revealAccounts     Json?
+  createdAt          DateTime @default(now())
 }

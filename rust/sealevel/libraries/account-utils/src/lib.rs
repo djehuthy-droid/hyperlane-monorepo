@@ -3,13 +3,99 @@ use solana_program::{
     account_info::AccountInfo,
     program::{invoke, invoke_signed},
     program_error::ProgramError,
+    pubkey,
     pubkey::Pubkey,
     rent::Rent,
-    system_instruction, system_program,
+};
+use solana_system_interface::{
+    instruction as system_instruction, program::id as system_program_id,
 };
 
 pub mod discriminator;
+pub mod error;
+
 pub use discriminator::*;
+pub use error::*;
+
+/// Verifies that no additional accounts remain in the iterator.
+pub fn ensure_no_extraneous_accounts(
+    accounts_iter: &mut std::slice::Iter<'_, AccountInfo<'_>>,
+) -> Result<(), ProgramError> {
+    if accounts_iter.next().is_some() {
+        return Err(AccountError::ExtraneousAccount.into());
+    }
+
+    Ok(())
+}
+
+/// Result of checking an account's initialization state.
+pub enum AccountInitState {
+    /// Account is uninitialized (empty data, owned by system program).
+    Uninitialized,
+    /// Account is initialized and owned by the expected program.
+    Initialized,
+    /// Account owner does not match the expected program.
+    OwnerMismatch,
+}
+
+/// Extension trait for `AccountInfo` providing common inspection and lifecycle methods.
+pub trait AccountInfoExt {
+    /// Checks the account's initialization state against an expected owner.
+    fn init_state(&self, expected_owner: &Pubkey) -> AccountInitState;
+
+    /// Closes the account by draining lamports to recipient, zeroing data, and
+    /// reassigning ownership to the system program.
+    fn close_account(&self, recipient: &AccountInfo) -> Result<(), ProgramError>;
+}
+
+impl AccountInfoExt for AccountInfo<'_> {
+    fn init_state(&self, expected_owner: &Pubkey) -> AccountInitState {
+        if self.data_is_empty() && self.owner == &system_program_id() {
+            AccountInitState::Uninitialized
+        } else if self.owner == expected_owner {
+            AccountInitState::Initialized
+        } else {
+            AccountInitState::OwnerMismatch
+        }
+    }
+
+    fn close_account(&self, recipient: &AccountInfo) -> Result<(), ProgramError> {
+        if !self.is_writable {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if self.key == recipient.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let lamports = self.lamports();
+        **self.try_borrow_mut_lamports()? = 0;
+        **recipient.try_borrow_mut_lamports()? = recipient
+            .lamports()
+            .checked_add(lamports)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        self.data.borrow_mut().fill(0);
+        self.resize(0)?;
+
+        self.assign(&system_program_id());
+
+        Ok(())
+    }
+}
+
+/// The SPL Noop program ID.
+/// Defined here to avoid pulling in `spl-noop` which depends on `solana-program ^2`.
+pub const SPL_NOOP_PROGRAM_ID: Pubkey = pubkey!("noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV");
+
+/// Serialized size of a `Pubkey` (32 bytes).
+pub const PUBKEY_SIZE: usize = 32;
+/// Serialized size of an `H256` value (32 bytes).
+pub const H256_SIZE: usize = 32;
+/// Serialized size of an `H160` value (20 bytes).
+pub const H160_SIZE: usize = 20;
+/// Borsh-encoded length prefix size (4-byte `u32`).
+pub const BORSH_LEN_PREFIX: usize = std::mem::size_of::<u32>();
 
 /// Data that has a predictable size when serialized.
 pub trait SizedData {
@@ -81,11 +167,21 @@ where
         // Account data is zero initialized.
         let initialized = bool::deserialize(buf)?;
         let data = if initialized {
-            Some(T::deserialize(buf).map(Box::new)?)
+            Some(Self::deserialize_boxed(buf)?)
         } else {
             None
         };
         Ok(data)
+    }
+
+    /// Deserializes to a Box<T>. This function is intentionally not inlined
+    /// so that the large stack frame for T is isolated and released after return.
+    /// This prevents stack overflow when used in CPI contexts.
+    #[inline(never)]
+    fn deserialize_boxed(buf: &mut &[u8]) -> Result<Box<T>, ProgramError> {
+        T::deserialize(buf)
+            .map(Box::new)
+            .map_err(|_| ProgramError::BorshIoError)
     }
 
     /// Deserializes the account data from the given slice and wraps it in an `AccountData`.
@@ -118,10 +214,10 @@ where
                     Err(err) => match err.kind() {
                         std::io::ErrorKind::WriteZero => {
                             if !allow_realloc {
-                                return Err(ProgramError::BorshIoError(err.to_string()));
+                                return Err(ProgramError::BorshIoError);
                             }
                         }
-                        _ => return Err(ProgramError::BorshIoError(err.to_string())),
+                        _ => return Err(ProgramError::BorshIoError),
                     },
                 };
 
@@ -130,9 +226,9 @@ where
 
             #[allow(unexpected_cfgs)] // TODO: `rustc` 1.80.1 issue
             if cfg!(target_os = "solana") {
-                account.realloc(data_len + realloc_increment, false)?;
+                account.resize(data_len + realloc_increment)?;
             } else {
-                panic!("realloc() is only supported on the SVM");
+                panic!("resize() is only supported on the SVM");
             }
         }
         Ok(())
@@ -145,6 +241,10 @@ where
         let mut writable_target: &mut [u8] = &mut *target;
         true.serialize(&mut writable_target)
             .and_then(|_| self.data.serialize(&mut writable_target))?;
+        // Zero any trailing bytes so stale data from a previously larger
+        // serialization (e.g. an optional field going from Some → None)
+        // does not confuse future deserialization.
+        writable_target.fill(0);
         Ok(())
     }
 }
@@ -184,7 +284,7 @@ where
         }
 
         if account_data_len < required_account_data_len {
-            account_info.realloc(required_account_data_len, false)?;
+            account_info.resize(required_account_data_len)?;
         }
 
         self.store(account_info, false)
@@ -262,7 +362,7 @@ pub fn verify_rent_exempt(account: &AccountInfo<'_>, rent: &Rent) -> Result<(), 
 /// Returns Ok if the account data is empty and the owner is the system program.
 /// Returns Err otherwise.
 pub fn verify_account_uninitialized(account: &AccountInfo) -> Result<(), ProgramError> {
-    if account.data_is_empty() && account.owner == &system_program::id() {
+    if account.data_is_empty() && account.owner == &system_program_id() {
         return Ok(());
     }
     Err(ProgramError::AccountAlreadyInitialized)

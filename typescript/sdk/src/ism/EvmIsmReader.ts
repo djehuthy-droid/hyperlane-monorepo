@@ -6,15 +6,20 @@ import {
   AbstractRoutingIsm__factory,
   AmountRoutingIsm__factory,
   ArbL2ToL1Ism__factory,
+  BlacklistIsm__factory,
   CCIPIsm__factory,
   DefaultFallbackRoutingIsm__factory,
+  DefaultIsm__factory,
+  DelayedFlowRouterHookIsm__factory,
   IInterchainSecurityModule__factory,
   IMultisigIsm__factory,
   IOutbox__factory,
   InterchainAccountRouter__factory,
+  NetFlowRateLimitedHookIsm__factory,
   OPStackIsm__factory,
   Ownable__factory,
   PausableIsm__factory,
+  RateLimitedIsm__factory,
   StaticAggregationIsm__factory,
   TrustedRelayerIsm__factory,
 } from '@hyperlane-xyz/core';
@@ -34,22 +39,35 @@ import { DEFAULT_CONTRACT_READ_CONCURRENCY } from '../consts/concurrency.js';
 import { DispatchedMessage } from '../core/types.js';
 import { ChainTechnicalStack } from '../metadata/chainMetadataTypes.js';
 import { MultiProvider } from '../providers/MultiProvider.js';
+import { EvmEventLogsReader } from '../rpc/evm/EvmEventLogsReader.js';
 import { ChainMap, ChainNameOrId } from '../types.js';
 import { HyperlaneReader } from '../utils/HyperlaneReader.js';
+import {
+  contractHasString,
+  isMissingSelectorCallException,
+  throwIfNotMissingSelector,
+} from '../utils/contract.js';
 
 import {
   AggregationIsmConfig,
   ArbL2ToL1IsmConfig,
+  BlacklistIsmConfig,
   DerivedIsmConfig,
   DomainRoutingIsmConfig,
   IsmConfig,
   IsmType,
+  MailboxDefaultIsmConfig,
   ModuleType,
   MultisigIsmConfig,
   NullIsmConfig,
   OffchainLookupIsmConfig,
   RoutingIsmConfig,
 } from './types.js';
+import { readBlacklistedIds } from './blacklist.js';
+import { deriveDelayedFlowRemoteIsms } from './delayedFlow.js';
+
+const INCREMENTAL_REVERT_STRING =
+  'IncrementalDomainRoutingIsm: removal not supported';
 
 export interface IsmReader {
   deriveIsmConfig(address: Address): Promise<DerivedIsmConfig>;
@@ -73,9 +91,16 @@ export interface IsmReader {
   ): void;
 }
 
+// ISM types that cannot be deployed by HyperlaneIsmFactory — preserve as address strings.
+const NON_REDEPLOYABLE_ISM_TYPES = new Set<IsmType>([
+  IsmType.OFFCHAIN_LOOKUP,
+  IsmType.INTERCHAIN_ACCOUNT_ROUTING,
+]);
+
 export class EvmIsmReader extends HyperlaneReader implements IsmReader {
   protected readonly logger = rootLogger.child({ module: 'EvmIsmReader' });
   protected isZkSyncChain: boolean;
+  protected readonly evmLogReader: EvmEventLogsReader;
 
   constructor(
     protected readonly multiProvider: MultiProvider,
@@ -92,6 +117,11 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
       this.chain,
     ).technicalStack;
     this.isZkSyncChain = chainTechnicalStack === ChainTechnicalStack.ZkSync;
+
+    this.evmLogReader = EvmEventLogsReader.fromConfig(
+      { chain: this.chain },
+      multiProvider,
+    );
   }
 
   async deriveIsmConfigFromAddress(
@@ -177,24 +207,54 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
       case IsmType.FALLBACK_ROUTING:
       case IsmType.ROUTING:
         config.domains = await promiseObjAll(
-          objMap(config.domains, async (_, ism) => this.deriveIsmConfig(ism)),
+          objMap(config.domains, async (_, ism) => {
+            const derived = await this.deriveIsmConfig(ism);
+            return this.preserveUnredeployableIsm(ism, derived);
+          }),
         );
         break;
       case IsmType.AGGREGATION:
       case IsmType.STORAGE_AGGREGATION:
         config.modules = await Promise.all(
-          config.modules.map(async (ism) => this.deriveIsmConfig(ism)),
+          config.modules.map(async (ism) => {
+            const derived = await this.deriveIsmConfig(ism);
+            return this.preserveUnredeployableIsm(ism, derived);
+          }),
         );
         break;
-      case IsmType.AMOUNT_ROUTING:
-        [config.lowerIsm, config.upperIsm] = await Promise.all([
-          this.deriveIsmConfig(config.lowerIsm),
-          this.deriveIsmConfig(config.upperIsm),
+      case IsmType.AMOUNT_ROUTING: {
+        const lowerOrig = config.lowerIsm;
+        const upperOrig = config.upperIsm;
+        const [lowerDerived, upperDerived] = await Promise.all([
+          this.deriveIsmConfig(lowerOrig),
+          this.deriveIsmConfig(upperOrig),
         ]);
+        config.lowerIsm = this.preserveUnredeployableIsm(
+          lowerOrig,
+          lowerDerived,
+        );
+        config.upperIsm = this.preserveUnredeployableIsm(
+          upperOrig,
+          upperDerived,
+        );
         break;
+      }
     }
 
     return config as DerivedIsmConfig;
+  }
+
+  // Returns the original IsmConfig for non-redeployable ISM types (e.g. OFFCHAIN_LOOKUP,
+  // INTERCHAIN_ACCOUNT_ROUTING) so normalizeConfig and deploy() handle them correctly.
+  // The original is typically a string address that survives normalizeConfig intact and
+  // reaches deploy()'s string branch; an object config is also preserved via derived.address.
+  private preserveUnredeployableIsm(
+    original: IsmConfig,
+    derived: DerivedIsmConfig,
+  ): IsmConfig {
+    if (!NON_REDEPLOYABLE_ISM_TYPES.has(derived.type)) return derived;
+    if (typeof original === 'string') return original;
+    return derived.address;
   }
 
   async deriveRoutingConfig(
@@ -210,37 +270,24 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
       ModuleType.ROUTING,
     );
 
-    // check if its the ICA ISM
-    try {
-      const icaInstance = InterchainAccountRouter__factory.connect(
-        address,
-        this.provider,
+    // OPTIMIZATION: When we have messageContext, we only need to derive
+    // the specific ISM that will verify this message, not the full routing table.
+    // Just call route(message) and derive that single ISM directly.
+    if (this.messageContext) {
+      const routedIsmAddress = await abstractRoutingIsm.route(
+        this.messageContext.message,
       );
-      await icaInstance.CCIP_READ_ISM();
-      if (this.messageContext) {
-        // Route via the message context to get routed ISM
-        const routedIsm = await icaInstance.route(this.messageContext.message);
-        return this.deriveIsmConfig(routedIsm);
-      }
-      // If no message context, just return this ICA ISM placeholder
-      return {
-        address,
-        type: IsmType.INTERCHAIN_ACCOUNT_ROUTING,
-        isms: {},
-        owner: await icaInstance.owner(),
-      };
-    } catch {
-      this.logger.debug(
-        'Error accessing CCIP_READ_ISM property, implying this is not an ICA ISM.',
-        address,
-      );
+      return this.deriveIsmConfig(routedIsmAddress);
     }
+
+    const isIca = await this.isIcaRouter(address);
 
     let owner: Address | undefined;
     const ownableIsm = Ownable__factory.connect(address, this.provider);
     try {
       owner = await ownableIsm.owner();
-    } catch {
+    } catch (error) {
+      throwIfNotMissingSelector(error);
       this.logger.debug(
         'Error accessing owner property, implying that this is not a DefaultFallbackRoutingIsm.',
         address,
@@ -249,46 +296,46 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
 
     // If the current ISM does not have an owner then it is an Amount Router
     if (!owner) {
+      if (isIca) {
+        return {
+          type: IsmType.INTERCHAIN_ACCOUNT_ROUTING,
+          isms: {},
+          address,
+          owner: ethers.constants.AddressZero,
+        };
+      }
       return this.deriveNonOwnableRoutingConfig(address);
     }
 
     const defaultFallbackIsmInstance =
       DefaultFallbackRoutingIsm__factory.connect(address, this.provider);
-    const domainIds = this.messageContext
-      ? [BigNumber.from(this.messageContext.parsed.origin)]
-      : await defaultFallbackIsmInstance.domains();
+    const domainIds = await defaultFallbackIsmInstance.domains();
 
-    const icaRouter = InterchainAccountRouter__factory.connect(
-      address,
-      this.provider,
-    );
-    try {
-      await icaRouter.CCIP_READ_ISM();
-
+    // Detect ICA routing ISM (full or minimal router)
+    if (isIca) {
+      const icaRouter = InterchainAccountRouter__factory.connect(
+        address,
+        this.provider,
+      );
       return {
         type: IsmType.INTERCHAIN_ACCOUNT_ROUTING,
         isms: await this.deriveRemoteIsmConfigs(
           domainIds,
           abstractRoutingIsm,
-          icaRouter.isms,
+          (domain) => icaRouter.isms(domain),
           // The isms here are deployed on remote chains and can't be derived
           false,
         ),
         address,
         owner,
       };
-    } catch {
-      this.logger.debug(
-        `Error accessing CCIP_READ_ISM property, implying that this is not a InterchainAccountRouterIsm.`,
-        address,
-      );
     }
 
     const domains: DomainRoutingIsmConfig['domains'] =
       await this.deriveRemoteIsmConfigs(
         domainIds,
         abstractRoutingIsm,
-        defaultFallbackIsmInstance.module,
+        (domain) => defaultFallbackIsmInstance.module(domain),
         true,
       );
 
@@ -296,12 +343,27 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
     let ismType: IsmType = IsmType.FALLBACK_ROUTING;
     try {
       await defaultFallbackIsmInstance.mailbox();
-    } catch {
+    } catch (error) {
+      throwIfNotMissingSelector(error);
       ismType = IsmType.ROUTING;
       this.logger.debug(
         'Error accessing mailbox property, implying this is not a fallback routing ISM.',
         address,
       );
+    }
+
+    // Check if it's an incremental routing ISM by looking for the unique error message in bytecode
+    if (ismType === IsmType.ROUTING) {
+      if (
+        await contractHasString(
+          this.provider,
+          address,
+          INCREMENTAL_REVERT_STRING,
+        )
+      ) {
+        ismType = IsmType.INCREMENTAL_ROUTING;
+        this.logger.debug({ address }, 'Detected incremental routing ISM');
+      }
     }
 
     return {
@@ -310,6 +372,34 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
       type: ismType,
       domains,
     };
+  }
+
+  /**
+   * Detects whether the contract at `address` is an ICA router
+   * by probing for CCIP_READ_ISM() (full router) or bytecodeHash() (minimal router).
+   */
+  private async isIcaRouter(address: Address): Promise<boolean> {
+    const icaInstance = InterchainAccountRouter__factory.connect(
+      address,
+      this.provider,
+    );
+    try {
+      await icaInstance.CCIP_READ_ISM();
+      return true;
+    } catch (error) {
+      throwIfNotMissingSelector(error);
+      try {
+        await icaInstance.bytecodeHash();
+        return true;
+      } catch (innerError) {
+        throwIfNotMissingSelector(innerError);
+        this.logger.debug(
+          'Not an ICA router (no CCIP_READ_ISM or bytecodeHash).',
+          address,
+        );
+        return false;
+      }
+    }
   }
 
   private async deriveRemoteIsmConfigs(
@@ -339,7 +429,7 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
         );
         if (!chainName) {
           this.logger.warn(
-            `Unknown domain ID ${domainId}, skipping domain configuration`,
+            `Unknown domain ID ${domainId.toString()}, skipping domain configuration`,
           );
           return;
         }
@@ -347,12 +437,14 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
           ? await contractInstance.route(this.messageContext.message)
           : await addressDeriveFunc(domainId);
 
-        return [
-          chainName,
-          deriveConfig
-            ? await this.deriveIsmConfig(moduleAddress)
-            : moduleAddress,
-        ];
+        if (deriveConfig) {
+          const derived = await this.deriveIsmConfigFromAddress(moduleAddress);
+          return [
+            chainName,
+            this.preserveUnredeployableIsm(moduleAddress, derived),
+          ];
+        }
+        return [chainName, moduleAddress];
       },
     );
 
@@ -363,7 +455,7 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
 
   private async deriveNonOwnableRoutingConfig(
     address: Address,
-  ): Promise<WithAddress<RoutingIsmConfig>> {
+  ): Promise<WithAddress<RoutingIsmConfig | MailboxDefaultIsmConfig>> {
     const ism = AmountRoutingIsm__factory.connect(address, this.provider);
 
     let lowerIsm: Address;
@@ -375,7 +467,23 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
         ism.upper(),
         ism.threshold(),
       ]);
-    } catch {
+    } catch (error) {
+      throwIfNotMissingSelector(error);
+
+      // DefaultIsm exposes a public mailbox() getter; the legacy
+      // InterchainAccountIsm keeps its mailbox private, so this probe cleanly
+      // separates the two remaining ownerless routing ISMs.
+      const defaultIsm = DefaultIsm__factory.connect(address, this.provider);
+      try {
+        await defaultIsm.mailbox();
+        return {
+          type: IsmType.MAILBOX_DEFAULT,
+          address,
+        };
+      } catch (innerError) {
+        throwIfNotMissingSelector(innerError);
+      }
+
       // If we fail to access AmountRoutingIsm properties, this is likely a legacy InterchainAccountIsm
       this.logger.debug(
         'Error accessing AmountRoutingIsm properties, treating as legacy InterchainAccountIsm.',
@@ -391,11 +499,15 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
       };
     }
 
+    const [lowerDerived, upperDerived] = await Promise.all([
+      this.deriveIsmConfigFromAddress(lowerIsm),
+      this.deriveIsmConfigFromAddress(upperIsm),
+    ]);
     return {
       type: IsmType.AMOUNT_ROUTING,
       address,
-      lowerIsm: await this.deriveIsmConfig(lowerIsm),
-      upperIsm: await this.deriveIsmConfig(upperIsm),
+      lowerIsm: this.preserveUnredeployableIsm(lowerIsm, lowerDerived),
+      upperIsm: this.preserveUnredeployableIsm(upperIsm, upperDerived),
       threshold: threshold.toNumber(),
     };
   }
@@ -404,6 +516,7 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
     address: Address,
   ): Promise<WithAddress<AggregationIsmConfig>> {
     const ism = StaticAggregationIsm__factory.connect(address, this.provider);
+
     this.assertModuleType(await ism.moduleType(), ModuleType.AGGREGATION);
 
     const [modules, threshold] = await ism.modulesAndThreshold(
@@ -413,7 +526,10 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
     const ismConfigs = await concurrentMap(
       this.concurrency,
       modules,
-      async (module) => this.deriveIsmConfig(module),
+      async (module) => {
+        const derived = await this.deriveIsmConfigFromAddress(module);
+        return this.preserveUnredeployableIsm(module, derived);
+      },
     );
 
     // If it's a zkSync chain, it must be a StorageAggregationIsm
@@ -487,7 +603,8 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
         relayer,
         type: IsmType.TRUSTED_RELAYER,
       };
-    } catch {
+    } catch (error) {
+      throwIfNotMissingSelector(error);
       this.logger.debug(
         'Error accessing "trustedRelayer" property, implying this is not a Trusted Relayer ISM.',
         address,
@@ -496,16 +613,29 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
 
     // if it has paused() property --> PAUSABLE
     const pausableIsm = PausableIsm__factory.connect(address, this.provider);
-    try {
-      const paused = await pausableIsm.paused();
-      const owner = await pausableIsm.owner();
+    const [pausedResult, ownerResult] = await Promise.allSettled([
+      pausableIsm.paused(),
+      pausableIsm.owner(),
+    ]);
+    const unexpectedError = [pausedResult, ownerResult].find(
+      (result) =>
+        result.status === 'rejected' &&
+        !isMissingSelectorCallException(result.reason),
+    );
+    if (unexpectedError?.status === 'rejected') {
+      throw unexpectedError.reason;
+    }
+    if (
+      pausedResult.status === 'fulfilled' &&
+      ownerResult.status === 'fulfilled'
+    ) {
       return {
         address,
-        owner,
+        owner: ownerResult.value,
         type: IsmType.PAUSABLE,
-        paused,
+        paused: pausedResult.value,
       };
-    } catch {
+    } else {
       this.logger.debug(
         'Error accessing "paused" property, implying this is not a Pausable ISM.',
         address,
@@ -525,7 +655,8 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
         type: IsmType.CCIP,
         originChain,
       };
-    } catch {
+    } catch (error) {
+      throwIfNotMissingSelector(error);
       this.logger.debug(
         'Error accessing "ccipOrigin" property, implying this is not a CCIP ISM.',
         address,
@@ -542,11 +673,124 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
         origin: address,
         nativeBridge: '', // no way to extract native bridge from the ism
       };
-    } catch {
+    } catch (error) {
+      throwIfNotMissingSelector(error);
       this.logger.debug(
         'Error accessing "VERIFIED_MASK_INDEX" property, implying this is not an OP Stack ISM.',
         address,
       );
+    }
+
+    // Detect RateLimitedIsm by probing for its unique recipient() selector.
+    // Safe today because no other NULL-type ISM in this repo exposes recipient().
+    // TODO: replace with bytecode or unique-selector matching if custom NULL ISMs
+    //       with the same interface are ever introduced.
+    const rateLimitedIsm = RateLimitedIsm__factory.connect(
+      address,
+      this.provider,
+    );
+    try {
+      await rateLimitedIsm.recipient(); // probe selector only; recipient is a constructor arg omitted from read()
+      const maxCapacity = (await rateLimitedIsm.maxCapacity()).toString();
+      const duration = (await rateLimitedIsm.DURATION()).toBigInt();
+      const owner = await rateLimitedIsm.owner();
+      return {
+        address,
+        type: IsmType.RATE_LIMITED,
+        maxCapacity,
+        duration,
+        owner,
+      };
+    } catch (error) {
+      throwIfNotMissingSelector(error);
+      this.logger.debug(
+        'Error accessing "recipient" property, implying this is not a Rate Limited ISM.',
+        address,
+      );
+    }
+
+    const blacklistConfig = await this.deriveBlacklistConfig(address);
+    if (blacklistConfig) {
+      return blacklistConfig;
+    }
+
+    // Discriminators for the two warp-route hybrid hook/ISMs, checked against
+    // the ABIs of the NULL-type ISMs probed above:
+    //   - warpRouter() is exposed by NetFlowRateLimitedHookIsm and
+    //     DelayedFlowRouterHookIsm, and by neither BlacklistIsm (whose ABI is
+    //     blacklist/blacklistedIds/values/owner/moduleType/verify) nor any
+    //     other ISM probed above, so the two directions cannot shadow.
+    //   - maxDelay() then separates the two hybrids: only
+    //     DelayedFlowRouterHookIsm declares it.
+    // Every probe here calls an output-bearing view, so a contract missing the
+    // selector reverts instead of decoding empty returndata as a match.
+    const netFlowIsm = NetFlowRateLimitedHookIsm__factory.connect(
+      address,
+      this.provider,
+    );
+    let warpRouter: Address | undefined;
+    try {
+      warpRouter = await netFlowIsm.warpRouter();
+    } catch (error) {
+      throwIfNotMissingSelector(error);
+      this.logger.debug(
+        'Error accessing "warpRouter" property, implying this is not a warp-route hybrid hook/ISM.',
+        address,
+      );
+    }
+    if (warpRouter) {
+      const delayedIsm = DelayedFlowRouterHookIsm__factory.connect(
+        address,
+        this.provider,
+      );
+      let maxDelay: number | undefined;
+      try {
+        maxDelay = await delayedIsm.maxDelay();
+      } catch (error) {
+        throwIfNotMissingSelector(error);
+        this.logger.debug(
+          'Error accessing "maxDelay" property, implying this is a NetFlowRateLimitedHookIsm.',
+          address,
+        );
+      }
+
+      if (maxDelay !== undefined) {
+        const [thresholdBps, duration, owner, remoteIsms] = await Promise.all([
+          delayedIsm.thresholdBps(),
+          delayedIsm.DURATION(),
+          delayedIsm.owner(),
+          deriveDelayedFlowRemoteIsms(
+            delayedIsm,
+            this.multiProvider,
+            this.concurrency,
+            this.logger,
+          ),
+        ]);
+        return {
+          address,
+          type: IsmType.DELAYED_FLOW_ROUTER,
+          warpRouter,
+          thresholdBps: thresholdBps.toNumber(),
+          maxDelay,
+          duration: duration.toBigInt(),
+          owner,
+          remoteIsms,
+        };
+      }
+
+      const [thresholdBps, duration, owner] = await Promise.all([
+        netFlowIsm.thresholdBps(),
+        netFlowIsm.DURATION(),
+        netFlowIsm.owner(),
+      ]);
+      return {
+        address,
+        type: IsmType.NET_FLOW_RATE_LIMITED,
+        warpRouter,
+        thresholdBps: thresholdBps.toNumber(),
+        duration: duration.toBigInt(),
+        owner,
+      };
     }
 
     // no specific properties, must be Test ISM
@@ -554,6 +798,43 @@ export class EvmIsmReader extends HyperlaneReader implements IsmReader {
       address,
       type: IsmType.TEST_ISM,
     };
+  }
+
+  /**
+   * Returns undefined when the contract is not a Blacklist ISM.
+   *
+   * Detection and enumeration are separate probes: deployments that predate
+   * `values()` expose the same `blacklistedIds(bytes32)` getter, so a missing
+   * `values()` selector falls back to replaying the entries from logs rather
+   * than disqualifying the contract. That replay either yields the entries or
+   * throws; it never yields a config without them.
+   */
+  private async deriveBlacklistConfig(
+    address: Address,
+  ): Promise<WithAddress<BlacklistIsmConfig> | undefined> {
+    const blacklistIsm = BlacklistIsm__factory.connect(address, this.provider);
+
+    let owner: Address;
+    try {
+      await blacklistIsm.blacklistedIds(ethers.constants.HashZero);
+      owner = await blacklistIsm.owner();
+    } catch (error) {
+      throwIfNotMissingSelector(error);
+      this.logger.debug(
+        'Error accessing "blacklistedIds" property, implying this is not a Blacklist ISM.',
+        address,
+      );
+      return undefined;
+    }
+
+    const blacklistedIds = await readBlacklistedIds(
+      this.chain,
+      address,
+      this.multiProvider,
+      this.evmLogReader,
+    );
+
+    return { address, type: IsmType.BLACKLIST, owner, blacklistedIds };
   }
 
   async deriveArbL2ToL1Config(

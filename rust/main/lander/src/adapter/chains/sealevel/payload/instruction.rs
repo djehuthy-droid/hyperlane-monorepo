@@ -1,14 +1,17 @@
+use hyperlane_sealevel::SealevelProcessPayload;
+use hyperlane_sealevel::SealevelTransactionFormat;
 use solana_sdk::instruction::Instruction as SealevelInstruction;
 
 use crate::payload::FullPayload;
 
-pub(crate) trait Instruction {
-    fn instruction(&self) -> SealevelInstruction;
+pub(crate) trait InstructionPayload {
+    fn instruction_and_alt(&self) -> (SealevelInstruction, SealevelTransactionFormat);
 }
 
-impl Instruction for FullPayload {
-    fn instruction(&self) -> SealevelInstruction {
-        serde_json::from_slice::<SealevelInstruction>(&self.data)
-            .expect("Payload should contain serialised Instruction for Sealevel")
+impl InstructionPayload for FullPayload {
+    fn instruction_and_alt(&self) -> (SealevelInstruction, SealevelTransactionFormat) {
+        let payload: SealevelProcessPayload = serde_json::from_slice(&self.data)
+            .expect("Payload should contain SealevelProcessPayload");
+        (payload.instruction, payload.alt_addresses)
     }
 }

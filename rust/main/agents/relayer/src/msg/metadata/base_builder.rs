@@ -8,7 +8,7 @@ use futures::{stream, StreamExt};
 use hyperlane_ethereum::Signers;
 use maplit::hashmap;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use hyperlane_base::{
     cache::{LocalCache, MeteredCache, OptionalCache},
@@ -19,15 +19,20 @@ use hyperlane_base::{
 use hyperlane_core::{
     accumulator::merkle::Proof, AggregationIsm, CcipReadIsm, Checkpoint, HyperlaneDomain,
     HyperlaneMessage, InterchainSecurityModule, ModuleType, MultisigIsm, RoutingIsm,
-    ValidatorAnnounce, H160, H256,
+    ValidatorAnnounce, H160, H256, H512,
 };
+use hyperlane_sealevel::SealevelCompositeIsm;
 
 use crate::msg::metadata::base_builder::validator_announced_storages::fetch_storage_locations_helper;
 use crate::{merkle_tree::builder::MerkleTreeBuilder, msg::metadata::MetadataBuildError};
 
 use super::{base::IsmCachePolicyClassifier, IsmAwareAppContextClassifier};
 
+mod cached_checkpoint_syncer;
+mod checkpoint_syncer_pool;
 mod validator_announced_storages;
+
+pub(crate) use checkpoint_syncer_pool::CheckpointSyncerPool;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IsmBuildMetricsParams {
@@ -49,6 +54,7 @@ pub struct BaseMetadataBuilder {
     allow_local_checkpoint_syncers: bool,
     metrics: Arc<CoreMetrics>,
     cache: OptionalCache<MeteredCache<LocalCache>>,
+    checkpoint_syncer_pool: CheckpointSyncerPool,
     db: HyperlaneRocksDB,
     app_context_classifier: IsmAwareAppContextClassifier,
     ism_cache_policy_classifier: IsmCachePolicyClassifier,
@@ -85,11 +91,19 @@ pub trait BuildsBaseMetadata: Send + Sync + Debug {
     async fn highest_known_leaf_index(&self) -> Option<u32>;
     async fn get_merkle_leaf_id_by_message_id(&self, message_id: H256)
         -> eyre::Result<Option<u32>>;
+    async fn retrieve_origin_tx_hash_by_message_id(
+        &self,
+        message_id: H256,
+    ) -> eyre::Result<Option<H512>>;
     async fn build_ism(&self, address: H256) -> eyre::Result<Box<dyn InterchainSecurityModule>>;
     async fn build_routing_ism(&self, address: H256) -> eyre::Result<Box<dyn RoutingIsm>>;
     async fn build_multisig_ism(&self, address: H256) -> eyre::Result<Box<dyn MultisigIsm>>;
     async fn build_aggregation_ism(&self, address: H256) -> eyre::Result<Box<dyn AggregationIsm>>;
     async fn build_ccip_read_ism(&self, address: H256) -> eyre::Result<Box<dyn CcipReadIsm>>;
+    async fn build_sealevel_composite_ism(
+        &self,
+        address: H256,
+    ) -> eyre::Result<Arc<SealevelCompositeIsm>>;
     async fn build_checkpoint_syncer(
         &self,
         message: &HyperlaneMessage,
@@ -172,6 +186,17 @@ impl BuildsBaseMetadata for BaseMetadataBuilder {
         Ok(merkle_leaf)
     }
 
+    async fn retrieve_origin_tx_hash_by_message_id(
+        &self,
+        message_id: H256,
+    ) -> eyre::Result<Option<H512>> {
+        // Older rows may hold Sealevel's zero placeholder; it is not a tx hash.
+        Ok(self
+            .db
+            .retrieve_dispatched_tx_hash_by_message_id(&message_id)?
+            .filter(|hash| *hash != H512::zero()))
+    }
+
     async fn build_ism(&self, address: H256) -> eyre::Result<Box<dyn InterchainSecurityModule>> {
         self.destination_chain_setup
             .build_ism(address, &self.metrics)
@@ -200,6 +225,16 @@ impl BuildsBaseMetadata for BaseMetadataBuilder {
         self.destination_chain_setup
             .build_ccip_read_ism(address, &self.metrics)
             .await
+    }
+
+    async fn build_sealevel_composite_ism(
+        &self,
+        address: H256,
+    ) -> eyre::Result<Arc<SealevelCompositeIsm>> {
+        self.destination_chain_setup
+            .build_sealevel_composite_ism(address, &self.metrics)
+            .await
+            .map(Arc::new)
     }
 
     async fn build_checkpoint_syncer(
@@ -257,7 +292,10 @@ impl BuildsBaseMetadata for BaseMetadataBuilder {
                             continue;
                         }
 
-                        if let Some(syncer) = self.build_and_validate(&config, validator).await? {
+                        if let Some(syncer) = self
+                            .build_and_validate(&config, validator, storage_location)
+                            .await?
+                        {
                             // found the syncer for this validator
                             return Ok(Some((*validator, syncer)));
                         }
@@ -284,7 +322,7 @@ impl BuildsBaseMetadata for BaseMetadataBuilder {
             .collect::<Vec<_>>();
 
         for (validator, checkpoint_syncer) in checkpoint_syncers_results {
-            checkpoint_syncers.insert(validator.into(), checkpoint_syncer.into());
+            checkpoint_syncers.insert(validator.into(), checkpoint_syncer);
         }
 
         Ok(MultisigCheckpointSyncer::new(
@@ -312,11 +350,20 @@ impl BaseMetadataBuilder {
         &self,
         config: &CheckpointSyncerConf,
         validator: &H256,
-    ) -> Result<Option<Box<dyn CheckpointSyncer>>, CheckpointSyncerBuildError> {
-        match config.build_and_validate(None).await {
-            Ok(checkpoint_syncer) => {
-                return Ok(Some(checkpoint_syncer));
-            }
+        storage_location: &str,
+    ) -> Result<Option<Arc<dyn CheckpointSyncer>>, CheckpointSyncerBuildError> {
+        let checkpoint_syncer = match self
+            .checkpoint_syncer_pool
+            .get_or_build(
+                config,
+                self.cache.clone(),
+                self.origin_domain.name().to_string(),
+                *validator,
+                storage_location.to_string(),
+            )
+            .await
+        {
+            Ok(checkpoint_syncer) => checkpoint_syncer,
             Err(CheckpointSyncerBuildError::ReorgFlag(reorg_event)) => {
                 if self.ignore_reorg_reports {
                     warn!(
@@ -339,8 +386,81 @@ impl BaseMetadataBuilder {
                     ?validator,
                     "Error when loading checkpoint syncer; will attempt to use the next config"
                 );
+                return Ok(None);
+            }
+        };
+
+        // The backend is pooled, but reorg status is safety-critical and must be
+        // checked on every checkout rather than only when the client is built.
+        match checkpoint_syncer.reorg_status().await {
+            Ok(reorg_event) if reorg_event.exists => {
+                if self.ignore_reorg_reports {
+                    warn!(
+                        ?reorg_event,
+                        ?config,
+                        ?validator,
+                        "Ignoring reorg event for checkpoint syncer build"
+                    );
+                    Ok(None)
+                } else {
+                    Err(CheckpointSyncerBuildError::ReorgFlag(reorg_event))
+                }
+            }
+            Ok(_) => Ok(Some(checkpoint_syncer)),
+            Err(err) => {
+                error!(
+                    ?err,
+                    ?config,
+                    ?validator,
+                    "Failed to read reorg status. Assuming no reorg occurred."
+                );
+                Ok(Some(checkpoint_syncer))
             }
         }
-        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperlane_base::db::DB;
+    use hyperlane_core::{ReorgEvent, ReorgPeriod};
+
+    use crate::test_utils::dummy_data::dummy_metadata_builder;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn revalidates_reorg_status_on_every_pool_checkout() {
+        let origin = HyperlaneDomain::new_test_domain("origin");
+        let destination = HyperlaneDomain::new_test_domain("destination");
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = HyperlaneRocksDB::new(&origin, DB::from_path(db_dir.path()).unwrap());
+        let builder = dummy_metadata_builder(&origin, &destination, &db, OptionalCache::new(None));
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let storage_location = format!("file://{}", checkpoint_dir.path().display());
+        let config = CheckpointSyncerConf::from_str(&storage_location).unwrap();
+        let validator = H256::from_low_u64_be(1);
+
+        let syncer = builder
+            .build_and_validate(&config, &validator, &storage_location)
+            .await
+            .unwrap()
+            .unwrap();
+        let reorg_event = ReorgEvent {
+            local_merkle_root: H256::from_low_u64_be(2),
+            canonical_merkle_root: H256::from_low_u64_be(3),
+            checkpoint_index: 4,
+            unix_timestamp: 5,
+            reorg_period: ReorgPeriod::from_blocks(6),
+        };
+        syncer.write_reorg_status(&reorg_event).await.unwrap();
+
+        let result = builder
+            .build_and_validate(&config, &validator, &storage_location)
+            .await;
+        assert!(matches!(
+            result,
+            Err(CheckpointSyncerBuildError::ReorgFlag(response)) if response.exists
+        ));
     }
 }

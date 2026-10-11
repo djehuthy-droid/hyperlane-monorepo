@@ -46,9 +46,10 @@ contract HypERC20Collateral is LpCollateralRouter {
      */
     constructor(
         address erc20,
-        uint256 _scale,
+        uint256 _scaleNumerator,
+        uint256 _scaleDenominator,
         address _mailbox
-    ) TokenRouter(_scale, _mailbox) {
+    ) TokenRouter(_scaleNumerator, _scaleDenominator, _mailbox) {
         require(Address.isContract(erc20), "HypERC20Collateral: invalid token");
         wrappedToken = IERC20(erc20);
     }
@@ -64,11 +65,6 @@ contract HypERC20Collateral is LpCollateralRouter {
 
     function token() public view override returns (address) {
         return address(wrappedToken);
-    }
-
-    function _addBridge(uint32 domain, ITokenBridge bridge) internal override {
-        MovableCollateralRouter._addBridge(domain, bridge);
-        wrappedToken.forceApprove(address(bridge), type(uint256).max);
     }
 
     function _removeBridge(

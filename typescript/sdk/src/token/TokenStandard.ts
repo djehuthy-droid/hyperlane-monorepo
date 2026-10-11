@@ -1,11 +1,12 @@
 import { ProtocolType, assert, objMap } from '@hyperlane-xyz/utils';
 
 import {
+  KnownProtocolType,
   PROTOCOL_TO_DEFAULT_PROVIDER_TYPE,
   ProviderType,
 } from '../providers/ProviderType.js';
 
-import { TokenType } from './config.js';
+import { DeployableTokenType, TokenType } from './config.js';
 
 export enum TokenStandard {
   // EVM
@@ -24,8 +25,11 @@ export enum TokenStandard {
   EvmHypVSXERC20 = 'EvmHypVSXERC20',
   EvmHypVSXERC20Lockbox = 'EvmHypVSXERC20Lockbox',
   EvmM0PortalLite = 'EvmM0PortalLite',
+  EvmM0Portal = 'EvmM0Portal',
   EvmHypEverclearCollateral = 'EvmHypEverclearCollateral',
   EvmHypEverclearEth = 'EvmHypEverclearEth',
+  EvmHypCrossCollateralRouter = 'EvmHypCrossCollateralRouter',
+  EvmAtomicLocalRebalancingBridge = 'EvmAtomicLocalRebalancingBridge',
 
   // Sealevel (Solana)
   SealevelSpl = 'SealevelSpl',
@@ -34,6 +38,7 @@ export enum TokenStandard {
   SealevelHypNative = 'SealevelHypNative',
   SealevelHypCollateral = 'SealevelHypCollateral',
   SealevelHypSynthetic = 'SealevelHypSynthetic',
+  SealevelHypCrossCollateral = 'SealevelHypCrossCollateral',
 
   // Cosmos
   CosmosIcs20 = 'CosmosIcs20',
@@ -69,10 +74,34 @@ export enum TokenStandard {
   AleoHypNative = 'AleoHypNative',
   AleoHypCollateral = 'AleoHypCollateral',
   AleoHypSynthetic = 'AleoHypSynthetic',
+
+  // Tron
+  TRC20 = 'TRC20',
+  TRC721 = 'TRC721',
+  TronNative = 'TronNative',
+  TronHypNative = 'TronHypNative',
+  TronHypCollateral = 'TronHypCollateral',
+  TronHypOwnerCollateral = 'TronHypOwnerCollateral',
+  TronHypRebaseCollateral = 'TronHypRebaseCollateral',
+  TronHypCollateralFiat = 'TronHypCollateralFiat',
+  TronHypSynthetic = 'TronHypSynthetic',
+  TronHypSyntheticRebase = 'TronHypSyntheticRebase',
+  TronHypXERC20 = 'TronHypXERC20',
+  TronHypXERC20Lockbox = 'TronHypXERC20Lockbox',
+  TronHypVSXERC20 = 'TronHypVSXERC20',
+  TronHypVSXERC20Lockbox = 'TronHypVSXERC20Lockbox',
+  TronM0PortalLite = 'TronM0PortalLite',
+  TronHypEverclearCollateral = 'TronHypEverclearCollateral',
+  TronHypEverclearEth = 'TronHypEverclearEth',
+  TronHypCrossCollateralRouter = 'TronHypCrossCollateralRouter',
+  TronAtomicLocalRebalancingBridge = 'TronAtomicLocalRebalancingBridge',
 }
 
 // Allows for omission of protocol field in token args
-export const TOKEN_STANDARD_TO_PROTOCOL: Record<TokenStandard, ProtocolType> = {
+export const TOKEN_STANDARD_TO_PROTOCOL: Record<
+  TokenStandard,
+  KnownProtocolType
+> = {
   // EVM
   ERC20: ProtocolType.Ethereum,
   ERC721: ProtocolType.Ethereum,
@@ -89,8 +118,11 @@ export const TOKEN_STANDARD_TO_PROTOCOL: Record<TokenStandard, ProtocolType> = {
   EvmHypVSXERC20: ProtocolType.Ethereum,
   EvmHypVSXERC20Lockbox: ProtocolType.Ethereum,
   EvmM0PortalLite: ProtocolType.Ethereum,
+  EvmM0Portal: ProtocolType.Ethereum,
   [TokenStandard.EvmHypEverclearCollateral]: ProtocolType.Ethereum,
   [TokenStandard.EvmHypEverclearEth]: ProtocolType.Ethereum,
+  [TokenStandard.EvmHypCrossCollateralRouter]: ProtocolType.Ethereum,
+  [TokenStandard.EvmAtomicLocalRebalancingBridge]: ProtocolType.Ethereum,
 
   // Sealevel (Solana)
   SealevelSpl: ProtocolType.Sealevel,
@@ -99,6 +131,7 @@ export const TOKEN_STANDARD_TO_PROTOCOL: Record<TokenStandard, ProtocolType> = {
   SealevelHypNative: ProtocolType.Sealevel,
   SealevelHypCollateral: ProtocolType.Sealevel,
   SealevelHypSynthetic: ProtocolType.Sealevel,
+  SealevelHypCrossCollateral: ProtocolType.Sealevel,
 
   // Cosmos
   CosmosIcs20: ProtocolType.Cosmos,
@@ -134,6 +167,27 @@ export const TOKEN_STANDARD_TO_PROTOCOL: Record<TokenStandard, ProtocolType> = {
   AleoHypNative: ProtocolType.Aleo,
   AleoHypCollateral: ProtocolType.Aleo,
   AleoHypSynthetic: ProtocolType.Aleo,
+
+  // Tron
+  TRC20: ProtocolType.Tron,
+  TRC721: ProtocolType.Tron,
+  TronNative: ProtocolType.Tron,
+  TronHypNative: ProtocolType.Tron,
+  TronHypCollateral: ProtocolType.Tron,
+  TronHypOwnerCollateral: ProtocolType.Tron,
+  TronHypRebaseCollateral: ProtocolType.Tron,
+  TronHypCollateralFiat: ProtocolType.Tron,
+  TronHypSynthetic: ProtocolType.Tron,
+  TronHypSyntheticRebase: ProtocolType.Tron,
+  TronHypXERC20: ProtocolType.Tron,
+  TronHypXERC20Lockbox: ProtocolType.Tron,
+  TronHypVSXERC20: ProtocolType.Tron,
+  TronHypVSXERC20Lockbox: ProtocolType.Tron,
+  TronM0PortalLite: ProtocolType.Tron,
+  TronHypEverclearCollateral: ProtocolType.Tron,
+  TronHypEverclearEth: ProtocolType.Tron,
+  TronHypCrossCollateralRouter: ProtocolType.Tron,
+  TronAtomicLocalRebalancingBridge: ProtocolType.Tron,
 };
 
 export const TOKEN_STANDARD_TO_PROVIDER_TYPE: Record<
@@ -152,6 +206,7 @@ export const TOKEN_STANDARD_TO_PROVIDER_TYPE: Record<
 
 export const TOKEN_NFT_STANDARDS = [
   TokenStandard.ERC721,
+  TokenStandard.TRC721,
   TokenStandard.CosmosIcs721,
   TokenStandard.CW721,
   // TODO solana here
@@ -159,6 +214,8 @@ export const TOKEN_NFT_STANDARDS = [
 
 export const TOKEN_COLLATERALIZED_STANDARDS = [
   TokenStandard.EvmHypCollateral,
+  TokenStandard.EvmHypOwnerCollateral,
+  TokenStandard.EvmHypRebaseCollateral,
   TokenStandard.EvmHypNative,
   TokenStandard.SealevelHypCollateral,
   TokenStandard.SealevelHypNative,
@@ -169,18 +226,49 @@ export const TOKEN_COLLATERALIZED_STANDARDS = [
   TokenStandard.EvmHypVSXERC20Lockbox,
   TokenStandard.AleoHypNative,
   TokenStandard.AleoHypCollateral,
+  TokenStandard.TronHypNative,
+  TokenStandard.TronHypCollateral,
+  TokenStandard.TronHypOwnerCollateral,
+  TokenStandard.TronHypRebaseCollateral,
+  TokenStandard.TronHypXERC20Lockbox,
+  TokenStandard.TronHypVSXERC20Lockbox,
+  TokenStandard.RadixHypCollateral,
+  TokenStandard.StarknetHypCollateral,
+  TokenStandard.StarknetHypNative,
+  TokenStandard.EvmHypCrossCollateralRouter,
+  TokenStandard.TronHypCrossCollateralRouter,
+  TokenStandard.SealevelHypCrossCollateral,
 ];
+
+export const TOKEN_CROSS_COLLATERAL_STANDARDS: Set<TokenStandard> = new Set([
+  TokenStandard.EvmHypCrossCollateralRouter,
+  TokenStandard.SealevelHypCrossCollateral,
+  TokenStandard.TronHypCrossCollateralRouter,
+]);
 
 export const XERC20_STANDARDS = [
   TokenStandard.EvmHypXERC20,
   TokenStandard.EvmHypXERC20Lockbox,
   TokenStandard.EvmHypVSXERC20,
   TokenStandard.EvmHypVSXERC20Lockbox,
+  TokenStandard.TronHypXERC20,
+  TokenStandard.TronHypXERC20Lockbox,
+  TokenStandard.TronHypVSXERC20,
+  TokenStandard.TronHypVSXERC20Lockbox,
 ];
 
 export const LOCKBOX_STANDARDS = [
   TokenStandard.EvmHypXERC20Lockbox,
   TokenStandard.EvmHypVSXERC20Lockbox,
+  TokenStandard.TronHypXERC20Lockbox,
+  TokenStandard.TronHypVSXERC20Lockbox,
+];
+
+export const ERC4626_COLLATERAL_STANDARDS = [
+  TokenStandard.EvmHypOwnerCollateral,
+  TokenStandard.EvmHypRebaseCollateral,
+  TokenStandard.TronHypOwnerCollateral,
+  TokenStandard.TronHypRebaseCollateral,
 ];
 
 export const MINT_LIMITED_STANDARDS = [
@@ -189,6 +277,11 @@ export const MINT_LIMITED_STANDARDS = [
   TokenStandard.EvmHypVSXERC20,
   TokenStandard.EvmHypVSXERC20Lockbox,
   TokenStandard.EvmHypCollateralFiat,
+  TokenStandard.TronHypXERC20,
+  TokenStandard.TronHypXERC20Lockbox,
+  TokenStandard.TronHypVSXERC20,
+  TokenStandard.TronHypVSXERC20Lockbox,
+  TokenStandard.TronHypCollateralFiat,
 ];
 
 export const TOKEN_HYP_STANDARDS = [
@@ -204,9 +297,12 @@ export const TOKEN_HYP_STANDARDS = [
   TokenStandard.EvmHypVSXERC20,
   TokenStandard.EvmHypVSXERC20Lockbox,
   TokenStandard.EvmM0PortalLite,
+  TokenStandard.EvmM0Portal,
+  TokenStandard.EvmHypCrossCollateralRouter,
   TokenStandard.SealevelHypNative,
   TokenStandard.SealevelHypCollateral,
   TokenStandard.SealevelHypSynthetic,
+  TokenStandard.SealevelHypCrossCollateral,
   TokenStandard.CwHypNative,
   TokenStandard.CwHypCollateral,
   TokenStandard.CwHypSynthetic,
@@ -220,6 +316,21 @@ export const TOKEN_HYP_STANDARDS = [
   TokenStandard.AleoHypNative,
   TokenStandard.AleoHypCollateral,
   TokenStandard.AleoHypSynthetic,
+  TokenStandard.TronHypNative,
+  TokenStandard.TronHypCollateral,
+  TokenStandard.TronHypOwnerCollateral,
+  TokenStandard.TronHypRebaseCollateral,
+  TokenStandard.TronHypCollateralFiat,
+  TokenStandard.TronHypSynthetic,
+  TokenStandard.TronHypSyntheticRebase,
+  TokenStandard.TronHypXERC20,
+  TokenStandard.TronHypXERC20Lockbox,
+  TokenStandard.TronHypVSXERC20,
+  TokenStandard.TronHypVSXERC20Lockbox,
+  TokenStandard.TronM0PortalLite,
+  TokenStandard.TronHypCrossCollateralRouter,
+  TokenStandard.TronHypEverclearCollateral,
+  TokenStandard.TronHypEverclearEth,
 ];
 
 export const TOKEN_MULTI_CHAIN_STANDARDS = [
@@ -242,6 +353,11 @@ export const tokenTypeToStandard = (
   protocolType: ProtocolType,
   tokenType: TokenType,
 ) => {
+  assert(
+    tokenType !== TokenType.unknown,
+    'Cannot determine token standard for unknown token type',
+  );
+
   switch (protocolType) {
     case ProtocolType.Ethereum: {
       return EVM_TOKEN_TYPE_TO_STANDARD[tokenType];
@@ -291,6 +407,9 @@ export const tokenTypeToStandard = (
         `token type ${tokenType} not available on protocol ${protocolType}`,
       );
     }
+    case ProtocolType.Tron: {
+      return TRON_TOKEN_TYPE_TO_STANDARD[tokenType];
+    }
     case ProtocolType.Sealevel: {
       const sealevelTokenStandard =
         SEALEVEL_TOKEN_TYPE_TO_STANDARD[
@@ -303,6 +422,18 @@ export const tokenTypeToStandard = (
       );
       return sealevelTokenStandard;
     }
+    case ProtocolType.Starknet: {
+      const starknetTokenStandard =
+        STARKNET_TOKEN_TYPE_TO_STANDARD[
+          tokenType as StarknetSupportedTokenTypes
+        ];
+
+      assert(
+        starknetTokenStandard,
+        `token type ${tokenType} not available on protocol ${protocolType}`,
+      );
+      return starknetTokenStandard;
+    }
     default: {
       throw new Error(
         `no token standard available for protocol type ${protocolType}`,
@@ -311,7 +442,10 @@ export const tokenTypeToStandard = (
   }
 };
 
-export const EVM_TOKEN_TYPE_TO_STANDARD: Record<TokenType, TokenStandard> = {
+export const EVM_TOKEN_TYPE_TO_STANDARD: Record<
+  DeployableTokenType,
+  TokenStandard
+> = {
   [TokenType.native]: TokenStandard.EvmHypNative,
   [TokenType.collateral]: TokenStandard.EvmHypCollateral,
   [TokenType.collateralFiat]: TokenStandard.EvmHypCollateralFiat,
@@ -329,6 +463,11 @@ export const EVM_TOKEN_TYPE_TO_STANDARD: Record<TokenType, TokenStandard> = {
   [TokenType.nativeOpL2]: TokenStandard.EvmHypNative,
   [TokenType.ethEverclear]: TokenStandard.EvmHypEverclearEth,
   [TokenType.collateralEverclear]: TokenStandard.EvmHypEverclearCollateral,
+  [TokenType.collateralDepositAddress]: TokenStandard.EvmHypCollateral,
+  [TokenType.collateralOft]: TokenStandard.EvmHypCollateral,
+  [TokenType.atomicLocalRebalancing]:
+    TokenStandard.EvmAtomicLocalRebalancingBridge,
+  [TokenType.crossCollateral]: TokenStandard.EvmHypCrossCollateralRouter,
 };
 
 // Cosmos Native supported token types
@@ -353,6 +492,7 @@ export const SEALEVEL_SUPPORTED_TOKEN_TYPES = [
   TokenType.collateral,
   TokenType.synthetic,
   TokenType.native,
+  TokenType.crossCollateral,
 ] as const;
 
 type SealevelSupportedTokenTypes =
@@ -365,6 +505,7 @@ export const SEALEVEL_TOKEN_TYPE_TO_STANDARD: Record<
   [TokenType.collateral]: TokenStandard.SealevelHypCollateral,
   [TokenType.synthetic]: TokenStandard.SealevelHypSynthetic,
   [TokenType.native]: TokenStandard.SealevelHypNative,
+  [TokenType.crossCollateral]: TokenStandard.SealevelHypCrossCollateral,
 };
 
 // Starknet supported token types
@@ -418,19 +559,50 @@ export const ALEO_TOKEN_TYPE_TO_STANDARD: Record<
   [TokenType.synthetic]: TokenStandard.AleoHypSynthetic,
 };
 
-export const PROTOCOL_TO_NATIVE_STANDARD: Record<ProtocolType, TokenStandard> =
-  {
-    [ProtocolType.Ethereum]: TokenStandard.EvmNative,
-    [ProtocolType.Cosmos]: TokenStandard.CosmosNative,
-    [ProtocolType.CosmosNative]: TokenStandard.CosmosNative,
-    [ProtocolType.Sealevel]: TokenStandard.SealevelNative,
-    [ProtocolType.Starknet]: TokenStandard.StarknetNative,
-    [ProtocolType.Radix]: TokenStandard.RadixNative,
-    [ProtocolType.Aleo]: TokenStandard.AleoNative,
-  };
+export const TRON_TOKEN_TYPE_TO_STANDARD: Record<
+  DeployableTokenType,
+  TokenStandard
+> = {
+  [TokenType.native]: TokenStandard.TronHypNative,
+  [TokenType.collateral]: TokenStandard.TronHypCollateral,
+  [TokenType.collateralFiat]: TokenStandard.TronHypCollateralFiat,
+  [TokenType.XERC20]: TokenStandard.TronHypXERC20,
+  [TokenType.XERC20Lockbox]: TokenStandard.TronHypXERC20Lockbox,
+  [TokenType.collateralVault]: TokenStandard.TronHypOwnerCollateral,
+  [TokenType.collateralVaultRebase]: TokenStandard.TronHypRebaseCollateral,
+  [TokenType.collateralUri]: TokenStandard.TronHypCollateral,
+  [TokenType.synthetic]: TokenStandard.TronHypSynthetic,
+  [TokenType.syntheticRebase]: TokenStandard.TronHypSyntheticRebase,
+  [TokenType.syntheticUri]: TokenStandard.TronHypSynthetic,
+  [TokenType.nativeScaled]: TokenStandard.TronHypNative,
+  [TokenType.collateralCctp]: TokenStandard.TronHypCollateral,
+  [TokenType.nativeOpL1]: TokenStandard.TronHypNative,
+  [TokenType.nativeOpL2]: TokenStandard.TronHypNative,
+  [TokenType.ethEverclear]: TokenStandard.TronHypEverclearEth,
+  [TokenType.collateralEverclear]: TokenStandard.TronHypEverclearCollateral,
+  [TokenType.collateralDepositAddress]: TokenStandard.TronHypCollateral,
+  [TokenType.collateralOft]: TokenStandard.TronHypCollateral,
+  [TokenType.atomicLocalRebalancing]:
+    TokenStandard.TronAtomicLocalRebalancingBridge,
+  [TokenType.crossCollateral]: TokenStandard.TronHypCrossCollateralRouter,
+};
+
+export const PROTOCOL_TO_NATIVE_STANDARD: Record<
+  KnownProtocolType,
+  TokenStandard
+> = {
+  [ProtocolType.Ethereum]: TokenStandard.EvmNative,
+  [ProtocolType.Cosmos]: TokenStandard.CosmosNative,
+  [ProtocolType.CosmosNative]: TokenStandard.CosmosNative,
+  [ProtocolType.Sealevel]: TokenStandard.SealevelNative,
+  [ProtocolType.Starknet]: TokenStandard.StarknetNative,
+  [ProtocolType.Radix]: TokenStandard.RadixNative,
+  [ProtocolType.Aleo]: TokenStandard.AleoNative,
+  [ProtocolType.Tron]: TokenStandard.TronNative,
+};
 
 export const PROTOCOL_TO_HYP_NATIVE_STANDARD: Record<
-  ProtocolType,
+  KnownProtocolType,
   TokenStandard
 > = {
   [ProtocolType.Ethereum]: TokenStandard.EvmHypNative,
@@ -441,4 +613,5 @@ export const PROTOCOL_TO_HYP_NATIVE_STANDARD: Record<
   [ProtocolType.Radix]: TokenStandard.RadixHypCollateral,
   [ProtocolType.CosmosNative]: TokenStandard.CosmNativeHypCollateral,
   [ProtocolType.Aleo]: TokenStandard.AleoHypNative,
+  [ProtocolType.Tron]: TokenStandard.TronHypNative,
 };

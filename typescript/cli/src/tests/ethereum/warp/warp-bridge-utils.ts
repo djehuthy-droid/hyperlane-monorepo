@@ -1,4 +1,3 @@
-import { JsonRpcProvider } from '@ethersproject/providers';
 import { Wallet } from 'ethers';
 import { parseUnits } from 'ethers/lib/utils.js';
 
@@ -23,6 +22,7 @@ import {
 import { type Address } from '@hyperlane-xyz/utils';
 
 import { readYamlOrJson, writeYamlOrJson } from '../../../utils/files.js';
+import { createLocalProvider } from '../localProvider.js';
 import { deployOrUseExistingCore } from '../commands/core.js';
 import {
   deploy4626Vault,
@@ -145,11 +145,7 @@ export async function runWarpBridgeTests(
       },
     });
 
-    await sendWarpRouteMessageRoundTrip(
-      startChain,
-      targetChain,
-      routeConfigPath,
-    );
+    await sendWarpRouteMessageRoundTrip(startChain, targetChain, warpRouteId);
 
     console.log(
       `Should deploy and be able to bridge in a ${warpConfig[CHAIN_NAME_2].type} -> ${warpConfig[CHAIN_NAME_3].type} warp route ✅`,
@@ -161,8 +157,8 @@ export async function setupChains(): Promise<WarpBridgeTestConfig> {
   const chain2Metadata: ChainMetadata = readYamlOrJson(CHAIN_2_METADATA_PATH);
   const chain3Metadata: ChainMetadata = readYamlOrJson(CHAIN_3_METADATA_PATH);
 
-  const providerChain2 = new JsonRpcProvider(chain2Metadata.rpcUrls[0].http);
-  const providerChain3 = new JsonRpcProvider(chain3Metadata.rpcUrls[0].http);
+  const providerChain2 = createLocalProvider(chain2Metadata.rpcUrls[0].http);
+  const providerChain3 = createLocalProvider(chain3Metadata.rpcUrls[0].http);
 
   const walletChain2 = new Wallet(ANVIL_KEY).connect(providerChain2);
   const walletChain3 = new Wallet(ANVIL_KEY).connect(providerChain3);

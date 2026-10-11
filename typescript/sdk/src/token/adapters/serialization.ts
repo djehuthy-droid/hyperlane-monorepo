@@ -1,6 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
 
-import { Domain } from '@hyperlane-xyz/utils';
+import { Domain, assert } from '@hyperlane-xyz/utils';
 
 import {
   SealevelInterchainGasPaymasterConfig,
@@ -10,7 +10,96 @@ import {
   SealevelAccountDataWrapper,
   SealevelInstructionWrapper,
   getSealevelAccountDataSchema,
+  readOptionalDiscriminatedTrailing,
 } from '../../utils/sealevelSerialization.js';
+
+/**
+ * Optional warp fee configuration. Mirrors `FeeConfig` in
+ * rust/sealevel/libraries/hyperlane-sealevel-token/src/accounts.rs
+ * (introduced in the SVM fee-flow upgrade).
+ */
+export interface SealevelTokenFeeConfig {
+  feeProgram: PublicKey;
+  feeAccount: PublicKey;
+}
+
+/// `FeeConfig::DISCRIMINATOR` in hyperlane-sealevel-token/src/accounts.rs.
+const FEE_CONFIG_DISCRIMINATOR = Buffer.from('TOKFEEV1', 'ascii');
+const FEE_CONFIG_PAYLOAD_SIZE = 64; // 32 (feeProgram) + 32 (feeAccount)
+
+/**
+ * Decode the optional trailing FeeConfig from a Hyperlane token PDA's raw
+ * account data. Returns undefined for pre-upgrade accounts and for accounts
+ * where fee_config is absent.
+ *
+ * On-chain layout: [SealevelHyperlaneTokenData (variable)] [plugin_data
+ * (fixed per token type)] [optional fee_config trailing]. The trailing field
+ * is an `OptionalDiscriminatedData<FeeConfig>`: empty when absent, or
+ * `[DISCRIMINATOR (8)][feeProgram (32)][feeAccount (32)]` when present.
+ */
+export function decodeTrailingFeeConfig(
+  rawAccountData: Buffer,
+  consumedSize: number,
+  pluginDataSize: number,
+): SealevelTokenFeeConfig | undefined {
+  const payload = readOptionalDiscriminatedTrailing(
+    rawAccountData,
+    consumedSize + pluginDataSize,
+    FEE_CONFIG_DISCRIMINATOR,
+  );
+  if (payload === undefined) return undefined;
+
+  assert(
+    payload.length >= FEE_CONFIG_PAYLOAD_SIZE,
+    `Truncated fee_config: expected ${FEE_CONFIG_PAYLOAD_SIZE} payload bytes, got ${payload.length}`,
+  );
+  return {
+    feeProgram: new PublicKey(payload.subarray(0, 32)),
+    feeAccount: new PublicKey(payload.subarray(32, 64)),
+  };
+}
+
+/**
+ * Prefix of a fee account sufficient to extract the beneficiary owner.
+ * Mirrors `FeeAccountPrefix` in
+ * rust/sealevel/programs/hyperlane-sealevel-fee/src/accounts.rs.
+ * Trailing fields (fee_data, domain_id, min_issued_at) are left for
+ * `deserializeUnchecked` to skip — borsh-js 0.7 lacks i64 support so a
+ * full FeeAccount decoder isn't viable here.
+ */
+export class SealevelFeeAccountPrefix {
+  bump_seed!: number;
+  owner?: Uint8Array | null;
+  owner_pub_key?: PublicKey;
+  beneficiary!: Uint8Array;
+  beneficiary_pub_key!: PublicKey;
+
+  constructor(fields: any) {
+    Object.assign(this, fields);
+    this.beneficiary_pub_key = new PublicKey(this.beneficiary);
+    this.owner_pub_key = this.owner ? new PublicKey(this.owner) : undefined;
+  }
+}
+
+export const SealevelFeeAccountPrefixSchema = new Map<any, any>([
+  [
+    SealevelAccountDataWrapper,
+    // [8] = FEE_ACCT discriminator (consumed; not explicitly verified, same
+    // convention as SealevelIgpDataSchema).
+    getSealevelAccountDataSchema(SealevelFeeAccountPrefix, [8]),
+  ],
+  [
+    SealevelFeeAccountPrefix,
+    {
+      kind: 'struct',
+      fields: [
+        ['bump_seed', 'u8'],
+        ['owner', { kind: 'option', type: [32] }],
+        ['beneficiary', [32]],
+      ],
+    },
+  ],
+]);
 
 /**
  * Hyperlane Token Borsh Schema
@@ -46,6 +135,9 @@ export class SealevelHyperlaneTokenData {
   /// Remote routers.
   remote_routers?: Map<Domain, Uint8Array>;
   remote_router_pubkeys: Map<Domain, PublicKey>;
+  /// Trailing optional warp fee configuration. Hydrated post-decode via
+  /// `decodeTrailingFeeConfig`; NOT part of SealevelHyperlaneTokenDataSchema.
+  fee_config?: SealevelTokenFeeConfig;
   constructor(public readonly fields: any) {
     Object.assign(this, fields);
     this.mailbox_pubkey = new PublicKey(this.mailbox);
@@ -179,6 +271,107 @@ export const SealevelTransferRemoteSchema = new Map<any, any>([
     },
   ],
 ]);
+
+// ============================================================================
+// Cross-Collateral Instruction Schemas
+// ============================================================================
+
+export enum SealevelCCInstructionKind {
+  SetCrossCollateralRouters = 0,
+  TransferRemoteTo = 1,
+  HandleLocal = 2,
+  HandleLocalAccountMetas = 3,
+}
+
+export class SealevelCCTransferRemoteToInstruction {
+  destination_domain!: number;
+  recipient!: Uint8Array;
+  amount_or_id!: bigint;
+  target_router!: Uint8Array;
+  constructor(public readonly fields: any) {
+    Object.assign(this, fields);
+  }
+}
+
+export const SealevelCCTransferRemoteToSchema = new Map<any, any>([
+  [
+    SealevelInstructionWrapper,
+    {
+      kind: 'struct',
+      fields: [
+        ['instruction', 'u8'],
+        ['data', SealevelCCTransferRemoteToInstruction],
+      ],
+    },
+  ],
+  [
+    SealevelCCTransferRemoteToInstruction,
+    {
+      kind: 'struct',
+      fields: [
+        ['destination_domain', 'u32'],
+        ['recipient', [32]],
+        ['amount_or_id', 'u256'],
+        ['target_router', [32]],
+      ],
+    },
+  ],
+]);
+
+export class SealevelCCHandleLocalInstruction {
+  sender_program_id!: Uint8Array;
+  message!: Uint8Array;
+  constructor(public readonly fields: any) {
+    Object.assign(this, fields);
+  }
+}
+
+export const SealevelCCHandleLocalSchema = new Map<any, any>([
+  [
+    SealevelInstructionWrapper,
+    {
+      kind: 'struct',
+      fields: [
+        ['instruction', 'u8'],
+        ['data', SealevelCCHandleLocalInstruction],
+      ],
+    },
+  ],
+  [
+    SealevelCCHandleLocalInstruction,
+    {
+      kind: 'struct',
+      fields: [
+        ['sender_program_id', [32]],
+        ['message', ['u8']],
+      ],
+    },
+  ],
+]);
+
+/**
+ * Encodes a TokenMessage matching the Rust `hyperlane_warp_route::TokenMessage`.
+ * Layout: recipient (32 bytes) + amount (32 bytes, big-endian U256) + metadata (variable).
+ */
+export function encodeTokenMessage(
+  recipient: Uint8Array,
+  amount: bigint,
+  metadata: Uint8Array = new Uint8Array(0),
+): Buffer {
+  assert(recipient.length === 32, 'TokenMessage recipient must be 32 bytes');
+  assert(
+    amount >= 0n && amount < 2n ** 256n,
+    'TokenMessage amount out of U256 range',
+  );
+  const buf = Buffer.alloc(64 + metadata.length);
+  buf.set(recipient, 0);
+  const amountHex = amount.toString(16).padStart(64, '0');
+  buf.set(Buffer.from(amountHex, 'hex'), 32);
+  if (metadata.length > 0) {
+    buf.set(metadata, 64);
+  }
+  return buf;
+}
 
 // ============================================================================
 // Governance Instruction Schemas

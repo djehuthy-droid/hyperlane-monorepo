@@ -5,9 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hyperlane_core::{
-    ChainResult, HyperlaneChain, HyperlaneContract, HyperlaneDomain,
-    HyperlaneMessage, HyperlaneProvider, InterchainSecurityModule, Metadata,
-    ModuleType, MultisigIsm, H256, U256,
+    ChainResult, HyperlaneChain, HyperlaneContract, HyperlaneDomain, HyperlaneMessage,
+    HyperlaneProvider, InterchainSecurityModule, Metadata, ModuleType, MultisigIsm, H256, U256,
 };
 use tracing::{debug, instrument};
 
@@ -33,11 +32,7 @@ pub struct KaspaMultisigIsm {
 
 impl KaspaMultisigIsm {
     /// Create a new Kaspa Multisig ISM.
-    pub fn new(
-        domain: HyperlaneDomain,
-        address: H256,
-        conf: &ConnectionConf,
-    ) -> ChainResult<Self> {
+    pub fn new(domain: HyperlaneDomain, address: H256, conf: &ConnectionConf) -> ChainResult<Self> {
         let client = Arc::new(KaspaRpcClient::new(conf)?);
         let provider = KaspaProvider::from_client(domain.clone(), client.clone());
 
@@ -107,7 +102,10 @@ impl InterchainSecurityModule for KaspaMultisigIsm {
             "legacy_multisig" | "legacymultisig" => ModuleType::LegacyMultisig,
             "ccip_read" | "ccipread" => ModuleType::CcipRead,
             _ => {
-                debug!("unknown module type: {}, defaulting to MessageIdMultisig", module_type_str);
+                debug!(
+                    "unknown module type: {}, defaulting to MessageIdMultisig",
+                    module_type_str
+                );
                 ModuleType::MessageIdMultisig
             }
         };
@@ -141,10 +139,7 @@ impl MultisigIsm for KaspaMultisigIsm {
         &self,
         message: &HyperlaneMessage,
     ) -> ChainResult<(Vec<H256>, u8)> {
-        let (validators, threshold) = self
-            .client
-            .get_validators_and_threshold(message)
-            .await?;
+        let (validators, threshold) = self.client.get_validators_and_threshold(message).await?;
 
         debug!(
             "validators: {:?}, threshold: {}",

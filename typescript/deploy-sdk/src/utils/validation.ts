@@ -4,50 +4,137 @@
  * The provider-sdk has a limited subset of ISM types compared to the full SDK.
  * These utilities validate ISM configs and provide clear error messages for unsupported types.
  */
-import { IsmConfig, IsmType } from '@hyperlane-xyz/provider-sdk/ism';
+import { ProtocolType } from '@hyperlane-xyz/provider-sdk';
+import {
+  IsmConfig,
+  IsmType,
+  assertValidDomainRoutingMultisig,
+} from '@hyperlane-xyz/provider-sdk/ism';
 
 /**
  * ISM types supported by provider-sdk for Alt-VM chains.
  * These correspond to the types defined in provider-sdk/src/ism.ts
+ *
+ * Typed as `ReadonlySet<string>` rather than `ReadonlySet<IsmType>`
+ * deliberately: `validateIsmType`'s `ismType` parameter is arbitrary,
+ * not-yet-validated input (a raw config field, possibly from an untrusted
+ * registry entry), so `.has()` is called with a plain `string`. Narrowing
+ * the set to `ReadonlySet<IsmType>` would just push an unsafe cast to
+ * every call site instead of removing it.
  */
-const SUPPORTED_ISM_TYPES: Set<IsmType> = new Set([
-  'domainRoutingIsm',
-  'merkleRootMultisigIsm',
-  'messageIdMultisigIsm',
-  'testIsm',
+const SUPPORTED_ISM_TYPES: ReadonlySet<string> = new Set<IsmType>([
+  IsmType.ROUTING,
+  IsmType.MERKLE_ROOT_MULTISIG,
+  IsmType.MESSAGE_ID_MULTISIG,
+  IsmType.TEST_ISM,
+  IsmType.COMPOSITE,
+  IsmType.ROUTING_MESSAGE_ID_MULTISIG,
 ]);
 
+/** ISM types restricted to a single Alt-VM protocol (Sealevel program, no cross-VM equivalent). */
+const PROTOCOL_SPECIFIC_ISM_TYPES: Readonly<
+  Partial<Record<string, ProtocolType>>
+> = {
+  [IsmType.COMPOSITE]: ProtocolType.Sealevel,
+  [IsmType.ROUTING_MESSAGE_ID_MULTISIG]: ProtocolType.Sealevel,
+};
+
+/** ISM types otherwise supported but rejected on a specific protocol, with the type to use instead. */
+const PROTOCOL_UNSUPPORTED_ISM_TYPES: Readonly<
+  Partial<Record<ProtocolType, Readonly<Record<string, IsmType>>>>
+> = {
+  [ProtocolType.Sealevel]: {
+    [IsmType.MESSAGE_ID_MULTISIG]: IsmType.ROUTING_MESSAGE_ID_MULTISIG,
+  },
+};
+
 /**
- * Validates that an ISM type is supported by provider-sdk.
+ * Validates that an ISM type is supported by provider-sdk for the given protocol.
  *
  * @param ismType - The ISM type string to validate
  * @param chain - Chain name for error messages
  * @param context - Context string for error messages (e.g., "warp route", "core")
+ * @param protocol - Protocol of the chain being validated. `protocol` is
+ * optional only so pre-existing callers (validating one of the
+ * always-cross-protocol types below) keep compiling — it does NOT loosen
+ * validation for a protocol-gated type like compositeIsm. At the point
+ * compositeIsm was introduced it was never accepted without a matching
+ * protocol, so omitting `protocol` for it still fails, just with a
+ * clearer "protocol required" reason instead of a generic type mismatch.
  * @throws UnsupportedIsmTypeError if ISM type is not supported
  */
 export function validateIsmType(
   ismType: string,
   chain: string,
   context: string = 'configuration',
+  protocol?: ProtocolType,
 ): void {
-  if (!SUPPORTED_ISM_TYPES.has(ismType as IsmType)) {
-    const supportedTypes = Array.from(SUPPORTED_ISM_TYPES).join(', ');
+  const requiredProtocol = PROTOCOL_SPECIFIC_ISM_TYPES[ismType];
+  const protocolUnsupported =
+    protocol === undefined
+      ? {}
+      : (PROTOCOL_UNSUPPORTED_ISM_TYPES[protocol] ?? {});
+  const supported =
+    SUPPORTED_ISM_TYPES.has(ismType) &&
+    (requiredProtocol === undefined || requiredProtocol === protocol) &&
+    !Object.prototype.hasOwnProperty.call(protocolUnsupported, ismType);
+
+  if (!supported) {
+    const supportedTypes = Array.from(SUPPORTED_ISM_TYPES)
+      .filter((type) => {
+        const required = PROTOCOL_SPECIFIC_ISM_TYPES[type];
+        return (
+          (required === undefined || required === protocol) &&
+          !Object.prototype.hasOwnProperty.call(protocolUnsupported, type)
+        );
+      })
+      .join(', ');
+
+    const replacement = Object.prototype.hasOwnProperty.call(
+      protocolUnsupported,
+      ismType,
+    )
+      ? protocolUnsupported[ismType]
+      : undefined;
+    if (replacement !== undefined) {
+      throw new UnsupportedIsmTypeError(
+        ismType,
+        chain,
+        context,
+        `${supportedTypes} (${ismType} is unsupported on ${protocol}, use ${replacement} instead)`,
+      );
+    }
+
+    if (
+      SUPPORTED_ISM_TYPES.has(ismType) &&
+      requiredProtocol !== undefined &&
+      protocol === undefined
+    ) {
+      throw new UnsupportedIsmTypeError(
+        ismType,
+        chain,
+        context,
+        `${supportedTypes} (ismType '${ismType}' requires the chain's protocol to be passed explicitly to validateIsmType/validateIsmConfig)`,
+      );
+    }
     throw new UnsupportedIsmTypeError(ismType, chain, context, supportedTypes);
   }
 }
 
 /**
- * Validates that an ISM configuration is supported by provider-sdk.
+ * Validates that an ISM configuration is supported by provider-sdk for the given protocol.
  *
  * @param config - ISM configuration (can be string address or config object)
  * @param chain - Chain name for error messages
  * @param context - Context string for error messages (e.g., "warp route", "core")
+ * @param protocol - Protocol of the chain being validated. See validateIsmType.
  * @throws UnsupportedIsmTypeError if ISM type is not supported
  */
 export function validateIsmConfig(
   config: IsmConfig | string,
   chain: string,
   context: string = 'configuration',
+  protocol?: ProtocolType,
 ): void {
   // If it's a string address, it's valid (pre-deployed ISM)
   if (typeof config === 'string') {
@@ -55,15 +142,26 @@ export function validateIsmConfig(
   }
 
   // Validate the ISM type
-  validateIsmType(config.type, chain, context);
+  validateIsmType(config.type, chain, context, protocol);
 
   // Recursively validate nested ISMs in routing configs
-  if (config.type === 'domainRoutingIsm') {
+  if (config.type === IsmType.ROUTING) {
     for (const [domain, domainConfig] of Object.entries(config.domains)) {
       validateIsmConfig(
         domainConfig,
         chain,
         `${context} (domain routing for ${domain})`,
+        protocol,
+      );
+    }
+  }
+
+  // Fail before any deployment transaction is sent.
+  if (config.type === IsmType.ROUTING_MESSAGE_ID_MULTISIG) {
+    for (const [domain, domainConfig] of Object.entries(config.domains)) {
+      assertValidDomainRoutingMultisig(
+        domainConfig,
+        `${IsmType.ROUTING_MESSAGE_ID_MULTISIG} domain '${domain}' on ${chain} in ${context}`,
       );
     }
   }

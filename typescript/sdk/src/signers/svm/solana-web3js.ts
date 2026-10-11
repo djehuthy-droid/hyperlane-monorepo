@@ -1,4 +1,5 @@
 import {
+  type Blockhash,
   ComputeBudgetProgram,
   Connection,
   Keypair,
@@ -6,22 +7,47 @@ import {
   Transaction,
   TransactionConfirmationStatus,
   TransactionInstruction,
+  VersionedTransaction,
 } from '@solana/web3.js';
 
 import { Address, ProtocolType, rootLogger, sleep } from '@hyperlane-xyz/utils';
 
 import { SEALEVEL_PRIORITY_FEES } from '../../consts/sealevel.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
+import { SendTransactionOptions } from '../../providers/MultiProvider.js';
 import { SolanaWeb3Transaction } from '../../providers/ProviderType.js';
 import { ChainName } from '../../types.js';
 import { IMultiProtocolSigner } from '../types.js';
 
 /**
- * Interface for SVM transaction signers
+ * Rewrite a `VersionedTransaction`'s blockhash and clear its signatures so
+ * the caller can re-sign with the fresh blockhash. `MessageV0.recentBlockhash`
+ * is declared `readonly` in TypeScript but is a plain mutable field at
+ * runtime; the same pattern is used by `@solana/wallet-adapter` resubmit
+ * examples. `Object.assign` performs the write without a type assertion.
+ * Returns the same instance for chaining.
+ */
+function stampVersionedBlockhash(
+  tx: VersionedTransaction,
+  blockhash: Blockhash,
+): VersionedTransaction {
+  Object.assign(tx.message, { recentBlockhash: blockhash });
+  for (let i = 0; i < tx.signatures.length; i++) {
+    tx.signatures[i] = new Uint8Array(64);
+  }
+  return tx;
+}
+
+/**
+ * Interface for SVM transaction signers. Accepts both legacy `Transaction`
+ * and `VersionedTransaction` — the latter is required by Sealevel warp
+ * transfer_remote calls compressed with Address Lookup Tables.
  */
 export interface SvmTransactionSigner {
   readonly publicKey: PublicKey;
-  signTransaction(transaction: Transaction): Promise<Transaction>;
+  signTransaction<T extends Transaction | VersionedTransaction>(
+    transaction: T,
+  ): Promise<T>;
 }
 
 export interface SvmSignerConfig {
@@ -56,15 +82,22 @@ export class KeypairSvmTransactionSigner implements SvmTransactionSigner {
     this.publicKey = this.keypair.publicKey;
   }
 
-  async signTransaction(transaction: Transaction): Promise<Transaction> {
-    transaction.sign(this.keypair);
+  async signTransaction<T extends Transaction | VersionedTransaction>(
+    transaction: T,
+  ): Promise<T> {
+    // `VersionedTransaction.sign([signer])` populates only the signer's
+    // slot (other signature slots stay as their pre-initialized zero bytes),
+    // matching the partial-sign semantics of legacy `Transaction.partialSign`.
+    if (transaction instanceof VersionedTransaction) {
+      transaction.sign([this.keypair]);
+    } else {
+      transaction.partialSign(this.keypair);
+    }
     return transaction;
   }
 }
 
-export class SvmMultiProtocolSignerAdapter
-  implements IMultiProtocolSigner<ProtocolType.Sealevel>
-{
+export class SvmMultiProtocolSignerAdapter implements IMultiProtocolSigner<ProtocolType.Sealevel> {
   private readonly signer: SvmTransactionSigner;
   private readonly svmProvider: Connection;
   private readonly config: Required<SvmSignerConfig>;
@@ -75,7 +108,7 @@ export class SvmMultiProtocolSignerAdapter
   constructor(
     private readonly chainName: ChainName,
     signer: SvmTransactionSigner,
-    multiProtocolProvider: MultiProtocolProvider,
+    multiProtocolProvider: MultiProviderAdapter,
     config?: SvmSignerConfig,
   ) {
     this.signer = signer;
@@ -111,8 +144,11 @@ export class SvmMultiProtocolSignerAdapter
   /**
    * Send and confirm a pre-built transaction (IMultiProtocolSigner interface)
    */
-  async sendAndConfirmTransaction(tx: SolanaWeb3Transaction): Promise<string> {
-    return this.signAndConfirm(tx.transaction);
+  async sendAndConfirmTransaction(
+    tx: SolanaWeb3Transaction,
+    _options?: SendTransactionOptions,
+  ): Promise<string> {
+    return this.signAndConfirm(tx.transaction, tx.extraSigners);
   }
 
   // ============ Private Methods ============
@@ -155,12 +191,36 @@ export class SvmMultiProtocolSignerAdapter
   /**
    * Sign and confirm transaction with blockhash resubmit on expiry
    */
-  private async signAndConfirm(transaction: Transaction): Promise<string> {
+  private async signAndConfirm(
+    transaction: Transaction | VersionedTransaction,
+    extraSigners?: Keypair[],
+  ): Promise<string> {
     // Get initial blockhash
     const { blockhash, lastValidBlockHeight } =
       await this.svmProvider.getLatestBlockhash(this.config.commitment);
 
-    transaction.recentBlockhash = blockhash;
+    if (transaction instanceof VersionedTransaction) {
+      stampVersionedBlockhash(transaction, blockhash);
+      // `VersionedTransaction.sign([signer])` only populates the signer's
+      // slot (matches partial-sign semantics of legacy `partialSign`).
+      for (const signer of extraSigners ?? []) {
+        transaction.sign([signer]);
+      }
+    } else {
+      transaction.recentBlockhash = blockhash;
+      if (!transaction.feePayer) {
+        transaction.feePayer = this.signer.publicKey;
+      }
+      // Sign with extra signers first (e.g., randomWallet for Sealevel
+      // transferRemote). Uses partialSign to avoid clearing any existing
+      // signatures. This re-signs with the fresh blockhash, overwriting
+      // the adapter's pre-sign.
+      for (const signer of extraSigners ?? []) {
+        transaction.partialSign(signer);
+      }
+    }
+
+    // Sign with main signer (preserves extra signers' signatures)
     const signedTx = await this.signer.signTransaction(transaction);
 
     // Send initial transaction
@@ -171,6 +231,7 @@ export class SvmMultiProtocolSignerAdapter
       signature,
       signedTx,
       lastValidBlockHeight,
+      extraSigners,
     );
 
     return result;
@@ -181,8 +242,9 @@ export class SvmMultiProtocolSignerAdapter
    */
   private async pollForConfirmation(
     initialSignature: string,
-    transaction: Transaction,
+    transaction: Transaction | VersionedTransaction,
     lastValidBlockHeight: number,
+    extraSigners?: Keypair[],
   ): Promise<string> {
     let signature = initialSignature;
     let attempts = 0;
@@ -198,6 +260,7 @@ export class SvmMultiProtocolSignerAdapter
           signature,
           transaction,
           currentLastValidBlockHeight,
+          extraSigners,
         );
         if (resubmitResult) {
           signature = resubmitResult.signature;
@@ -243,8 +306,9 @@ export class SvmMultiProtocolSignerAdapter
    */
   private async checkAndResubmitIfExpired(
     signature: string,
-    transaction: Transaction,
+    transaction: Transaction | VersionedTransaction,
     lastValidBlockHeight: number,
+    extraSigners?: Keypair[],
   ): Promise<{ signature: string; lastValidBlockHeight: number } | null> {
     if (!this.config.enableBlockhashResubmit) {
       return null;
@@ -263,7 +327,18 @@ export class SvmMultiProtocolSignerAdapter
     const { blockhash, lastValidBlockHeight: newLastValid } =
       await this.svmProvider.getLatestBlockhash(this.config.commitment);
 
-    transaction.recentBlockhash = blockhash;
+    if (transaction instanceof VersionedTransaction) {
+      stampVersionedBlockhash(transaction, blockhash);
+      for (const signer of extraSigners ?? []) {
+        transaction.sign([signer]);
+      }
+    } else {
+      transaction.recentBlockhash = blockhash;
+      for (const signer of extraSigners ?? []) {
+        transaction.partialSign(signer);
+      }
+    }
+
     const signedTx = await this.signer.signTransaction(transaction);
 
     const newSignature = await this.sendRawTransaction(signedTx);
@@ -310,7 +385,9 @@ export class SvmMultiProtocolSignerAdapter
   /**
    * Send signed transaction to network
    */
-  private async sendRawTransaction(transaction: Transaction): Promise<string> {
+  private async sendRawTransaction(
+    transaction: Transaction | VersionedTransaction,
+  ): Promise<string> {
     return await this.svmProvider.sendRawTransaction(transaction.serialize(), {
       skipPreflight: false,
       maxRetries: 3,

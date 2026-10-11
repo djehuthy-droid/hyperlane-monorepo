@@ -1,9 +1,10 @@
 import { InterchainAccountRouter__factory } from '@hyperlane-xyz/core';
-import { Address } from '@hyperlane-xyz/utils';
+import { Address, rootLogger } from '@hyperlane-xyz/utils';
 
 import { EvmRouterReader } from '../router/EvmRouterReader.js';
+import { throwIfNotMissingSelector } from '../utils/contract.js';
 
-import { DerivedIcaRouterConfig } from './types.js';
+import { DerivedIcaRouterConfig, IcaRouterType } from './types.js';
 
 export class EvmIcaRouterReader extends EvmRouterReader {
   public async deriveConfig(address: Address): Promise<DerivedIcaRouterConfig> {
@@ -12,17 +13,29 @@ export class EvmIcaRouterReader extends EvmRouterReader {
       this.provider,
     );
 
-    const commitmentIsmAddress = await icaRouterInstance.CCIP_READ_ISM();
+    let commitmentIsmAddress: string | undefined;
+    let routerType: IcaRouterType;
+    try {
+      commitmentIsmAddress = await icaRouterInstance.CCIP_READ_ISM();
+      routerType = IcaRouterType.REGULAR;
+    } catch (error) {
+      throwIfNotMissingSelector(error);
+      rootLogger.debug(
+        `No CCIP_READ_ISM on ${address} — MinimalInterchainAccountRouter`,
+      );
+      routerType = IcaRouterType.MINIMAL;
+    }
 
-    const [routerConfig, commitmentIsm] = await Promise.all([
-      this.readRouterConfig(address),
-      this.evmIsmReader.deriveOffchainLookupConfig(commitmentIsmAddress),
-    ]);
+    const routerConfig = await this.readRouterConfig(address);
+    const commitmentIsm = commitmentIsmAddress
+      ? await this.evmIsmReader.deriveOffchainLookupConfig(commitmentIsmAddress)
+      : undefined;
 
     return {
       address,
       ...routerConfig,
-      commitmentIsm,
+      routerType,
+      ...(commitmentIsm ? { commitmentIsm } : {}),
     };
   }
 }

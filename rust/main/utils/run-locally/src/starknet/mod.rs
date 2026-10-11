@@ -14,7 +14,10 @@ use crate::metrics::agent_balance_sum;
 use crate::program::Program;
 use crate::starknet::types::{AgentConfigOut, ValidatorConfig};
 use crate::starknet::utils::{STARKNET_ACCOUNT, STARKNET_KEY};
-use crate::utils::{as_task, concat_path, stop_child, AgentHandles, TaskHandle};
+use crate::utils::{
+    as_task, concat_path, prepare_docker_image, start_postgres, stop_child, AgentHandles,
+    TaskHandle,
+};
 use crate::{fetch_metric, AGENT_BIN_PATH};
 
 use self::cli::StarknetCLI;
@@ -151,6 +154,14 @@ fn launch_starknet_validator(
     agent_config_path: PathBuf,
     debug: bool,
 ) -> AgentHandles {
+    starknet_validator_program(agent_config, agent_config_path, debug).spawn("VAL", None)
+}
+
+fn starknet_validator_program(
+    agent_config: AgentConfig,
+    agent_config_path: PathBuf,
+    debug: bool,
+) -> Program {
     let validator_bin = concat_path(format!("../../{AGENT_BIN_PATH}"), "validator");
     let validator_base = tempdir().expect("Failed to create a temp dir").into_path();
     let validator_base_db = concat_path(&validator_base, "db");
@@ -161,7 +172,7 @@ fn launch_starknet_validator(
     let checkpoint_path = concat_path(&validator_base, "checkpoint");
     let signature_path = concat_path(&validator_base, "signature");
 
-    let validator = Program::default()
+    Program::default()
         .bin(validator_bin)
         .working_dir("../../")
         .env("CONFIG_FILES", agent_config_path.to_str().unwrap())
@@ -172,6 +183,14 @@ fn launch_starknet_validator(
         .env("RUST_BACKTRACE", "1")
         .hyp_env("CHECKPOINTSYNCER_PATH", checkpoint_path.to_str().unwrap())
         .hyp_env("CHECKPOINTSYNCER_TYPE", "localStorage")
+        // Dead endpoints in this fixture intentionally exercise fallback, not voting.
+        .hyp_env(
+            format!(
+                "CHAINS_{}_RPCCONSENSUSTYPE",
+                agent_config.name.to_uppercase()
+            ),
+            "fallback",
+        )
         .hyp_env("ORIGINCHAINNAME", agent_config.name)
         .hyp_env("DB", validator_base_db.to_str().unwrap())
         .hyp_env("METRICSPORT", agent_config.metrics_port.to_string())
@@ -183,9 +202,6 @@ fn launch_starknet_validator(
         .hyp_env("SIGNER_SIGNER_TYPE", agent_config.signer.typ)
         .hyp_env("SIGNER_KEY", agent_config.signer.key)
         .hyp_env("TRACING_LEVEL", if debug { "debug" } else { "info" })
-        .spawn("VAL", None);
-
-    validator
 }
 
 #[apply(as_task)]
@@ -239,6 +255,31 @@ fn launch_starknet_scraper(
     scraper
 }
 
+/// Poll the Starknet devnet JSON-RPC endpoint until it responds successfully.
+fn wait_for_starknet_node(rpc_addr: &str) {
+    const MAX_ATTEMPTS: u32 = 60;
+    for attempt in 0..MAX_ATTEMPTS {
+        let resp = ureq::post(rpc_addr)
+            .set("Content-Type", "application/json")
+            .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"starknet_chainId","params":[]}"#);
+        if let Ok(resp) = resp {
+            if resp.status() == 200 {
+                log!(
+                    "Starknet devnet at {} is ready (attempt {})",
+                    rpc_addr,
+                    attempt + 1
+                );
+                return;
+            }
+        }
+        sleep(Duration::from_secs(1));
+    }
+    panic!(
+        "Starknet devnet at {} failed to start after {MAX_ATTEMPTS}s",
+        rpc_addr
+    );
+}
+
 const ENV_STARKNET_CLI_PATH_KEY: &str = "E2E_STARKLI_CLI_PATH";
 const ENV_HYPERLANE_STARKNET_PATH_KEY: &str = "E2E_HYPERLANE_STARKNET_PATH";
 
@@ -287,6 +328,9 @@ fn run_locally() {
     let domain_start = 23448593u32;
     let node_count = 2;
 
+    // Prepare once before launching both nodes, outside their readiness deadline.
+    prepare_docker_image(&format!("{STARKNET_DEVNET_IMAGE}:{STARKNET_DEVNET_TAG}"));
+
     let nodes = (0..node_count)
         .map(|i| {
             (
@@ -312,13 +356,12 @@ fn run_locally() {
     };
     let _relayer = "hpl-relayer";
 
-    // give things a chance to fully start.
-    sleep(Duration::from_secs(20));
-
+    // Wait for devnet nodes to be ready before proceeding.
     let nodes = nodes
         .into_iter()
         .map(|v| (v.0.join(), v.1, v.2, v.3))
         .map(|(launch_resp, chain_id, metrics_port, domain)| {
+            wait_for_starknet_node(&launch_resp.endpoint.rpc_addr);
             let mut starknet_cli = launch_resp.cli(&starklid);
             starknet_cli.init(
                 STARKNET_KEY.into(),
@@ -390,16 +433,9 @@ fn run_locally() {
     .unwrap();
 
     log!("Running postgres db...");
-    let postgres = Program::new("docker")
-        .cmd("run")
-        .flag("rm")
-        .arg("name", "scraper-testnet-postgres")
-        .arg("env", "POSTGRES_PASSWORD=47221c18c610")
-        .arg("publish", "5432:5432")
-        .cmd("postgres:14")
-        .spawn("SQL", None);
+    let postgres = start_postgres();
 
-    sleep(Duration::from_secs(15));
+    crate::utils::wait_for_postgres();
 
     log!("Init postgres db...");
     Program::new(concat_path(format!("../../{AGENT_BIN_PATH}"), "init-db"))
@@ -620,5 +656,25 @@ mod test {
     #[test]
     fn test_run() {
         run_locally()
+    }
+}
+
+#[cfg(test)]
+mod validator_config_tests {
+    use super::*;
+
+    #[test]
+    fn validator_harness_explicitly_uses_fallback() {
+        let config: AgentConfig = serde_json::from_value(serde_json::json!({
+            "name": "fallback-test", "domainId": 1234, "metricsPort": 9999,
+            "mailbox": "test", "interchainGasPaymaster": "test", "validatorAnnounce": "test", "merkleTreeHook": "test",
+            "protocol": "starknet", "rpcUrls": [], "index": {"from": 0, "chunk": 10}, "contractAddressBytes": 32,
+            "signer": {"type": "starkKey", "key": "test", "address": "test"},
+            "nativeToken": {"denom": "test"}, "maxBatchSize": 1
+        })).unwrap();
+        let program = starknet_validator_program(config, PathBuf::from("test-config.json"), false);
+        let command = format!("{program:#}");
+        assert!(command.contains("HYP_CHAINS_FALLBACK-TEST_RPCCONSENSUSTYPE=fallback"));
+        assert!(command.contains("HYP_ORIGINCHAINNAME=fallback-test"));
     }
 }

@@ -5,100 +5,88 @@ import {
   type BankExtension,
   type MsgSendEncodeObject,
   QueryClient,
-  StargateClient,
+  type StargateClient,
   defaultRegistryTypes,
   setupBankExtension,
 } from '@cosmjs/stargate';
 import { type CometClient, connectComet } from '@cosmjs/tendermint-rpc';
 
-import { warpTypes } from '@hyperlane-xyz/cosmos-types';
-import { AltVM } from '@hyperlane-xyz/provider-sdk';
+import { type AltVM } from '@hyperlane-xyz/provider-sdk';
+import type { ChainMetadataForAltVM } from '@hyperlane-xyz/provider-sdk/chain';
+import {
+  composeWarpDeployGas,
+  nativeAmountFromGasUnits,
+  type WarpArtifactConfig,
+} from '@hyperlane-xyz/provider-sdk/warp';
 import { assert, strip0x } from '@hyperlane-xyz/utils';
 
-import {
-  type MsgCreateMailboxEncodeObject,
-  type MsgSetMailboxEncodeObject,
-} from '../hyperlane/core/messages.js';
+import { type MsgRemoteTransferEncodeObject } from '../hyperlane/warp/messages.js';
 import {
   type CoreExtension,
   setupCoreExtension,
 } from '../hyperlane/core/query.js';
 import {
-  type MsgCreateMerkleRootMultisigIsmEncodeObject,
-  type MsgCreateMessageIdMultisigIsmEncodeObject,
-  type MsgCreateNoopIsmEncodeObject,
-  type MsgCreateRoutingIsmEncodeObject,
-  type MsgRemoveRoutingIsmDomainEncodeObject,
-  type MsgSetRoutingIsmDomainEncodeObject,
-  type MsgUpdateRoutingIsmOwnerEncodeObject,
-} from '../hyperlane/interchain_security/messages.js';
-import {
-  type InterchainSecurityExtension,
-  setupInterchainSecurityExtension,
-} from '../hyperlane/interchain_security/query.js';
-import {
-  type MsgCreateIgpEncodeObject,
-  type MsgCreateMerkleTreeHookEncodeObject,
-  type MsgCreateNoopHookEncodeObject,
-  type MsgSetDestinationGasConfigEncodeObject,
-  type MsgSetIgpOwnerEncodeObject,
-} from '../hyperlane/post_dispatch/messages.js';
-import {
-  type PostDispatchExtension,
-  setupPostDispatchExtension,
-} from '../hyperlane/post_dispatch/query.js';
-import {
-  type MsgCreateCollateralTokenEncodeObject,
-  type MsgCreateSyntheticTokenEncodeObject,
-  type MsgEnrollRemoteRouterEncodeObject,
-  type MsgRemoteTransferEncodeObject,
-  type MsgSetTokenEncodeObject,
-  type MsgUnrollRemoteRouterEncodeObject,
-} from '../hyperlane/warp/messages.js';
-import {
   type WarpExtension,
   setupWarpExtension,
 } from '../hyperlane/warp/query.js';
-import {
-  getIsmType,
-  getMerkleRootMultisigIsmConfig,
-  getMessageIdMultisigIsmConfig,
-  getNoopIsmConfig,
-  getRoutingIsmConfig,
-} from '../ism/ism-query.js';
 import { COSMOS_MODULE_MESSAGE_REGISTRY as R } from '../registry.js';
+import { getWarpTokenType } from '../warp/warp-query.js';
+
+import {
+  StargateClientCache,
+  disconnectStargateClient,
+  shouldCacheStargateClient,
+} from './stargate.js';
+
+// Warp-deploy cost breakdown for Cosmos-native. Composed additively in
+// getMinGasForWarpDeploy() based on the WarpConfig shape. Unlike rent-metered
+// protocols, these are gas UNITS (ugas) that get multiplied by the chain's
+// gas price to yield a native-denom amount.
+//
+// TODO: fill from observed deploy — we don't have a measured breakdown for
+// feature-heavy warp deploys on Cosmos-native yet, so all extras currently
+// contribute nothing.
+const WARP_DEPLOY_BASE_UGAS = BigInt(3e6); // base router deploy
+const WARP_DEPLOY_CROSS_COLLATERAL_EXTRA_UGAS = 0n; // + crossCollateral router extras
+const WARP_DEPLOY_FEE_PROGRAM_UGAS = 0n; // + fee program (config.fee object)
+const WARP_DEPLOY_CUSTOM_ISM_UGAS = 0n; // + custom ISM (config.interchainSecurityModule object)
+const WARP_DEPLOY_CUSTOM_HOOK_UGAS = 0n; // + custom hook / IGP (config.hook object)
 
 export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
   private readonly query: QueryClient &
     BankExtension &
-    WarpExtension &
     CoreExtension &
-    InterchainSecurityExtension &
-    PostDispatchExtension;
+    WarpExtension;
   private readonly registry: Registry;
   private readonly cometClient: CometClient;
-  private readonly rpcUrls: string[];
-
-  private static NULL_ADDRESS =
-    '0x0000000000000000000000000000000000000000000000000000000000000000';
+  private readonly rpcUrls: [string, ...string[]];
+  protected readonly chainMetadata: ChainMetadataForAltVM;
+  private readonly stargateClients = new StargateClientCache(1);
 
   static async connect(
-    rpcUrls: string[],
-    _chainId: string | number,
+    metadata: ChainMetadataForAltVM,
   ): Promise<CosmosNativeProvider> {
-    assert(rpcUrls.length > 0, `got no rpcUrls`);
+    const rpcUrls = (metadata.rpcUrls ?? []).map((rpc) => rpc.http);
+    const [rpcUrl, ...otherRpcUrls] = rpcUrls;
+    assert(rpcUrl, `${CosmosNativeProvider.name} got no rpcUrls`);
 
-    const client = await connectComet(rpcUrls[0]);
-    return new CosmosNativeProvider(client, rpcUrls);
+    const client = await connectComet(rpcUrl);
+    return new CosmosNativeProvider(
+      client,
+      [rpcUrl, ...otherRpcUrls],
+      metadata,
+    );
   }
 
-  protected constructor(cometClient: CometClient, rpcUrls: string[]) {
+  protected constructor(
+    cometClient: CometClient,
+    rpcUrls: [string, ...string[]],
+    chainMetadata: ChainMetadataForAltVM,
+  ) {
     this.query = QueryClient.withExtensions(
       cometClient,
       setupBankExtension,
       setupCoreExtension,
-      setupInterchainSecurityExtension,
-      setupPostDispatchExtension,
       setupWarpExtension,
     );
 
@@ -111,6 +99,24 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
 
     this.cometClient = cometClient;
     this.rpcUrls = rpcUrls;
+    this.chainMetadata = chainMetadata;
+  }
+
+  async getMinGasForWarpDeploy(
+    warpConfig: WarpArtifactConfig,
+  ): Promise<bigint> {
+    const units = composeWarpDeployGas(warpConfig, {
+      base: WARP_DEPLOY_BASE_UGAS,
+      crossCollateralExtra: WARP_DEPLOY_CROSS_COLLATERAL_EXTRA_UGAS,
+      feeProgram: WARP_DEPLOY_FEE_PROGRAM_UGAS,
+      customIsm: WARP_DEPLOY_CUSTOM_ISM_UGAS,
+      customHook: WARP_DEPLOY_CUSTOM_HOOK_UGAS,
+    });
+    assert(
+      this.chainMetadata.gasPrice,
+      `gasPrice not defined on chain ${this.chainMetadata.name}`,
+    );
+    return nativeAmountFromGasUnits(units, this.chainMetadata.gasPrice);
   }
 
   // ### QUERY BASE ###
@@ -120,7 +126,7 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
     return status.syncInfo.latestBlockHeight > 0;
   }
 
-  getRpcUrls(): string[] {
+  getRpcUrls(): [string, ...string[]] {
     return this.rpcUrls;
   }
 
@@ -158,56 +164,57 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
       req.senderPubKey,
       `Cosmos Native requires a sender public key to estimate the transaction fee`,
     );
-    const stargateClient = await StargateClient.connect(this.rpcUrls[0]);
+    const stargateClientPromise = this.getStargateClient();
+    let stargateClient: StargateClient | undefined;
 
-    const message = this.registry.encodeAsAny(req.transaction);
-    const pubKey = encodeSecp256k1Pubkey(
-      new Uint8Array(Buffer.from(strip0x(req.senderPubKey), 'hex')),
-    );
+    try {
+      stargateClient = await stargateClientPromise;
 
-    const queryClient = stargateClient['getQueryClient']();
-    assert(queryClient, `queryClient could not be found on stargate client`);
+      const message = this.registry.encodeAsAny(req.transaction);
+      const pubKey = encodeSecp256k1Pubkey(
+        new Uint8Array(Buffer.from(strip0x(req.senderPubKey), 'hex')),
+      );
 
-    const { sequence } = await stargateClient.getSequence(req.senderAddress);
-    const { gasInfo } = await queryClient.tx.simulate(
-      [message],
-      undefined,
-      pubKey,
-      sequence,
-    );
-    const gasUnits = Uint53.fromString(
-      gasInfo?.gasUsed.toString() ?? '0',
-    ).toNumber();
+      const queryClient = stargateClient
+        // @ts-ignore force access to protected method
+        .forceGetQueryClient();
 
-    const gasPrice = parseFloat(req.estimatedGasPrice.toString());
-    return {
-      gasUnits: BigInt(gasUnits),
-      gasPrice,
-      fee: BigInt(Math.floor(gasUnits * gasPrice)),
-    };
+      const { sequence } = await stargateClient.getSequence(req.senderAddress);
+      const { gasInfo } = await queryClient.tx.simulate(
+        [message],
+        undefined,
+        pubKey,
+        sequence,
+      );
+      const gasUnits = Uint53.fromString(
+        gasInfo?.gasUsed.toString() ?? '0',
+      ).toNumber();
+
+      const gasPrice = parseFloat(req.estimatedGasPrice.toString());
+      return {
+        gasUnits: BigInt(gasUnits),
+        gasPrice,
+        fee: BigInt(Math.floor(gasUnits * gasPrice)),
+      };
+    } catch (error) {
+      this.stargateClients.evict(this.rpcUrls[0], stargateClientPromise);
+      throw error;
+    } finally {
+      if (shouldCacheStargateClient(this.rpcUrls[0])) {
+        this.stargateClients.release(stargateClientPromise);
+      } else if (stargateClient) {
+        disconnectStargateClient(Promise.resolve(stargateClient));
+      }
+    }
   }
 
-  // ### QUERY CORE ###
+  private getStargateClient(): Promise<StargateClient> {
+    return this.stargateClients.get(this.rpcUrls[0]);
+  }
 
-  async getMailbox(req: AltVM.ReqGetMailbox): Promise<AltVM.ResGetMailbox> {
-    const { mailbox } = await this.query.core.Mailbox({
-      id: req.mailboxAddress,
-    });
-    assert(mailbox, `found no mailbox for id ${req.mailboxAddress}`);
-
-    if (mailbox.default_ism === CosmosNativeProvider.NULL_ADDRESS) {
-      mailbox.default_ism = '';
-    }
-
-    return {
-      address: mailbox.id,
-      owner: mailbox.owner,
-      localDomain: mailbox.local_domain,
-      defaultIsm: mailbox.default_ism,
-      defaultHook: mailbox.default_hook,
-      requiredHook: mailbox.required_hook,
-      nonce: mailbox.message_sent,
-    };
+  disconnect(): void {
+    this.cometClient.disconnect();
+    this.stargateClients.clear();
   }
 
   async isMessageDelivered(req: AltVM.ReqIsMessageDelivered): Promise<boolean> {
@@ -218,120 +225,6 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
     return delivered;
   }
 
-  async getIsmType(req: AltVM.ReqGetIsmType): Promise<AltVM.IsmType> {
-    return getIsmType(this.query, req.ismAddress);
-  }
-
-  async getMessageIdMultisigIsm(
-    req: AltVM.ReqMessageIdMultisigIsm,
-  ): Promise<AltVM.ResMessageIdMultisigIsm> {
-    return getMessageIdMultisigIsmConfig(this.query, req.ismAddress);
-  }
-
-  async getMerkleRootMultisigIsm(
-    req: AltVM.ReqMerkleRootMultisigIsm,
-  ): Promise<AltVM.ResMerkleRootMultisigIsm> {
-    return getMerkleRootMultisigIsmConfig(this.query, req.ismAddress);
-  }
-
-  async getRoutingIsm(req: AltVM.ReqRoutingIsm): Promise<AltVM.ResRoutingIsm> {
-    return getRoutingIsmConfig(this.query, req.ismAddress);
-  }
-
-  async getNoopIsm(req: AltVM.ReqNoopIsm): Promise<AltVM.ResNoopIsm> {
-    return getNoopIsmConfig(this.query, req.ismAddress);
-  }
-
-  async getHookType(req: AltVM.ReqGetHookType): Promise<AltVM.HookType> {
-    try {
-      const { igp } = await this.query.postDispatch.Igp({
-        id: req.hookAddress,
-      });
-
-      if (igp) {
-        return AltVM.HookType.INTERCHAIN_GAS_PAYMASTER;
-      }
-    } catch {
-      try {
-        const { merkle_tree_hook } =
-          await this.query.postDispatch.MerkleTreeHook({ id: req.hookAddress });
-
-        if (merkle_tree_hook) {
-          return AltVM.HookType.MERKLE_TREE;
-        }
-      } catch {
-        throw new Error(`Unknown Hook Type: ${req.hookAddress}`);
-      }
-    }
-
-    throw new Error(`Unknown Hook Type: ${req.hookAddress}`);
-  }
-
-  async getInterchainGasPaymasterHook(
-    req: AltVM.ReqGetInterchainGasPaymasterHook,
-  ): Promise<AltVM.ResGetInterchainGasPaymasterHook> {
-    const { igp } = await this.query.postDispatch.Igp({ id: req.hookAddress });
-    assert(igp, `found no igp for id ${req.hookAddress}`);
-
-    const { destination_gas_configs } =
-      await this.query.postDispatch.DestinationGasConfigs({
-        id: igp.id,
-      });
-
-    const configs: {
-      [domainId: string]: {
-        gasOracle: {
-          tokenExchangeRate: string;
-          gasPrice: string;
-        };
-        gasOverhead: string;
-      };
-    } = {};
-
-    for (const config of destination_gas_configs) {
-      configs[config.remote_domain] = {
-        gasOracle: {
-          tokenExchangeRate: config.gas_oracle?.token_exchange_rate ?? '0',
-          gasPrice: config.gas_oracle?.gas_price ?? '0',
-        },
-        gasOverhead: config.gas_overhead,
-      };
-    }
-
-    return {
-      address: igp.id,
-      owner: igp.owner,
-      destinationGasConfigs: configs,
-    };
-  }
-
-  async getMerkleTreeHook(
-    req: AltVM.ReqGetMerkleTreeHook,
-  ): Promise<AltVM.ResGetMerkleTreeHook> {
-    const { merkle_tree_hook } = await this.query.postDispatch.MerkleTreeHook({
-      id: req.hookAddress,
-    });
-    assert(
-      merkle_tree_hook,
-      `found no merkle tree hook for id ${req.hookAddress}`,
-    );
-
-    return {
-      address: merkle_tree_hook.id,
-    };
-  }
-
-  async getNoopHook(req: AltVM.ReqGetNoopHook): Promise<AltVM.ResGetNoopHook> {
-    const { noop_hook } = await this.query.postDispatch.NoopHook({
-      id: req.hookAddress,
-    });
-    assert(noop_hook, `found no noop hook for id ${req.hookAddress}`);
-
-    return {
-      address: noop_hook.id,
-    };
-  }
-
   // ### QUERY WARP ###
 
   async getToken(req: AltVM.ReqGetToken): Promise<AltVM.ResGetToken> {
@@ -340,20 +233,7 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
     });
     assert(token, `found no token for id ${req.tokenAddress}`);
 
-    let token_type: AltVM.TokenType;
-
-    switch (token.token_type) {
-      case warpTypes.HypTokenType.HYP_TOKEN_TYPE_COLLATERAL:
-        token_type = AltVM.TokenType.collateral;
-        break;
-      case warpTypes.HypTokenType.HYP_TOKEN_TYPE_SYNTHETIC:
-        token_type = AltVM.TokenType.synthetic;
-        break;
-      default:
-        throw new Error(
-          `Failed to determine token type for address ${req.tokenAddress}`,
-        );
-    }
+    const token_type = await getWarpTokenType(this.query, req.tokenAddress);
 
     return {
       address: token.id,
@@ -415,356 +295,6 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
     return {
       denom: gas_payment[0].denom,
       amount: BigInt(gas_payment[0].amount),
-    };
-  }
-
-  // ### GET CORE TXS ###
-
-  async getCreateMailboxTransaction(
-    req: AltVM.ReqCreateMailbox,
-  ): Promise<MsgCreateMailboxEncodeObject> {
-    assert(
-      req.defaultIsmAddress,
-      `defaultIsmAddress required in Cosmos Native`,
-    );
-
-    return {
-      typeUrl: R.MsgCreateMailbox.proto.type,
-      value: R.MsgCreateMailbox.proto.converter.create({
-        local_domain: req.domainId,
-        owner: req.signer,
-        default_ism: req.defaultIsmAddress,
-      }),
-    };
-  }
-
-  async getSetDefaultIsmTransaction(
-    req: AltVM.ReqSetDefaultIsm,
-  ): Promise<MsgSetMailboxEncodeObject> {
-    return {
-      typeUrl: R.MsgSetMailbox.proto.type,
-      value: R.MsgSetMailbox.proto.converter.create({
-        mailbox_id: req.mailboxAddress,
-        default_ism: req.ismAddress,
-        owner: req.signer,
-      }),
-    };
-  }
-
-  async getSetDefaultHookTransaction(
-    req: AltVM.ReqSetDefaultHook,
-  ): Promise<MsgSetMailboxEncodeObject> {
-    return {
-      typeUrl: R.MsgSetMailbox.proto.type,
-      value: R.MsgSetMailbox.proto.converter.create({
-        mailbox_id: req.mailboxAddress,
-        default_hook: req.hookAddress,
-        owner: req.signer,
-      }),
-    };
-  }
-
-  async getSetRequiredHookTransaction(
-    req: AltVM.ReqSetRequiredHook,
-  ): Promise<MsgSetMailboxEncodeObject> {
-    return {
-      typeUrl: R.MsgSetMailbox.proto.type,
-      value: R.MsgSetMailbox.proto.converter.create({
-        mailbox_id: req.mailboxAddress,
-        required_hook: req.hookAddress,
-        owner: req.signer,
-      }),
-    };
-  }
-
-  async getSetMailboxOwnerTransaction(
-    req: AltVM.ReqSetMailboxOwner,
-  ): Promise<MsgSetMailboxEncodeObject> {
-    return {
-      typeUrl: R.MsgSetMailbox.proto.type,
-      value: R.MsgSetMailbox.proto.converter.create({
-        owner: req.signer,
-        mailbox_id: req.mailboxAddress,
-        new_owner: req.newOwner,
-        renounce_ownership: !req.newOwner,
-      }),
-    };
-  }
-
-  async getCreateMerkleRootMultisigIsmTransaction(
-    req: AltVM.ReqCreateMerkleRootMultisigIsm,
-  ): Promise<MsgCreateMerkleRootMultisigIsmEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateMerkleRootMultisigIsm.proto.type,
-      value: R.MsgCreateMerkleRootMultisigIsm.proto.converter.create({
-        creator: req.signer,
-        validators: req.validators,
-        threshold: req.threshold,
-      }),
-    };
-  }
-
-  async getCreateMessageIdMultisigIsmTransaction(
-    req: AltVM.ReqCreateMessageIdMultisigIsm,
-  ): Promise<MsgCreateMessageIdMultisigIsmEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateMessageIdMultisigIsm.proto.type,
-      value: R.MsgCreateMessageIdMultisigIsm.proto.converter.create({
-        creator: req.signer,
-        validators: req.validators,
-        threshold: req.threshold,
-      }),
-    };
-  }
-
-  async getCreateRoutingIsmTransaction(
-    req: AltVM.ReqCreateRoutingIsm,
-  ): Promise<MsgCreateRoutingIsmEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateRoutingIsm.proto.type,
-      value: R.MsgCreateRoutingIsm.proto.converter.create({
-        creator: req.signer,
-        routes: req.routes.map((r) => ({
-          domain: r.domainId,
-          ism: r.ismAddress,
-        })),
-      }),
-    };
-  }
-
-  async getSetRoutingIsmRouteTransaction(
-    req: AltVM.ReqSetRoutingIsmRoute,
-  ): Promise<MsgSetRoutingIsmDomainEncodeObject> {
-    return {
-      typeUrl: R.MsgSetRoutingIsmDomain.proto.type,
-      value: R.MsgSetRoutingIsmDomain.proto.converter.create({
-        owner: req.signer,
-        ism_id: req.ismAddress,
-        route: {
-          domain: req.route.domainId,
-          ism: req.route.ismAddress,
-        },
-      }),
-    };
-  }
-
-  async getRemoveRoutingIsmRouteTransaction(
-    req: AltVM.ReqRemoveRoutingIsmRoute,
-  ): Promise<MsgRemoveRoutingIsmDomainEncodeObject> {
-    return {
-      typeUrl: R.MsgRemoveRoutingIsmDomain.proto.type,
-      value: R.MsgRemoveRoutingIsmDomain.proto.converter.create({
-        owner: req.signer,
-        ism_id: req.ismAddress,
-        domain: req.domainId,
-      }),
-    };
-  }
-
-  async getSetRoutingIsmOwnerTransaction(
-    req: AltVM.ReqSetRoutingIsmOwner,
-  ): Promise<MsgUpdateRoutingIsmOwnerEncodeObject> {
-    return {
-      typeUrl: R.MsgUpdateRoutingIsmOwner.proto.type,
-      value: R.MsgUpdateRoutingIsmOwner.proto.converter.create({
-        owner: req.signer,
-        ism_id: req.ismAddress,
-        new_owner: req.newOwner,
-        renounce_ownership: !req.newOwner,
-      }),
-    };
-  }
-
-  async getCreateNoopIsmTransaction(
-    req: AltVM.ReqCreateNoopIsm,
-  ): Promise<MsgCreateNoopIsmEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateNoopIsm.proto.type,
-      value: R.MsgCreateNoopIsm.proto.converter.create({
-        creator: req.signer,
-      }),
-    };
-  }
-
-  async getCreateMerkleTreeHookTransaction(
-    req: AltVM.ReqCreateMerkleTreeHook,
-  ): Promise<MsgCreateMerkleTreeHookEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateMerkleTreeHook.proto.type,
-      value: R.MsgCreateMerkleTreeHook.proto.converter.create({
-        owner: req.signer,
-        mailbox_id: req.mailboxAddress,
-      }),
-    };
-  }
-
-  async getCreateInterchainGasPaymasterHookTransaction(
-    req: AltVM.ReqCreateInterchainGasPaymasterHook,
-  ): Promise<MsgCreateIgpEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateIgp.proto.type,
-      value: R.MsgCreateIgp.proto.converter.create({
-        owner: req.signer,
-        denom: req.denom,
-      }),
-    };
-  }
-
-  async getSetInterchainGasPaymasterHookOwnerTransaction(
-    req: AltVM.ReqSetInterchainGasPaymasterHookOwner,
-  ): Promise<MsgSetIgpOwnerEncodeObject> {
-    return {
-      typeUrl: R.MsgSetIgpOwner.proto.type,
-      value: R.MsgSetIgpOwner.proto.converter.create({
-        owner: req.signer,
-        igp_id: req.hookAddress,
-        new_owner: req.newOwner,
-        renounce_ownership: !req.newOwner,
-      }),
-    };
-  }
-
-  async getSetDestinationGasConfigTransaction(
-    req: AltVM.ReqSetDestinationGasConfig,
-  ): Promise<MsgSetDestinationGasConfigEncodeObject> {
-    return {
-      typeUrl: R.MsgSetDestinationGasConfig.proto.type,
-      value: R.MsgSetDestinationGasConfig.proto.converter.create({
-        owner: req.signer,
-        igp_id: req.hookAddress,
-        destination_gas_config: {
-          remote_domain: req.destinationGasConfig.remoteDomainId,
-          gas_overhead: req.destinationGasConfig.gasOverhead,
-          gas_oracle: {
-            token_exchange_rate:
-              req.destinationGasConfig.gasOracle.tokenExchangeRate,
-            gas_price: req.destinationGasConfig.gasOracle.gasPrice,
-          },
-        },
-      }),
-    };
-  }
-
-  async getRemoveDestinationGasConfigTransaction(
-    _req: AltVM.ReqRemoveDestinationGasConfig,
-  ): Promise<EncodeObject> {
-    throw new Error(
-      `RemoveDestinationGasConfig is currently not supported on Cosmos Native`,
-    );
-  }
-
-  async getCreateNoopHookTransaction(
-    req: AltVM.ReqCreateNoopHook,
-  ): Promise<MsgCreateNoopHookEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateNoopHook.proto.type,
-      value: R.MsgCreateNoopHook.proto.converter.create({
-        owner: req.signer,
-      }),
-    };
-  }
-
-  async getCreateValidatorAnnounceTransaction(
-    _req: AltVM.ReqCreateValidatorAnnounce,
-  ): Promise<EncodeObject> {
-    throw new Error(
-      'Cosmos Native does not support populateCreateValidatorAnnounce',
-    );
-  }
-
-  // ### GET WARP TXS ###
-
-  async getCreateNativeTokenTransaction(
-    _req: AltVM.ReqCreateNativeToken,
-  ): Promise<EncodeObject> {
-    throw new Error(`Native Token is not supported on Cosmos Native`);
-  }
-
-  async getCreateCollateralTokenTransaction(
-    req: AltVM.ReqCreateCollateralToken,
-  ): Promise<MsgCreateCollateralTokenEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateCollateralToken.proto.type,
-      value: R.MsgCreateCollateralToken.proto.converter.create({
-        owner: req.signer,
-        origin_mailbox: req.mailboxAddress,
-        origin_denom: req.collateralDenom,
-      }),
-    };
-  }
-
-  async getCreateSyntheticTokenTransaction(
-    req: AltVM.ReqCreateSyntheticToken,
-  ): Promise<MsgCreateSyntheticTokenEncodeObject> {
-    return {
-      typeUrl: R.MsgCreateSyntheticToken.proto.type,
-      value: R.MsgCreateSyntheticToken.proto.converter.create({
-        owner: req.signer,
-        origin_mailbox: req.mailboxAddress,
-      }),
-    };
-  }
-
-  async getSetTokenOwnerTransaction(
-    req: AltVM.ReqSetTokenOwner,
-  ): Promise<MsgSetTokenEncodeObject> {
-    return {
-      typeUrl: R.MsgSetToken.proto.type,
-      value: R.MsgSetToken.proto.converter.create({
-        owner: req.signer,
-        token_id: req.tokenAddress,
-        new_owner: req.newOwner,
-        renounce_ownership: !req.newOwner,
-      }),
-    };
-  }
-
-  async getSetTokenIsmTransaction(
-    req: AltVM.ReqSetTokenIsm,
-  ): Promise<MsgSetTokenEncodeObject> {
-    return {
-      typeUrl: R.MsgSetToken.proto.type,
-      value: R.MsgSetToken.proto.converter.create({
-        owner: req.signer,
-        token_id: req.tokenAddress,
-        ism_id: req.ismAddress,
-      }),
-    };
-  }
-
-  async getSetTokenHookTransaction(
-    _req: AltVM.ReqSetTokenHook,
-  ): Promise<MsgSetTokenEncodeObject> {
-    throw new Error(`SetTokenHook is currently not supported on Cosmos Native`);
-  }
-
-  async getEnrollRemoteRouterTransaction(
-    req: AltVM.ReqEnrollRemoteRouter,
-  ): Promise<MsgEnrollRemoteRouterEncodeObject> {
-    return {
-      typeUrl: R.MsgEnrollRemoteRouter.proto.type,
-      value: R.MsgEnrollRemoteRouter.proto.converter.create({
-        owner: req.signer,
-        token_id: req.tokenAddress,
-        remote_router: {
-          receiver_domain: req.remoteRouter.receiverDomainId,
-          receiver_contract: req.remoteRouter.receiverAddress,
-          gas: req.remoteRouter.gas,
-        },
-      }),
-    };
-  }
-
-  async getUnenrollRemoteRouterTransaction(
-    req: AltVM.ReqUnenrollRemoteRouter,
-  ): Promise<MsgUnrollRemoteRouterEncodeObject> {
-    return {
-      typeUrl: R.MsgUnrollRemoteRouter.proto.type,
-      value: R.MsgUnrollRemoteRouter.proto.converter.create({
-        owner: req.signer,
-        token_id: req.tokenAddress,
-        receiver_domain: req.receiverDomainId,
-      }),
     };
   }
 

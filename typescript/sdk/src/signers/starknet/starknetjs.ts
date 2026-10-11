@@ -3,21 +3,20 @@ import { Account as StarknetAccount } from 'starknet';
 
 import { ProtocolType, assert } from '@hyperlane-xyz/utils';
 
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
+import { SendTransactionOptions } from '../../providers/MultiProvider.js';
 import { StarknetJsTransaction } from '../../providers/ProviderType.js';
 import { ChainName } from '../../types.js';
 import { IMultiProtocolSigner } from '../types.js';
 
-export class StarknetMultiProtocolSignerAdapter
-  implements IMultiProtocolSigner<ProtocolType.Starknet>
-{
+export class StarknetMultiProtocolSignerAdapter implements IMultiProtocolSigner<ProtocolType.Starknet> {
   private readonly signer: StarknetAccount;
 
   constructor(
     private readonly chainName: ChainName,
     privateKey: string,
     address: string,
-    multiProtocolProvider: MultiProtocolProvider,
+    multiProtocolProvider: MultiProviderAdapter,
   ) {
     const provider = multiProtocolProvider.getStarknetProvider(this.chainName);
 
@@ -30,14 +29,21 @@ export class StarknetMultiProtocolSignerAdapter
       'Starknet private key must be a hex string',
     );
 
-    this.signer = new StarknetAccount(provider, address, privateKey);
+    this.signer = new StarknetAccount({
+      provider,
+      address,
+      signer: privateKey,
+    });
   }
 
   async address(): Promise<string> {
     return this.signer.address;
   }
 
-  async sendAndConfirmTransaction(tx: StarknetJsTransaction): Promise<string> {
+  async sendAndConfirmTransaction(
+    tx: StarknetJsTransaction,
+    _options?: SendTransactionOptions,
+  ): Promise<string> {
     const { entrypoint, calldata, contractAddress } = tx.transaction;
     assert(entrypoint, 'entrypoint is required for starknet transactions');
 

@@ -1,6 +1,6 @@
 image:
-  repository: gcr.io/abacus-labs-dev/hyperlane-agent
-  pullPolicy: Always
+  repository: ghcr.io/hyperlane-xyz/hyperlane-agent
+  pullPolicy: IfNotPresent
   tag: 'latest'
 
 imagePullSecrets: []
@@ -101,6 +101,15 @@ hyperlane:
   relayer:
     enabled: false
     aws: # true | false
+    # relayApi controls only the containerPort declaration so Kubernetes knows
+    # about the port. The actual HYP_RELAYAPIENABLED / HYP_RELAYAPIPORT env vars
+    # flow through envConfig (set by the infra TS helpers). Direct Helm users
+    # must also populate envConfig with relay API fields to enable the feature.
+    relayApi:
+      enabled: false
+      port: 8900
+      tunnel:
+        image: cloudflare/cloudflared:2026.8.2
     podAnnotations:
       prometheus.io/port: '9090'
       prometheus.io/scrape: 'true'
@@ -149,6 +158,19 @@ hyperlane:
         memory: 256Mi
     config:
       chainsToScrape: ''
+
+  scraperProxy:
+    enabled: false
+    maxAgentClients: 100
+    port: 8383
+    replicas: 1
+    tunnel:
+      enabled: true
+      image: cloudflare/cloudflared:2026.8.2
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
 
   kathy:
     enabled: false

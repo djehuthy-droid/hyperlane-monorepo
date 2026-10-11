@@ -2,7 +2,13 @@ import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers.js';
 import { expect } from 'chai';
 import hre from 'hardhat';
 
-import { ERC20Test, ERC20Test__factory } from '@hyperlane-xyz/core';
+import {
+  ERC20Test,
+  ERC20Test__factory,
+  LinearFee__factory,
+  OffchainQuotedLinearFee__factory,
+  ProgressiveFee__factory,
+} from '@hyperlane-xyz/core';
 import { addressToBytes32, randomInt } from '@hyperlane-xyz/utils';
 
 import { TestChainName } from '../consts/testChains.js';
@@ -11,18 +17,38 @@ import { MultiProvider } from '../providers/MultiProvider.js';
 import { EvmTokenFeeDeployer } from './EvmTokenFeeDeployer.js';
 import { BPS, HALF_AMOUNT, MAX_FEE } from './EvmTokenFeeReader.hardhat-test.js';
 import {
-  LinearFeeConfig,
-  ProgressiveFeeConfig,
-  RegressiveFeeConfig,
+  DEFAULT_ROUTER_KEY,
+  LinearFeeInputConfig,
+  ProgressiveFeeInputConfig,
+  RegressiveFeeInputConfig,
+  CrossCollateralRoutingFeeConfigSchema,
   RoutingFeeConfigSchema,
   TokenFeeConfigSchema,
   TokenFeeType,
 } from './types.js';
-import { convertToBps } from './utils.js';
+import { BPS_PRECISION, convertToBps } from './utils.js';
 
 type DistributiveOmit<T, K extends keyof T> = T extends any
   ? Omit<T, K>
   : never;
+
+async function expectError(
+  promise: Promise<unknown>,
+  expectedMessage: string,
+): Promise<void> {
+  let thrown: unknown;
+  try {
+    await promise;
+  } catch (error) {
+    thrown = error;
+  }
+
+  expect(thrown).to.be.instanceOf(Error);
+  if (thrown instanceof Error) {
+    expect(thrown.message).to.equal(expectedMessage);
+  }
+}
+
 describe('EvmTokenFeeDeployer', () => {
   let multiProvider: MultiProvider;
   let deployer: EvmTokenFeeDeployer;
@@ -32,8 +58,10 @@ describe('EvmTokenFeeDeployer', () => {
   type TestCase = {
     title: string;
     config: DistributiveOmit<
-      LinearFeeConfig | ProgressiveFeeConfig | RegressiveFeeConfig,
-      'owner' | 'token' // Omit owner and token because they are created after the beforeEach
+      | LinearFeeInputConfig
+      | ProgressiveFeeInputConfig
+      | RegressiveFeeInputConfig,
+      'owner' // Omit owner because it is created after the beforeEach
     >;
   };
 
@@ -104,10 +132,11 @@ describe('EvmTokenFeeDeployer', () => {
   });
 
   it('should deploy RoutingFee with correct parameters', async () => {
-    const config = TokenFeeConfigSchema.parse({
+    const config = RoutingFeeConfigSchema.parse({
       type: TokenFeeType.RoutingFee,
       owner: signer.address,
       token: token.address,
+      feeContracts: {},
     });
 
     const deployedContracts = await deployer.deploy({
@@ -140,23 +169,53 @@ describe('EvmTokenFeeDeployer', () => {
     await routingFeeContract.setFeeContract(1, linearFeeContract.address);
 
     const amount = randomInt(1, 10000000000000);
-    const quote = await routingFeeContract.quoteTransferRemote(
-      1,
-      addressToBytes32(signer.address),
-      amount,
-    );
+    const quote = await routingFeeContract[
+      'quoteTransferRemote(uint32,bytes32,uint256)'
+    ](1, addressToBytes32(signer.address), amount);
 
     expect(quote.length).to.equal(1);
-    expect(quote[0].amount).to.be.equal((BigInt(amount) * BPS) / 10_000n);
+    expect(quote[0].amount).to.be.equal(
+      (BigInt(amount) * BigInt(BPS)) / BPS_PRECISION,
+    );
     expect(quote[0].token).to.equal(token.address);
 
     // If no fee contract is set, the quote should be zero
-    const quote2 = await routingFeeContract.quoteTransferRemote(
-      122222,
-      addressToBytes32(signer.address),
-      MAX_FEE,
-    );
+    const quote2 = await routingFeeContract[
+      'quoteTransferRemote(uint32,bytes32,uint256)'
+    ](122222, addressToBytes32(signer.address), MAX_FEE);
     expect(quote2.length).to.equal(0);
+  });
+
+  it('should reject a nested routing fee before deploying its parent', async () => {
+    const transactionCount = await signer.getTransactionCount();
+    const config = RoutingFeeConfigSchema.parse({
+      type: TokenFeeType.RoutingFee,
+      owner: signer.address,
+      token: token.address,
+      feeContracts: {
+        [TestChainName.test1]: {
+          type: TokenFeeType.RoutingFee,
+          owner: signer.address,
+          token: token.address,
+          feeContracts: {
+            [TestChainName.test2]: {
+              type: TokenFeeType.LinearFee,
+              owner: signer.address,
+              token: token.address,
+              maxFee: MAX_FEE,
+              halfAmount: HALF_AMOUNT,
+              bps: BPS,
+            },
+          },
+        },
+      },
+    });
+
+    await expectError(
+      deployer.deploy({ [TestChainName.test2]: config }),
+      'Cannot nest RoutingFee inside a routing fee',
+    );
+    expect(await signer.getTransactionCount()).to.equal(transactionCount);
   });
 
   it('should deploy RoutingFee with multiple fee contracts', async () => {
@@ -188,12 +247,69 @@ describe('EvmTokenFeeDeployer', () => {
 
     // Read the actual address of the deployed routing fee contract
     const actualLinearFeeAddress = await routingFeeContract.feeContracts(
-      multiProvider.getChainId(TestChainName.test2),
+      multiProvider.getDomainId(TestChainName.test2),
+    );
+    const linearFeeContract = LinearFee__factory.connect(
+      actualLinearFeeAddress,
+      signer,
     );
 
-    expect(actualLinearFeeAddress).to.equal(
-      deployedContracts[TestChainName.test2][TokenFeeType.LinearFee].address,
+    expect(actualLinearFeeAddress).to.not.equal(
+      hre.ethers.constants.AddressZero,
     );
+    expect(await linearFeeContract.owner()).to.equal(config.owner);
+    expect(await linearFeeContract.token()).to.equal(config.token);
+  });
+
+  it('should deploy RoutingFee with multiple sub-fees of the same type as unique contracts', async () => {
+    // Regression test: caching caused all sub-fees of the same type to share one
+    // address. After the first one's transferOwnership succeeded, subsequent ones
+    // would hit the cache and fail with UNPREDICTABLE_GAS_LIMIT because the
+    // deployer was no longer the owner of the cached contract.
+    const [, otherSigner] = await hre.ethers.getSigners();
+    const config = RoutingFeeConfigSchema.parse({
+      type: TokenFeeType.RoutingFee,
+      owner: otherSigner.address,
+      token: token.address,
+      feeContracts: {
+        [TestChainName.test1]: {
+          type: TokenFeeType.LinearFee,
+          token: token.address,
+          owner: otherSigner.address,
+          maxFee: MAX_FEE,
+          halfAmount: HALF_AMOUNT,
+          bps: BPS,
+        },
+        [TestChainName.test3]: {
+          type: TokenFeeType.LinearFee,
+          token: token.address,
+          owner: otherSigner.address,
+          maxFee: MAX_FEE,
+          halfAmount: HALF_AMOUNT,
+          bps: BPS,
+        },
+      },
+    });
+
+    const deployedContracts = await deployer.deploy({
+      [TestChainName.test2]: config,
+    });
+
+    const routingFeeContract =
+      deployedContracts[TestChainName.test2][TokenFeeType.RoutingFee];
+
+    expect(await routingFeeContract.owner()).to.equal(otherSigner.address);
+
+    const fee1Address = await routingFeeContract.feeContracts(
+      multiProvider.getDomainId(TestChainName.test1),
+    );
+    const fee3Address = await routingFeeContract.feeContracts(
+      multiProvider.getDomainId(TestChainName.test3),
+    );
+
+    expect(fee1Address).to.not.equal(hre.ethers.constants.AddressZero);
+    expect(fee3Address).to.not.equal(hre.ethers.constants.AddressZero);
+    expect(fee1Address).to.not.equal(fee3Address);
   });
 
   it('should deploy RoutingFee with fee contracts when owner differs from signer', async () => {
@@ -221,25 +337,30 @@ describe('EvmTokenFeeDeployer', () => {
 
     const routingFeeContract =
       deployedContracts[TestChainName.test2][TokenFeeType.RoutingFee];
-    const linearFeeContract =
-      deployedContracts[TestChainName.test2][TokenFeeType.LinearFee];
 
     expect(await routingFeeContract.owner()).to.equal(config.owner);
 
     const actualLinearFeeAddress = await routingFeeContract.feeContracts(
-      multiProvider.getChainId(TestChainName.test2),
+      multiProvider.getDomainId(TestChainName.test2),
     );
-    expect(actualLinearFeeAddress).to.equal(linearFeeContract.address);
+    const linearFeeContract = LinearFee__factory.connect(
+      actualLinearFeeAddress,
+      signer,
+    );
+    expect(actualLinearFeeAddress).to.not.equal(
+      hre.ethers.constants.AddressZero,
+    );
     expect(await linearFeeContract.owner()).to.equal(otherSigner.address);
   });
 
   it('should deploy RoutingFee and transfer ownership when owner differs from signer (no fee contracts)', async () => {
     const [, otherSigner] = await hre.ethers.getSigners();
 
-    const config = TokenFeeConfigSchema.parse({
+    const config = RoutingFeeConfigSchema.parse({
       type: TokenFeeType.RoutingFee,
       owner: otherSigner.address,
       token: token.address,
+      feeContracts: {},
     });
 
     const deployedContracts = await deployer.deploy({
@@ -251,5 +372,140 @@ describe('EvmTokenFeeDeployer', () => {
 
     expect(await routingFeeContract.owner()).to.equal(otherSigner.address);
     expect(await routingFeeContract.token()).to.equal(token.address);
+  });
+
+  it('should deploy OffchainQuotedLinearFee with correct parameters', async () => {
+    const [, otherSigner] = await hre.ethers.getSigners();
+    const config = TokenFeeConfigSchema.parse({
+      type: TokenFeeType.OffchainQuotedLinearFee,
+      token: token.address,
+      owner: signer.address,
+      maxFee: MAX_FEE,
+      halfAmount: HALF_AMOUNT,
+      bps: BPS,
+      quoteSigners: [signer.address, otherSigner.address],
+    });
+
+    const deployedContracts = await deployer.deploy({
+      [TestChainName.test2]: config,
+    });
+
+    const contract =
+      deployedContracts[TestChainName.test2][
+        TokenFeeType.OffchainQuotedLinearFee
+      ];
+
+    const offchainFee = OffchainQuotedLinearFee__factory.connect(
+      contract.address,
+      signer,
+    );
+
+    expect(await offchainFee.owner()).to.equal(signer.address);
+    expect(await offchainFee.token()).to.equal(token.address);
+    expect(
+      convertToBps(
+        (await offchainFee.maxFee()).toBigInt(),
+        (await offchainFee.halfAmount()).toBigInt(),
+      ),
+    ).to.equal(BPS);
+
+    const signers = await offchainFee.quoteSigners();
+    expect(signers).to.have.lengthOf(2);
+    expect(signers).to.include(signer.address);
+    expect(signers).to.include(otherSigner.address);
+  });
+
+  it('should deploy CrossCollateralRoutingFee with router-keyed fee contracts', async () => {
+    const routerKey = hre.ethers.utils.hexZeroPad(signer.address, 32);
+    const config = CrossCollateralRoutingFeeConfigSchema.parse({
+      type: TokenFeeType.CrossCollateralRoutingFee,
+      owner: signer.address,
+      feeContracts: {
+        [TestChainName.test2]: {
+          [DEFAULT_ROUTER_KEY]: {
+            type: TokenFeeType.LinearFee,
+            token: token.address,
+            owner: signer.address,
+            maxFee: MAX_FEE,
+            halfAmount: HALF_AMOUNT,
+            bps: BPS,
+          },
+          [routerKey]: {
+            type: TokenFeeType.ProgressiveFee,
+            token: token.address,
+            owner: signer.address,
+            maxFee: MAX_FEE,
+            halfAmount: HALF_AMOUNT,
+          },
+        },
+      },
+    });
+
+    const deployedContracts = await deployer.deploy({
+      [TestChainName.test2]: config,
+    });
+
+    const routingFeeContract =
+      deployedContracts[TestChainName.test2][
+        TokenFeeType.CrossCollateralRoutingFee
+      ];
+    const defaultRouter = await routingFeeContract.DEFAULT_ROUTER();
+    const destinationDomain = multiProvider.getDomainId(TestChainName.test2);
+    const defaultFeeAddress = await routingFeeContract.feeContracts(
+      destinationDomain,
+      defaultRouter,
+    );
+    const routerFeeAddress = await routingFeeContract.feeContracts(
+      destinationDomain,
+      routerKey,
+    );
+    const defaultFeeContract = LinearFee__factory.connect(
+      defaultFeeAddress,
+      signer,
+    );
+    const routerFeeContract = ProgressiveFee__factory.connect(
+      routerFeeAddress,
+      signer,
+    );
+
+    expect(defaultFeeAddress).to.not.equal(hre.ethers.constants.AddressZero);
+    expect(routerFeeAddress).to.not.equal(hre.ethers.constants.AddressZero);
+    expect(await defaultFeeContract.owner()).to.equal(config.owner);
+    expect(await defaultFeeContract.token()).to.equal(token.address);
+    expect(await routerFeeContract.owner()).to.equal(config.owner);
+    expect(await routerFeeContract.token()).to.equal(token.address);
+  });
+
+  it('should reject nested routing before deploying a cross-collateral parent', async () => {
+    const transactionCount = await signer.getTransactionCount();
+    const config = CrossCollateralRoutingFeeConfigSchema.parse({
+      type: TokenFeeType.CrossCollateralRoutingFee,
+      owner: signer.address,
+      feeContracts: {
+        [TestChainName.test1]: {
+          [DEFAULT_ROUTER_KEY]: {
+            type: TokenFeeType.RoutingFee,
+            owner: signer.address,
+            token: token.address,
+            feeContracts: {
+              [TestChainName.test2]: {
+                type: TokenFeeType.LinearFee,
+                owner: signer.address,
+                token: token.address,
+                maxFee: MAX_FEE,
+                halfAmount: HALF_AMOUNT,
+                bps: BPS,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    await expectError(
+      deployer.deploy({ [TestChainName.test2]: config }),
+      'Cannot nest RoutingFee inside a cross-collateral routing fee',
+    );
+    expect(await signer.getTransactionCount()).to.equal(transactionCount);
   });
 });

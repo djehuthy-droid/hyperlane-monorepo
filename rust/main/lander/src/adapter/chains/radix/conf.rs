@@ -42,6 +42,7 @@ mod tests {
         ChainConf {
             domain,
             signer,
+            identity: None,
             submitter: SubmitterType::Lander,
             estimated_block_time: Duration::from_secs(1),
             reorg_period: ReorgPeriod::None,
@@ -50,9 +51,13 @@ mod tests {
             metrics_conf: PrometheusMiddlewareConf {
                 contracts: HashMap::new(),
                 chain: None,
+                rpc_role: Default::default(),
             },
             index: IndexSettings::default(),
+            confirmations: Default::default(),
+            chain_id: Default::default(),
             ignore_reorg_reports: false,
+            native_token: Default::default(),
         }
     }
 
@@ -100,6 +105,7 @@ mod tests {
                 transaction_overrides: TransactionOverrides::default(),
                 op_submission_config: OpSubmissionConfig::default(),
                 consider_null_transaction_receipt: false,
+                fallback_hedge: None,
             }),
         );
 

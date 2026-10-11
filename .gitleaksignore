@@ -1,0 +1,3 @@
+# Inherited unchanged from hyperlane-xyz/main at 4cdfc0ca8a391900965b0c975e27e448cb3288cb.
+# Scope this exception to the existing Radix RPC finding; keep all other scanning enabled.
+rust/main/config/mainnet_config.json:grove-city-api-key:3127

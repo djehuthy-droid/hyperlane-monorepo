@@ -1,10 +1,7 @@
 import { z } from 'zod';
 
-import { ZChainName, ZHash } from '../../metadata/customZodTypes.js';
-import {
-  BigNumberSchema,
-  CallDataSchema,
-} from '../../providers/transactions/types.js';
+import { ZChainName, ZHash, ZUWei } from '../../metadata/customZodTypes.js';
+import { CallDataSchema } from '../../providers/transactions/types.js';
 
 export const AccountConfigSchema = z.object({
   origin: ZChainName,
@@ -12,9 +9,18 @@ export const AccountConfigSchema = z.object({
   localRouter: ZHash.optional(),
   routerOverride: ZHash.optional(),
   ismOverride: ZHash.optional(),
+  userSalt: ZHash.optional(),
 });
 
 export type AccountConfig = z.infer<typeof AccountConfigSchema>;
+
+export const StandardHookMetadataSchema = z.object({
+  msgValue: ZUWei.optional(),
+  gasLimit: ZUWei.optional(),
+  refundAddress: z.string().optional(),
+});
+
+export type StandardHookMetadata = z.infer<typeof StandardHookMetadataSchema>;
 
 /* For InterchainAccount::getCallRemote() */
 export const GetCallRemoteSettingsSchema = z.object({
@@ -22,7 +28,7 @@ export const GetCallRemoteSettingsSchema = z.object({
   destination: ZChainName,
   innerCalls: z.array(CallDataSchema),
   config: AccountConfigSchema,
-  hookMetadata: BigNumberSchema.optional(),
+  hookMetadata: z.union([z.string(), StandardHookMetadataSchema]).optional(),
 });
 /* For InterchainAccount::getCallRemote() */
 

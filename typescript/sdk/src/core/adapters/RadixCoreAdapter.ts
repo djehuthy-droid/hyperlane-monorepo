@@ -8,7 +8,7 @@ import {
 } from '@hyperlane-xyz/utils';
 
 import { BaseRadixAdapter } from '../../app/MultiProtocolApp.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
 import {
   ProviderType,
   TypedTransactionReceipt,
@@ -24,15 +24,15 @@ const MESSAGE_DESTINATION_FIELD_KEY = 'destination';
 export class RadixCoreAdapter extends BaseRadixAdapter implements ICoreAdapter {
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider<any>,
+    public readonly multiProvider: MultiProviderAdapter<any>,
     public readonly addresses: { mailbox: Address },
   ) {
     super(chainName, multiProvider, addresses);
   }
 
-  extractMessageIds(
+  async extractMessageIds(
     sourceTx: TypedTransactionReceipt,
-  ): Array<{ messageId: string; destination: ChainName }> {
+  ): Promise<Array<{ messageId: string; destination: ChainName }>> {
     assert(
       sourceTx.type === ProviderType.Radix,
       `Unsupported provider type for RadixCoreAdapter ${sourceTx.type}`,
@@ -92,5 +92,16 @@ export class RadixCoreAdapter extends BaseRadixAdapter implements ICoreAdapter {
     );
 
     return true;
+  }
+
+  async isDelivered(
+    messageId: HexString,
+    _blockTag?: string | number,
+  ): Promise<boolean> {
+    const provider = this.multiProvider.getRadixProvider(this.chainName);
+    return provider.isMessageDelivered({
+      mailboxAddress: this.addresses.mailbox,
+      messageId: messageId,
+    });
   }
 }

@@ -1,11 +1,8 @@
 import { ProtocolType } from '@hyperlane-xyz/utils';
 
-import {
-  ChainMetadata,
-  ChainTechnicalStack,
-  ExplorerFamily,
-} from '../metadata/chainMetadataTypes.js';
-import { ChainMap, ChainName } from '../types.js';
+import { ExplorerFamily } from '../metadata/chainMetadataTypes.js';
+import type { ChainMetadata } from '../metadata/chainMetadataTypes.js';
+import type { ChainMap, ChainName } from '../types.js';
 
 export enum TestChainName {
   test1 = 'test1',
@@ -97,6 +94,22 @@ export const testXERC20Lockbox: ChainMetadata = {
   domainId: 9913376,
   displayName: 'Test XERC20Lockbox',
   name: 'testxerc20lockbox',
+};
+
+export const testOwnerCollateral: ChainMetadata = {
+  ...test1,
+  chainId: 9913380,
+  domainId: 9913380,
+  displayName: 'Test OwnerCollateral',
+  name: 'testownercollateral',
+};
+
+export const testRebaseCollateral: ChainMetadata = {
+  ...test1,
+  chainId: 9913381,
+  domainId: 9913381,
+  displayName: 'Test RebaseCollateral',
+  name: 'testrebasecollateral',
 };
 
 export const testScale1: ChainMetadata = {
@@ -194,26 +207,34 @@ export const testStarknetChain: ChainMetadata = {
   ],
 };
 
-// Address of a timelock contract on base that can be used for integration tests
-export const KNOWN_BASE_TIMELOCK_CONTRACT =
-  '0x733BC1F0D76AB8f0AB7C1c8044ECc4720Cd402AD';
+// Address of the ENS DAO TimelockController contract on Ethereum mainnet,
+// used for integration tests that exercise the block explorer path.
+// Chosen because Routescan exposes both logs and contract creation data.
+export const KNOWN_ETHEREUM_TIMELOCK_CONTRACT =
+  '0xFe89cc7aBB2C4183683ab71653C4cdc9B02D44b7';
 
-// Base chain metadata for testing with block explorer
-export const baseTestChain: ChainMetadata = {
+// Ethereum mainnet metadata for testing with a live block explorer
+export const ethereumTestChain: ChainMetadata = {
   blockExplorers: [
     {
-      apiUrl: 'https://base.blockscout.com/api',
-      family: ExplorerFamily.Blockscout,
-      name: 'Base Explorer',
-      url: 'https://base.blockscout.com',
+      apiUrl: 'https://api.routescan.io/v2/network/mainnet/evm/1/etherscan/api',
+      family: ExplorerFamily.Routescan,
+      name: 'Ethereum Explorer',
+      url: 'https://routescan.io',
+    },
+    {
+      apiUrl: 'https://api.routescan.io/v2/network/mainnet/evm/1/etherscan',
+      family: ExplorerFamily.Routescan,
+      name: 'Routescan Ethereum Explorer',
+      url: 'https://routescan.io',
     },
   ],
-  blocks: { confirmations: 3, estimateBlockTime: 2, reorgPeriod: 10 },
-  chainId: 8453,
-  displayName: 'Base',
-  domainId: 8453,
+  blocks: { confirmations: 3, estimateBlockTime: 12, reorgPeriod: 14 },
+  chainId: 1,
+  displayName: 'Ethereum',
+  domainId: 1,
   gasCurrencyCoinGeckoId: 'ethereum',
-  name: 'base',
+  name: 'ethereum',
   nativeToken: {
     decimals: 18,
     name: 'Ether',
@@ -221,15 +242,12 @@ export const baseTestChain: ChainMetadata = {
   },
   protocol: ProtocolType.Ethereum,
   rpcUrls: [
-    { http: 'https://base.publicnode.com' },
-    { http: 'https://mainnet.base.org' },
-    { http: 'https://base.blockpi.network/v1/rpc/public' },
-    { http: 'https://base.drpc.org' },
-    { http: 'https://base.llamarpc.com' },
-    { http: 'https://1rpc.io/base' },
-    { http: 'https://base-pokt.nodies.app' },
+    { http: 'https://ethereum-rpc.publicnode.com' },
+    { http: 'https://1rpc.io/eth' },
+    { http: 'https://ethereum.blockpi.network/v1/rpc/public' },
+    { http: 'https://eth.drpc.org' },
+    { http: 'https://gateway.tenderly.co/public/mainnet' },
   ],
-  technicalStack: ChainTechnicalStack.OpStack,
 };
 
 export const multiProtocolTestChainMetadata: ChainMap<ChainMetadata> = {
@@ -243,6 +261,8 @@ export const multiProtocolTestChainMetadata: ChainMap<ChainMetadata> = {
   testscale1: testScale1,
   testscale2: testScale2,
   testcollateralfiat: testCollateralFiat,
+  testownercollateral: testOwnerCollateral,
+  testrebasecollateral: testRebaseCollateral,
 };
 
 export const multiProtocolTestChains: Array<ChainName> = Object.keys(

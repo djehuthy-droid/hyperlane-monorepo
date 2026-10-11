@@ -1,5 +1,5 @@
 import { Mailbox__factory } from '@hyperlane-xyz/core';
-import { Address, rootLogger } from '@hyperlane-xyz/utils';
+import { Address, ProtocolType, rootLogger } from '@hyperlane-xyz/utils';
 
 import { ChainMetadata } from '../metadata/chainMetadataTypes.js';
 
@@ -9,20 +9,27 @@ import {
   CosmJsProvider,
   CosmJsWasmProvider,
   EthersV5Provider,
+  KnownProtocolType,
   ProviderType,
   RadixProvider,
   SolanaWeb3Provider,
   StarknetJsProvider,
 } from './ProviderType.js';
-import { protocolToDefaultProviderBuilder } from './providerBuilders.js';
+import { protocolToDefaultProviderBuilder } from './defaultProviderBuilderMaps.js';
 
 export async function isRpcHealthy(
   metadata: ChainMetadata,
   rpcIndex: number,
 ): Promise<boolean> {
   const rpc = metadata.rpcUrls[rpcIndex];
-  const builder = protocolToDefaultProviderBuilder[metadata.protocol];
-  const provider = builder([rpc], metadata.chainId);
+  if (metadata.protocol === ProtocolType.Unknown) {
+    return false;
+  }
+  const protocol = metadata.protocol as KnownProtocolType;
+  const builder = protocolToDefaultProviderBuilder[protocol];
+  // Build against only the RPC under test so the health check targets the
+  // specific endpoint at `rpcIndex` rather than the metadata's first RPC.
+  const provider = builder({ ...metadata, rpcUrls: [rpc] });
   if (provider.type === ProviderType.EthersV5)
     return isEthersV5ProviderHealthy(provider.provider, metadata);
   else if (provider.type === ProviderType.SolanaWeb3)
@@ -39,6 +46,8 @@ export async function isRpcHealthy(
     return isRadixProviderHealthy(provider.provider, metadata);
   else if (provider.type === ProviderType.Aleo)
     return isAleoProviderHealthy(provider.provider, metadata);
+  else if (provider.type === ProviderType.Tron)
+    return isEthersV5ProviderHealthy(provider.provider, metadata);
   else
     throw new Error(
       `Unsupported provider type ${provider.type}, new health check required`,

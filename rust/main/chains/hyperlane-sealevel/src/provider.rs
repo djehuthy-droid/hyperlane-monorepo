@@ -1,25 +1,29 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serializable_account_meta::{SerializableAccountMeta, SimulationReturnData};
-use solana_client::rpc_client::SerializableTransaction;
 use solana_client::rpc_response::Response;
+use solana_commitment_config::CommitmentConfig;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::account::Account;
-use solana_sdk::commitment_config::CommitmentConfig;
-use solana_sdk::compute_budget::ComputeBudgetInstruction;
+use solana_sdk::hash::Hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::message::Message;
+use solana_sdk::message::v0::Message as MessageV0;
+use solana_sdk::message::AddressLookupTableAccount;
+use solana_sdk::message::{Message, VersionedMessage};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use solana_transaction_status::{
     option_serializer::OptionSerializer, EncodedTransactionWithStatusMeta, UiTransaction,
     UiTransactionStatusMeta,
 };
 use solana_transaction_status::{TransactionStatus, UiReturnDataEncoding};
+use tokio::sync::{OnceCell, RwLock};
 use tracing::warn;
 
 use hyperlane_core::{
@@ -27,17 +31,25 @@ use hyperlane_core::{
     HyperlaneDomain, HyperlaneProvider, HyperlaneProviderError, NativeToken, TxnInfo,
     TxnReceiptInfo, H256, H512, U256,
 };
+use hyperlane_sealevel_interchain_security_module_interface::{
+    InterchainSecurityModuleInstruction, VerifyInstruction, VERIFY_ACCOUNT_METAS_PDA_SEEDS,
+};
 
+use crate::alt::{fetch_alt, NonEmptyAltAddresses};
 use crate::error::HyperlaneSealevelError;
 use crate::fallback::{SealevelFallbackRpcClient, SubmitSealevelRpc};
 use crate::priority_fee::PriorityFeeOracle;
 use crate::provider::recipient::RecipientProvider;
 use crate::provider::transaction::{parsed_message, txn};
+use crate::tx_type::SealevelTxType;
 use crate::utils::{decode_h256, decode_h512, decode_pubkey};
-use crate::{ConnectionConf, SealevelKeypair, TransactionSubmitter};
+use crate::{ConnectionConf, SealevelKeypair, SealevelTransactionFormat, TransactionSubmitter};
 
 mod recipient;
 mod transaction;
+
+type AltAccountCell =
+    Arc<OnceCell<Result<Arc<AddressLookupTableAccount>, Arc<ChainCommunicationError>>>>;
 
 const COMPUTE_UNIT_MULTIPLIER_NUMERATOR: u32 = 11;
 const COMPUTE_UNIT_MULTIPLIER_DENOMINATOR: u32 = 10;
@@ -68,30 +80,38 @@ impl Default for SealevelTxCostEstimate {
 
 /// Methods of provider which are used in submitter
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait SealevelProviderForLander: Send + Sync {
-    /// Creates Sealevel transaction for instruction
-    async fn create_transaction_for_instruction(
+    /// Creates Sealevel transaction for instruction.
+    /// Builds the transaction representation selected by `alt_addresses`.
+    async fn create_transaction_for_instruction<'a>(
         &self,
         compute_unit_limit: u32,
         compute_unit_price_micro_lamports: u64,
         instruction: Instruction,
-        payer: &SealevelKeypair,
+        payer: &'a SealevelKeypair,
         tx_submitter: Arc<dyn TransactionSubmitter>,
         sign: bool,
-    ) -> ChainResult<Transaction>;
+        alt_addresses: &SealevelTransactionFormat,
+        additional_signers: &'a [&'a SealevelKeypair],
+    ) -> ChainResult<SealevelTxType>;
 
-    /// Estimates cost for Sealevel instruction
+    /// Estimates cost for Sealevel instruction.
+    /// Uses the same transaction representation as submission.
     async fn get_estimated_costs_for_instruction(
         &self,
         instruction: Instruction,
         payer: &SealevelKeypair,
         tx_submitter: Arc<dyn TransactionSubmitter>,
         priority_fee_oracle: Arc<dyn PriorityFeeOracle>,
+        alt_addresses: &SealevelTransactionFormat,
     ) -> ChainResult<SealevelTxCostEstimate>;
 
     /// Waits for Sealevel transaction confirmation with processed commitment level
-    async fn wait_for_transaction_confirmation(&self, transaction: &Transaction)
-        -> ChainResult<()>;
+    async fn wait_for_transaction_confirmation(
+        &self,
+        transaction: &SealevelTxType,
+    ) -> ChainResult<()>;
 
     /// Confirm transaction
     async fn confirm_transaction(
@@ -109,27 +129,45 @@ pub trait SealevelProviderForLander: Send + Sync {
 }
 
 /// A wrapper around a Sealevel provider to get generic blockchain information.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SealevelProvider {
     rpc_client: SealevelFallbackRpcClient,
     domain: HyperlaneDomain,
     native_token: NativeToken,
     recipient_provider: RecipientProvider,
+    /// Lazily fetched ALT cache for transaction size reduction.
+    /// Maps ALT address to fetched account data. ALTs are assumed static once fetched.
+    /// Note: Keep the number of different ALTs small to avoid memory bloat.
+    alt_cache: Arc<RwLock<HashMap<Pubkey, AltAccountCell>>>,
+    /// Materialized ALT sets in compile order. This avoids cloning every ALT's
+    /// account-address vector for every simulation and submission.
+    alt_set_cache: Arc<RwLock<HashMap<NonEmptyAltAddresses, Arc<[AddressLookupTableAccount]>>>>,
+}
+
+impl std::fmt::Debug for SealevelProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealevelProvider")
+            .field("domain", &self.domain)
+            .finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
 impl SealevelProviderForLander for SealevelProvider {
-    /// Creates a transaction for a given instruction, compute unit limit, and compute unit price.
+    /// Creates a transaction for a given instruction.
+    /// Builds the transaction representation selected by `alt_addresses`.
     /// If `sign` is true, the transaction will be signed.
-    async fn create_transaction_for_instruction(
+    async fn create_transaction_for_instruction<'a>(
         &self,
         compute_unit_limit: u32,
         compute_unit_price_micro_lamports: u64,
         instruction: Instruction,
-        payer: &SealevelKeypair,
+        payer: &'a SealevelKeypair,
         tx_submitter: Arc<dyn TransactionSubmitter>,
         sign: bool,
-    ) -> ChainResult<Transaction> {
+        alt_addresses: &SealevelTransactionFormat,
+        additional_signers: &'a [&'a SealevelKeypair],
+    ) -> ChainResult<SealevelTxType> {
         let instructions = vec![
             // Set the compute unit limit.
             ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit),
@@ -142,27 +180,76 @@ impl SealevelProviderForLander for SealevelProvider {
             instruction,
         ];
 
-        let tx = if sign {
+        // Get blockhash for signed transactions
+        let recent_blockhash = if sign {
             // Getting the finalized blockhash eliminates the chance the blockhash
             // gets reorged out, causing the tx to be invalid. The tradeoff is this
             // will cause the tx to expire in about 47 seconds (instead of the typical 60).
-            let recent_blockhash = self
-                .rpc_client()
+            self.rpc_client()
                 .get_latest_blockhash_with_commitment(CommitmentConfig::finalized())
                 .await
-                .map_err(ChainCommunicationError::from_other)?;
-
-            Transaction::new_signed_with_payer(
-                &instructions,
-                Some(&payer.pubkey()),
-                &[payer.keypair()],
-                recent_blockhash,
-            )
+                .map_err(ChainCommunicationError::from_other)?
         } else {
-            Transaction::new_unsigned(Message::new(&instructions, Some(&payer.pubkey())))
+            Hash::default()
         };
 
-        Ok(tx)
+        match alt_addresses {
+            SealevelTransactionFormat::V0 { alt_addresses } => {
+                // Lazily fetch any ALTs not already cached, preserving config order so
+                // account indexes stay deterministic across runs.
+                let alt_accounts = self.get_or_fetch_alts(alt_addresses).await?;
+
+                let message = MessageV0::try_compile(
+                    &payer.pubkey(),
+                    &instructions,
+                    alt_accounts.as_ref(),
+                    recent_blockhash,
+                )
+                .map_err(ChainCommunicationError::from_other)?;
+
+                let versioned_tx = if sign {
+                    // Build signer list after all awaits to avoid Send issues with &dyn Signer.
+                    let all_signers: Vec<&dyn Signer> =
+                        std::iter::once(payer.keypair() as &dyn Signer)
+                            .chain(
+                                additional_signers
+                                    .iter()
+                                    .map(|k| k.keypair() as &dyn Signer),
+                            )
+                            .collect();
+                    VersionedTransaction::try_new(VersionedMessage::V0(message), &all_signers)
+                        .map_err(ChainCommunicationError::from_other)?
+                } else {
+                    let num_required_signatures = message.header.num_required_signatures as usize;
+                    VersionedTransaction {
+                        signatures: vec![Signature::default(); num_required_signatures],
+                        message: VersionedMessage::V0(message),
+                    }
+                };
+
+                Ok(SealevelTxType::Versioned(versioned_tx))
+            }
+            SealevelTransactionFormat::Legacy => {
+                // No ALT - use pure legacy Transaction (NOT wrapped in VersionedTransaction)
+                let message = Message::new(&instructions, Some(&payer.pubkey()));
+                let legacy_tx = if sign {
+                    // Build signer list after all awaits to avoid Send issues with &dyn Signer.
+                    let all_signers: Vec<&dyn Signer> =
+                        std::iter::once(payer.keypair() as &dyn Signer)
+                            .chain(
+                                additional_signers
+                                    .iter()
+                                    .map(|k| k.keypair() as &dyn Signer),
+                            )
+                            .collect();
+                    Transaction::new(&all_signers, message, recent_blockhash)
+                } else {
+                    Transaction::new_unsigned(message)
+                };
+
+                Ok(SealevelTxType::Legacy(legacy_tx))
+            }
+        }
     }
 
     /// Gets the estimated costs for a given instruction.
@@ -174,6 +261,7 @@ impl SealevelProviderForLander for SealevelProvider {
         payer: &SealevelKeypair,
         tx_submitter: Arc<dyn TransactionSubmitter>,
         priority_fee_oracle: Arc<dyn PriorityFeeOracle>,
+        alt_addresses: &SealevelTransactionFormat,
     ) -> ChainResult<SealevelTxCostEstimate> {
         // Build a transaction that sets the max compute units and a dummy compute unit price.
         // This is used for simulation to get the actual compute unit limit. We set dummy values
@@ -187,17 +275,26 @@ impl SealevelProviderForLander for SealevelProvider {
                 payer,
                 tx_submitter,
                 false,
+                alt_addresses,
+                &[],
             )
             .await?;
 
         let simulation_result = self
             .rpc_client()
-            .simulate_transaction(&simulation_tx)
+            .simulate_sealevel_tx(&simulation_tx)
             .await?;
 
         // If there was an error in the simulation result, return an error.
         if simulation_result.err.is_some() {
-            tracing::error!(?simulation_result, "Got simulation result for transaction");
+            // Log base58-encoded transaction for debugging/replay
+            let tx_bytes = bincode::serialize(&simulation_tx).unwrap_or_default();
+            let tx_base58 = solana_sdk::bs58::encode(&tx_bytes).into_string();
+            tracing::error!(
+                ?simulation_result,
+                tx_base58,
+                "Simulation failed - transaction for replay"
+            );
             return Err(ChainCommunicationError::from_other_str(
                 format!("Error in simulation result: {:?}", simulation_result.err).as_str(),
             ));
@@ -261,19 +358,15 @@ impl SealevelProviderForLander for SealevelProvider {
     /// decoupled from the sending of a transaction.
     async fn wait_for_transaction_confirmation(
         &self,
-        transaction: &Transaction,
+        transaction: &SealevelTxType,
     ) -> ChainResult<()> {
-        let signature = transaction.get_signature();
+        let signature = transaction.signature().ok_or_else(|| {
+            ChainCommunicationError::from_other_str("No signature in transaction")
+        })?;
 
         const GET_STATUS_RETRIES: usize = usize::MAX;
 
-        let recent_blockhash = if transaction.uses_durable_nonce() {
-            self.rpc_client()
-                .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
-                .await?
-        } else {
-            *transaction.get_recent_blockhash()
-        };
+        let recent_blockhash = transaction.blockhash();
 
         for status_retry in 0..GET_STATUS_RETRIES {
             let signature_statuses: Response<Vec<Option<TransactionStatus>>> = self
@@ -331,7 +424,7 @@ impl SealevelProviderForLander for SealevelProvider {
 }
 
 impl SealevelProvider {
-    /// constructor
+    /// Constructor.
     pub fn new(
         rpc_client: SealevelFallbackRpcClient,
         domain: HyperlaneDomain,
@@ -345,7 +438,87 @@ impl SealevelProvider {
             domain,
             native_token,
             recipient_provider,
+            alt_cache: Arc::new(RwLock::new(HashMap::new())),
+            alt_set_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Lazily fetches each ALT from the chain if not already cached.
+    ///
+    /// Order is preserved: `MessageV0::try_compile` assigns account indexes by ALT
+    /// position, so a stable order keeps compiled transactions deterministic.
+    async fn get_or_fetch_alts(
+        &self,
+        alt_addresses: &NonEmptyAltAddresses,
+    ) -> ChainResult<Arc<[AddressLookupTableAccount]>> {
+        {
+            let cache = self.alt_set_cache.read().await;
+            if let Some(alt_accounts) = cache.get(alt_addresses) {
+                return Ok(Arc::clone(alt_accounts));
+            }
+        }
+
+        let mut alt_accounts = Vec::with_capacity(alt_addresses.as_slice().len());
+        for alt_address in alt_addresses.as_slice() {
+            let alt_account = self.get_or_fetch_alt(*alt_address).await?;
+            alt_accounts.push((*alt_account).clone());
+        }
+        let alt_accounts: Arc<[AddressLookupTableAccount]> = alt_accounts.into();
+
+        let mut cache = self.alt_set_cache.write().await;
+        let cached = cache
+            .entry(alt_addresses.clone())
+            .or_insert_with(|| Arc::clone(&alt_accounts));
+        Ok(Arc::clone(cached))
+    }
+
+    /// Lazily fetches an ALT from the chain if not already cached.
+    /// Returns the cached or newly fetched ALT account.
+    async fn get_or_fetch_alt(
+        &self,
+        alt_address: Pubkey,
+    ) -> ChainResult<Arc<AddressLookupTableAccount>> {
+        let cached = self.alt_cache.read().await.get(&alt_address).cloned();
+        let cell = match cached {
+            Some(cell) => cell,
+            None => self
+                .alt_cache
+                .write()
+                .await
+                .entry(alt_address)
+                .or_default()
+                .clone(),
+        };
+        // Store the whole result so current waiters share failures too, rather
+        // than retrying one at a time as get_or_try_init would. Cancellation
+        // still lets another waiter take over the unfinished initialization.
+        let result = cell
+            .get_or_init(|| async {
+                let account = Arc::new(
+                    fetch_alt(&self.rpc_client, alt_address)
+                        .await
+                        .map_err(Arc::new)?,
+                );
+                tracing::info!(
+                    domain = %self.domain,
+                    alt_address = %alt_address,
+                    num_accounts = account.addresses.len(),
+                    "Fetched and cached ALT"
+                );
+                Ok(account)
+            })
+            .await;
+        if result.is_err() {
+            let mut cache = self.alt_cache.write().await;
+            // A delayed waiter must not evict a newer retry's cell.
+            if cache
+                .get(&alt_address)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
+            {
+                cache.remove(&alt_address);
+            }
+        }
+        result.clone().map_err(ChainCommunicationError::from_other)
     }
 
     /// Get an rpc client
@@ -413,13 +586,21 @@ impl SealevelProvider {
     }
 
     /// Builds a transaction with estimated costs for a given instruction.
+    /// Returns `SealevelTxType::Versioned` with ALTs if `alt_addresses` is non-empty,
+    /// or `SealevelTxType::Legacy` otherwise.
+    ///
+    /// `additional_signers` are extra keypairs that must co-sign the transaction (e.g. the
+    /// identity keypair when a TrustedRelayer ISM is in use). Pass an empty slice when not
+    /// needed.
     pub async fn build_estimated_tx_for_instruction(
         &self,
         instruction: Instruction,
         payer: &SealevelKeypair,
         tx_submitter: Arc<dyn TransactionSubmitter>,
         priority_fee_oracle: Arc<dyn PriorityFeeOracle>,
-    ) -> ChainResult<Transaction> {
+        alt_addresses: SealevelTransactionFormat,
+        additional_signers: &[&SealevelKeypair],
+    ) -> ChainResult<SealevelTxType> {
         // Get the estimated costs for the instruction.
         let SealevelTxCostEstimate {
             compute_units,
@@ -430,6 +611,7 @@ impl SealevelProvider {
                 payer,
                 tx_submitter.clone(),
                 priority_fee_oracle,
+                &alt_addresses,
             )
             .await?;
 
@@ -439,23 +621,74 @@ impl SealevelProvider {
             "Got compute units and compute unit price / priority fee for transaction"
         );
 
-        // Build the final transaction with the correct compute unit limit and price.
-        let tx = self
+        if additional_signers.is_empty() {
+            // Fast path: single signer — reuse the existing signing path.
+            let tx = self
+                .create_transaction_for_instruction(
+                    compute_units,
+                    compute_unit_price_micro_lamports,
+                    instruction,
+                    payer,
+                    tx_submitter,
+                    true,
+                    &alt_addresses,
+                    &[],
+                )
+                .await?;
+            return Ok(tx);
+        }
+
+        // Multi-signer path: build unsigned, then sign with all keypairs.
+        let unsigned_tx = self
             .create_transaction_for_instruction(
                 compute_units,
                 compute_unit_price_micro_lamports,
                 instruction,
                 payer,
                 tx_submitter,
-                true,
+                false,
+                &alt_addresses,
+                &[],
             )
             .await?;
 
-        Ok(tx)
+        let recent_blockhash = self
+            .rpc_client()
+            .get_latest_blockhash_with_commitment(CommitmentConfig::finalized())
+            .await
+            .map_err(ChainCommunicationError::from_other)?;
+
+        let all_signers: Vec<&dyn Signer> = std::iter::once(payer.keypair() as &dyn Signer)
+            .chain(
+                additional_signers
+                    .iter()
+                    .map(|k| k.keypair() as &dyn Signer),
+            )
+            .collect();
+
+        let signed_tx = match unsigned_tx {
+            SealevelTxType::Legacy(mut tx) => {
+                tx.sign(&all_signers, recent_blockhash);
+                SealevelTxType::Legacy(tx)
+            }
+            SealevelTxType::Versioned(vtx) => {
+                // Rebuild with the real blockhash then sign with all keypairs.
+                let mut message = vtx.message;
+                match &mut message {
+                    VersionedMessage::V0(msg) => msg.recent_blockhash = recent_blockhash,
+                    VersionedMessage::Legacy(msg) => msg.recent_blockhash = recent_blockhash,
+                }
+                let signed = VersionedTransaction::try_new(message, &all_signers)
+                    .map_err(ChainCommunicationError::from_other)?;
+                SealevelTxType::Versioned(signed)
+            }
+        };
+
+        Ok(signed_tx)
     }
 
     async fn block_info_by_height(&self, slot: u64) -> Result<BlockInfo, ChainCommunicationError> {
-        let confirmed_block = self.rpc_client.get_block(slot).await?;
+        let confirmed_block = self.rpc_client.get_block_info(slot).await?;
 
         let block_hash = decode_h256(&confirmed_block.blockhash)?;
 
@@ -496,6 +729,53 @@ impl SealevelProvider {
         Ok(account_metas)
     }
 
+    /// Runs a fixpoint loop over `VerifyAccountMetas` on `ism` until the returned
+    /// account set converges, then returns it.  Callers are responsible for any
+    /// post-processing (e.g. signer-stripping via `sanitize_dynamic_accounts`).
+    pub async fn get_ism_verify_account_metas(
+        &self,
+        payer: &Pubkey,
+        ism: Pubkey,
+        metadata: Vec<u8>,
+        message: Vec<u8>,
+    ) -> ChainResult<Vec<AccountMeta>> {
+        let (vam_pda, _) = Pubkey::find_program_address(VERIFY_ACCOUNT_METAS_PDA_SEEDS, &ism);
+
+        const MAX_VAM_ITERATIONS: usize = 10;
+        let mut accounts = vec![AccountMeta::new(vam_pda, false)];
+
+        let instruction_data =
+            InterchainSecurityModuleInstruction::VerifyAccountMetas(VerifyInstruction {
+                metadata,
+                message,
+            })
+            .encode()
+            .map_err(ChainCommunicationError::from_other)?;
+
+        for _ in 0..MAX_VAM_ITERATIONS {
+            let ix = Instruction::new_with_bytes(ism, &instruction_data, accounts.clone());
+            let result: Vec<AccountMeta> = self
+                .simulate_instruction::<SimulationReturnData<Vec<SerializableAccountMeta>>>(
+                    payer, ix,
+                )
+                .await?
+                .map(|s| s.return_data.into_iter().map(|m| m.into()).collect())
+                .unwrap_or_default();
+
+            // Converged when the full AccountMeta list (pubkeys AND flags) stabilises.
+            // Key-only comparison would miss is_writable/is_signer flips: the
+            // last iteration's flags would silently take effect.
+            if result == accounts {
+                return Ok(result);
+            }
+            accounts = result;
+        }
+
+        Err(ChainCommunicationError::from_other_str(
+            "ISM verify account metas did not converge within MAX_VAM_ITERATIONS iterations",
+        ))
+    }
+
     /// Simulates an instruction, and attempts to deserialize it into a T.
     /// If no return data at all was returned, returns Ok(None).
     /// If some return data was returned but deserialization was unsuccessful,
@@ -505,17 +785,14 @@ impl SealevelProvider {
         pubkey: &Pubkey,
         instruction: Instruction,
     ) -> ChainResult<Option<T>> {
-        let commitment = CommitmentConfig::finalized();
-        let recent_blockhash = self
-            .rpc_client()
-            .get_latest_blockhash_with_commitment(commitment)
-            .await?;
-        let transaction = Transaction::new_unsigned(Message::new_with_blockhash(
-            &[instruction],
-            Some(pubkey),
-            &recent_blockhash,
-        ));
+        // Simulation already sets replace_recent_blockhash=true and disables
+        // signature verification, so fetching a blockhash adds an unused RPC.
+        let transaction = Transaction::new_unsigned(Message::new(&[instruction], Some(pubkey)));
         let simulation = self.rpc_client().simulate_transaction(&transaction).await?;
+
+        if let Some(err) = simulation.err {
+            return Err(ChainCommunicationError::from_other(err));
+        }
 
         if let Some(return_data) = simulation.return_data {
             let bytes = match return_data.data.1 {
@@ -568,6 +845,10 @@ impl HyperlaneProvider for SealevelProvider {
         Ok(block_info)
     }
 
+    fn is_block_unavailable(&self, error: &ChainCommunicationError) -> bool {
+        crate::error::is_get_block_unresolvable_after_retries(error)
+    }
+
     /// TODO This method is superfluous for Solana.
     /// Since we have to request full block to find transaction hash and transaction index
     /// for Solana, we have all the data about transaction mach earlier before this
@@ -575,7 +856,9 @@ impl HyperlaneProvider for SealevelProvider {
     /// We can refactor abstractions so that our chain-agnostic code is more suitable
     /// for all chains, not only Ethereum-like chains.
     async fn get_txn_by_hash(&self, hash: &H512) -> ChainResult<TxnInfo> {
-        let signature = Signature::new(hash.as_bytes());
+        let signature = Signature::try_from(hash.as_bytes()).map_err(|e| {
+            ChainCommunicationError::from_other_str(&format!("Invalid signature: {e}"))
+        })?;
 
         let txn_confirmed = self.rpc_client.get_transaction(signature).await?;
         let txn_with_meta = &txn_confirmed.transaction;
@@ -627,11 +910,407 @@ impl HyperlaneProvider for SealevelProvider {
 
     async fn get_chain_metrics(&self) -> ChainResult<Option<ChainInfo>> {
         let slot = self.rpc_client.get_slot_raw().await?;
-        let latest_block = self.block_info_by_height(slot).await?;
         let chain_info = ChainInfo {
-            latest_block,
+            block_height: slot,
             min_gas_price: None,
         };
         Ok(Some(chain_info))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use hyperlane_core::{rpc_clients::FallbackProvider, KnownHyperlaneDomain};
+    use serde_json::{json, Value};
+    use solana_client::{
+        client_error::Result as ClientResult,
+        nonblocking::rpc_client::RpcClient,
+        rpc_client::RpcClientConfig,
+        rpc_request::RpcRequest,
+        rpc_sender::{RpcSender, RpcTransportStats},
+    };
+
+    use super::*;
+    use crate::client::SealevelRpcClient;
+
+    #[derive(Clone, Default)]
+    struct RecordingRpcSender {
+        calls: Arc<Mutex<Vec<(RpcRequest, Value)>>>,
+        slot: u64,
+        accounts: Arc<Mutex<HashMap<Pubkey, Vec<u8>>>>,
+        simulation_accounts: Vec<AccountMeta>,
+        account_gate: Option<Arc<tokio::sync::Notify>>,
+        fail_accounts: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl RpcSender for RecordingRpcSender {
+        async fn send(&self, request: RpcRequest, params: Value) -> ClientResult<Value> {
+            self.calls
+                .lock()
+                .expect("recording sender mutex should not be poisoned")
+                .push((request, params.clone()));
+            // Ensure concurrent callers overlap while a fetch is in flight.
+            tokio::task::yield_now().await;
+            let response = match &request {
+                RpcRequest::GetSlot => json!(self.slot),
+                RpcRequest::GetVersion => json!({"solana-core": "3.0.0", "feature-set": 1}),
+                RpcRequest::GetAccountInfo => {
+                    if let Some(gate) = &self.account_gate {
+                        gate.notified().await;
+                    }
+                    if self.fail_accounts.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(std::io::Error::other("ALT RPC unavailable").into());
+                    }
+                    let key: Pubkey = params[0]
+                        .as_str()
+                        .expect("test fixture should be valid")
+                        .parse()
+                        .expect("test fixture should be valid");
+                    let accounts = self.accounts.lock().expect("test fixture should be valid");
+                    let data = accounts.get(&key).expect("fixture account must exist");
+                    json!({"context": {"slot": self.slot}, "value": {
+                        "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"],
+                        "owner": solana_sdk_ids::address_lookup_table::id().to_string(),
+                        "lamports": 1, "executable": false, "rentEpoch": 0,
+                        "space": data.len(),
+                    }})
+                }
+                RpcRequest::SimulateTransaction => {
+                    let bytes = borsh::to_vec(&SimulationReturnData::new(
+                        self.simulation_accounts
+                            .iter()
+                            .cloned()
+                            .map(SerializableAccountMeta::from)
+                            .collect::<Vec<_>>(),
+                    ))
+                    .expect("test fixture should be valid");
+                    json!({"context": {"slot": self.slot}, "value": {
+                        "err": null, "logs": [], "unitsConsumed": 1,
+                        "returnData": {
+                            "programId": Pubkey::default().to_string(),
+                            "data": [base64::engine::general_purpose::STANDARD.encode(bytes), "base64"],
+                        },
+                    }})
+                }
+                _ => {
+                    return Err(
+                        std::io::Error::other(format!("unexpected RPC: {request:?}")).into(),
+                    )
+                }
+            };
+            Ok(response)
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "recording://sealevel-provider-test".to_owned()
+        }
+    }
+
+    fn recording_provider(sender: RecordingRpcSender) -> SealevelProvider {
+        let rpc_client = RpcClient::new_sender(
+            sender,
+            RpcClientConfig::with_commitment(CommitmentConfig::processed()),
+        );
+        let client = SealevelRpcClient::from_rpc_client(Arc::new(rpc_client));
+        let fallback_provider = FallbackProvider::new(vec![client]);
+        SealevelProvider {
+            rpc_client: SealevelFallbackRpcClient::new(fallback_provider),
+            domain: HyperlaneDomain::Known(KnownHyperlaneDomain::SolanaMainnet),
+            native_token: NativeToken::default(),
+            recipient_provider: RecipientProvider::new(&[]),
+            alt_cache: Arc::new(RwLock::new(HashMap::new())),
+            alt_set_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn alt_fixture(addresses: Vec<Pubkey>) -> Vec<u8> {
+        solana_address_lookup_table_interface::state::AddressLookupTable {
+            meta: solana_address_lookup_table_interface::state::LookupTableMeta::default(),
+            addresses: std::borrow::Cow::Owned(addresses),
+        }
+        .serialize_for_tests()
+        .expect("test fixture should be valid")
+    }
+
+    #[tokio::test]
+    async fn concurrent_alt_bundles_share_fetches_and_preserve_order() {
+        let core = Pubkey::new_unique();
+        let route = Pubkey::new_unique();
+        let core_accounts = vec![Pubkey::new_unique()];
+        let route_accounts = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+        let sender = RecordingRpcSender::default();
+        sender
+            .accounts
+            .lock()
+            .expect("test fixture should be valid")
+            .extend([
+                (core, alt_fixture(core_accounts.clone())),
+                (route, alt_fixture(route_accounts.clone())),
+            ]);
+        let provider = recording_provider(sender.clone());
+        let forward = NonEmptyAltAddresses::try_from(vec![core, route])
+            .expect("test fixture should be valid");
+        let reverse = NonEmptyAltAddresses::try_from(vec![route, core])
+            .expect("test fixture should be valid");
+        let (a, b, c) = tokio::try_join!(
+            provider.get_or_fetch_alts(&forward),
+            provider.get_or_fetch_alts(&reverse),
+            provider.get_or_fetch_alts(&forward),
+        )
+        .expect("test fixture should be valid");
+        assert_eq!(
+            a.iter().map(|a| a.key).collect::<Vec<_>>(),
+            vec![core, route]
+        );
+        assert_eq!(
+            b.iter().map(|a| a.key).collect::<Vec<_>>(),
+            vec![route, core]
+        );
+        assert_eq!(a[0].addresses, core_accounts);
+        assert_eq!(a[1].addresses, route_accounts);
+        assert!(Arc::ptr_eq(&a, &c));
+        assert!(Arc::ptr_eq(
+            &a,
+            &provider
+                .get_or_fetch_alts(&forward)
+                .await
+                .expect("test fixture should be valid")
+        ));
+        let calls = sender.calls.lock().expect("test fixture should be valid");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(r, _)| *r == RpcRequest::GetAccountInfo)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_alt_failures_share_one_attempt_and_later_calls_retry() {
+        for rpc_failure in [false, true] {
+            let key = Pubkey::new_unique();
+            let sender = RecordingRpcSender::default();
+            sender
+                .fail_accounts
+                .store(rpc_failure, std::sync::atomic::Ordering::SeqCst);
+            sender
+                .accounts
+                .lock()
+                .expect("fixture lock")
+                .insert(key, vec![]);
+            let provider = recording_provider(sender.clone());
+            let (a, b, c) = tokio::join!(
+                provider.get_or_fetch_alt(key),
+                provider.get_or_fetch_alt(key),
+                provider.get_or_fetch_alt(key),
+            );
+            let errors = [a, b, c].map(|r| r.expect_err("all waiters must fail").to_string());
+            assert_eq!(errors[0], errors[1]);
+            assert_eq!(errors[1], errors[2]);
+            // The fallback client retries transport errors four times per
+            // fetch_alt attempt. Decode failures happen after its one RPC.
+            let expected_calls = if rpc_failure { 4 } else { 1 };
+            assert_eq!(
+                sender
+                    .calls
+                    .lock()
+                    .expect("fixture lock")
+                    .iter()
+                    .filter(|(r, _)| *r == RpcRequest::GetAccountInfo)
+                    .count(),
+                expected_calls
+            );
+            assert!(provider.alt_cache.read().await.get(&key).is_none());
+            sender
+                .fail_accounts
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            sender
+                .accounts
+                .lock()
+                .expect("fixture lock")
+                .insert(key, alt_fixture(vec![]));
+            assert_eq!(
+                provider
+                    .get_or_fetch_alt(key)
+                    .await
+                    .expect("later batch should retry")
+                    .key,
+                key
+            );
+            assert_eq!(
+                sender
+                    .calls
+                    .lock()
+                    .expect("fixture lock")
+                    .iter()
+                    .filter(|(r, _)| *r == RpcRequest::GetAccountInfo)
+                    .count(),
+                if rpc_failure { 5 } else { 2 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_alt_decode_can_be_retried() {
+        let key = Pubkey::new_unique();
+        let sender = RecordingRpcSender::default();
+        sender
+            .accounts
+            .lock()
+            .expect("test fixture should be valid")
+            .insert(key, vec![]);
+        let provider = recording_provider(sender.clone());
+        assert!(provider.get_or_fetch_alt(key).await.is_err());
+        let expected = vec![Pubkey::new_unique()];
+        sender
+            .accounts
+            .lock()
+            .expect("test fixture should be valid")
+            .insert(key, alt_fixture(expected.clone()));
+        assert_eq!(
+            provider
+                .get_or_fetch_alt(key)
+                .await
+                .expect("test fixture should be valid")
+                .addresses,
+            expected
+        );
+        assert_eq!(
+            sender
+                .calls
+                .lock()
+                .expect("test fixture should be valid")
+                .iter()
+                .filter(|(r, _)| *r == RpcRequest::GetAccountInfo)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_alt_fetch_can_be_retried() {
+        let key = Pubkey::new_unique();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let sender = RecordingRpcSender {
+            account_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        sender
+            .accounts
+            .lock()
+            .expect("test fixture should be valid")
+            .insert(key, alt_fixture(vec![]));
+        let provider = recording_provider(sender.clone());
+        let initial_provider = provider.clone();
+        let initial = tokio::spawn(async move { initial_provider.get_or_fetch_alt(key).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sender
+                .calls
+                .lock()
+                .expect("test fixture should be valid")
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test fixture should be valid");
+        initial.abort();
+        assert!(initial
+            .await
+            .expect_err("cancelled task should fail")
+            .is_cancelled());
+        gate.notify_one();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            provider.get_or_fetch_alt(key),
+        )
+        .await
+        .expect("test fixture should be valid")
+        .expect("test fixture should be valid");
+        assert_eq!(result.key, key);
+    }
+
+    #[tokio::test]
+    async fn vam_simulations_reuse_instruction_data_without_fetching_blockhashes() {
+        let payer = Pubkey::new_unique();
+        let ism = Pubkey::new_unique();
+        let (vam, _) = Pubkey::find_program_address(VERIFY_ACCOUNT_METAS_PDA_SEEDS, &ism);
+        // Same key, different writable flag: convergence must compare flags too.
+        let expected = vec![AccountMeta::new_readonly(vam, false)];
+        let sender = RecordingRpcSender {
+            simulation_accounts: expected.clone(),
+            ..Default::default()
+        };
+        let provider = recording_provider(sender.clone());
+        let metadata = vec![1, 2, 3];
+        let message = vec![4, 5, 6];
+        let encoded = InterchainSecurityModuleInstruction::VerifyAccountMetas(VerifyInstruction {
+            metadata: metadata.clone(),
+            message: message.clone(),
+        })
+        .encode()
+        .expect("test fixture should be valid");
+        assert_eq!(
+            provider
+                .get_ism_verify_account_metas(&payer, ism, metadata, message)
+                .await
+                .expect("test fixture should be valid"),
+            expected
+        );
+        let calls = sender.calls.lock().expect("test fixture should be valid");
+        assert!(!calls
+            .iter()
+            .any(|(r, _)| *r == RpcRequest::GetLatestBlockhash));
+        let simulations = calls
+            .iter()
+            .filter(|(r, _)| *r == RpcRequest::SimulateTransaction)
+            .map(|(_, p)| p)
+            .collect::<Vec<_>>();
+        assert_eq!(simulations.len(), 2);
+        for params in simulations {
+            assert_eq!(params[1]["replaceRecentBlockhash"], true);
+            assert_eq!(params[1]["sigVerify"], false);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(params[0].as_str().expect("test fixture should be valid"))
+                .expect("test fixture should be valid");
+            let tx: Transaction =
+                bincode::deserialize(&bytes).expect("test fixture should be valid");
+            assert_eq!(tx.message.recent_blockhash, Hash::default());
+            assert_eq!(tx.message.instructions[0].data, encoded);
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_metrics_only_fetch_finalized_slot() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingRpcSender {
+            calls: calls.clone(),
+            slot: 42,
+            ..Default::default()
+        };
+        let provider = recording_provider(sender);
+
+        let chain_info = provider
+            .get_chain_metrics()
+            .await
+            .expect("chain metrics request should succeed")
+            .expect("Sealevel should expose chain metrics");
+
+        assert_eq!(chain_info.block_height, 42);
+        assert_eq!(
+            *calls
+                .lock()
+                .expect("recording sender mutex should not be poisoned"),
+            vec![(RpcRequest::GetSlot, json!([CommitmentConfig::finalized()]),)]
+        );
     }
 }

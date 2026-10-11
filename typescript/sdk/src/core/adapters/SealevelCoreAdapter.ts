@@ -21,7 +21,7 @@ import {
   SealevelMailboxTransferOwnershipInstruction,
   SealevelMailboxTransferOwnershipInstructionSchema,
 } from '../../mailbox/serialization.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
 import {
   ProviderType,
   TypedTransactionReceipt,
@@ -40,15 +40,15 @@ export class SealevelCoreAdapter
 {
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { mailbox: Address },
   ) {
     super(chainName, multiProvider, addresses);
   }
 
-  extractMessageIds(
+  async extractMessageIds(
     sourceTx: TypedTransactionReceipt,
-  ): Array<{ messageId: HexString; destination: ChainName }> {
+  ): Promise<Array<{ messageId: HexString; destination: ChainName }>> {
     if (sourceTx.type !== ProviderType.SolanaWeb3) {
       throw new Error(
         `Unsupported provider type for SealevelCoreAdapter ${sourceTx.type}`,
@@ -89,6 +89,20 @@ export class SealevelCoreAdapter
     );
 
     return true;
+  }
+
+  async isDelivered(
+    messageId: HexString,
+    _blockTag?: string | number,
+  ): Promise<boolean> {
+    const pda = SealevelCoreAdapter.deriveMailboxMessageProcessedPda(
+      this.addresses.mailbox,
+      messageId,
+    );
+    const connection = this.multiProvider.getSolanaWeb3Provider(this.chainName);
+    // If the PDA exists, then the message has been processed
+    const accountInfo = await connection.getAccountInfo(pda);
+    return (accountInfo?.data?.length ?? 0) > 0;
   }
 
   static parseMessageDispatchLogs(
@@ -181,6 +195,29 @@ export class SealevelCoreAdapter
    * Instruction builders for Mailbox operations
    * Should match https://github.com/hyperlane-xyz/hyperlane-monorepo/blob/main/rust/sealevel/programs/mailbox/src/instruction.rs
    */
+
+  /**
+   * Claims all lamports above the chain's current rent-exempt minimum from the
+   * outbox, including accrued protocol fees and excess rent deposits.
+   * The mailbox enforces that beneficiary matches its configured beneficiary.
+   */
+  createClaimProtocolFeesInstruction(
+    beneficiary: PublicKey,
+  ): TransactionInstruction {
+    const mailboxProgramId = new PublicKey(this.addresses.mailbox);
+    return new TransactionInstruction({
+      programId: mailboxProgramId,
+      keys: [
+        {
+          pubkey: SealevelCoreAdapter.deriveMailboxOutboxPda(mailboxProgramId),
+          isSigner: false,
+          isWritable: true,
+        },
+        { pubkey: beneficiary, isSigner: false, isWritable: true },
+      ],
+      data: Buffer.from([SealevelMailboxInstructionType.CLAIM_PROTOCOL_FEES]),
+    });
+  }
 
   /**
    * Create a SetDefaultIsm instruction

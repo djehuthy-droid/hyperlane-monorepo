@@ -140,8 +140,7 @@ impl Default for RetryConfig {
 impl RetryConfig {
     /// Calculate delay for a given retry attempt.
     pub fn delay_for_attempt(&self, attempt: u32) -> u64 {
-        let delay = (self.initial_backoff_ms as f64)
-            * self.backoff_multiplier.powi(attempt as i32);
+        let delay = (self.initial_backoff_ms as f64) * self.backoff_multiplier.powi(attempt as i32);
         (delay as u64).min(self.max_backoff_ms)
     }
 }

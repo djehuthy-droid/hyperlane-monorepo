@@ -9,6 +9,7 @@ use solana_program::{
     pubkey,
     pubkey::Pubkey,
 };
+use solana_system_interface::program as system_program;
 
 use ecdsa_signature::EcdsaSignature;
 use hyperlane_core::{Encode, HyperlaneMessage, ModuleType, H160, H256};
@@ -21,7 +22,6 @@ use hyperlane_sealevel_multisig_ism_message_id::{
     domain_data_pda_seeds,
     error::Error as MultisigIsmError,
     instruction::{Domained, Instruction as MultisigIsmProgramInstruction, ValidatorsAndThreshold},
-    metadata::MultisigIsmMessageIdMetadata,
     processor::process_instruction,
 };
 use hyperlane_test_utils::assert_transaction_error;
@@ -30,6 +30,7 @@ use multisig_ism::interface::{
 };
 #[cfg(test)]
 use multisig_ism::test_data::{get_multisig_ism_test_data, MultisigIsmTestData};
+use multisig_ism::MultisigIsmMessageIdMetadata;
 use serializable_account_meta::{SerializableAccountMeta, SimulationReturnData};
 use solana_program_test::*;
 use solana_sdk::{
@@ -53,7 +54,7 @@ async fn new_funded_keypair(
     let keypair = Keypair::new();
     let recent_blockhash = banks_client.get_latest_blockhash().await.unwrap();
     let transaction = Transaction::new_signed_with_payer(
-        &[solana_sdk::system_instruction::transfer(
+        &[solana_system_interface::instruction::transfer(
             &payer.pubkey(),
             &keypair.pubkey(),
             lamports,
@@ -82,7 +83,7 @@ async fn initialize(
             vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
                 AccountMeta::new(access_control_pda_key, false),
-                AccountMeta::new_readonly(solana_program::system_program::id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
             ],
         )],
         Some(&payer.pubkey()),
@@ -119,7 +120,7 @@ async fn set_validators_and_threshold(
                 AccountMeta::new_readonly(payer.pubkey(), true),
                 AccountMeta::new_readonly(access_control_pda_key, false),
                 AccountMeta::new(domain_data_pda_key, false),
-                AccountMeta::new_readonly(solana_program::system_program::id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
             ],
         )],
         Some(&payer.pubkey()),
@@ -524,4 +525,41 @@ async fn test_ism_type() {
         .unwrap()
         .return_data;
     assert_eq!(type_u32, ModuleType::MessageIdMultisig as u32);
+}
+
+#[tokio::test]
+async fn test_get_program_version() {
+    let program_id = multisig_ism_message_id_id();
+    let (banks_client, payer, recent_blockhash) = ProgramTest::new(
+        "hyperlane_sealevel_ism_multisig_ism",
+        program_id,
+        processor!(process_instruction),
+    )
+    .start()
+    .await;
+
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &package_versioned::get_program_version_instruction_data(),
+        vec![],
+    );
+
+    let simulation = banks_client
+        .simulate_transaction(Transaction::new_unsigned(Message::new_with_blockhash(
+            &[ix],
+            Some(&payer.pubkey()),
+            &recent_blockhash,
+        )))
+        .await
+        .unwrap();
+
+    assert!(simulation.result.unwrap().is_ok());
+    let return_data = simulation
+        .simulation_details
+        .unwrap()
+        .return_data
+        .expect("no return data");
+    let result = SimulationReturnData::<String>::try_from_slice(&return_data.data)
+        .expect("failed to deserialize");
+    assert_eq!(result.return_data, package_versioned::PACKAGE_VERSION);
 }

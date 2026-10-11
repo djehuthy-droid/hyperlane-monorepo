@@ -4,6 +4,7 @@ import path from 'path';
 
 import {
   ChainMap,
+  ChainStatus,
   GasPriceConfig,
   MultiProtocolProvider,
   getCosmosChainGasPrice,
@@ -18,7 +19,7 @@ import { supportedChainNames as mainnet3SupportedChainNames } from '../config/en
 import { getRegistry as getTestnet4Registry } from '../config/environments/testnet4/chains.js';
 import testnet4GasPrices from '../config/environments/testnet4/gasPrices.json' with { type: 'json' };
 import { supportedChainNames as testnet4SupportedChainNames } from '../config/environments/testnet4/supportedChainNames.js';
-import { DeployEnvironment } from '../src/config/environment.js';
+import { DeployEnvironment } from '../src/config/deploy-environment.js';
 import {
   getSafeNumericValue,
   updatePriceIfNeeded,
@@ -74,6 +75,13 @@ async function main() {
           const currentGasPrice = gasPrices[
             chain as keyof typeof gasPrices
           ] as GasPriceConfig;
+
+          if (
+            chainMetadata[chain]?.availability?.status === ChainStatus.Disabled
+          ) {
+            return [chain, currentGasPrice ?? createDefaultGasPrice(chain)];
+          }
+
           const newGasPrice = await getGasPrice(mpp, chain, currentGasPrice);
 
           const currentAmount = getGasPriceAmount(currentGasPrice);
@@ -116,6 +124,7 @@ async function getGasPrice(
 ): Promise<GasPriceConfig> {
   const protocolType = mpp.getProtocol(chain);
   switch (protocolType) {
+    case ProtocolType.Tron:
     case ProtocolType.Ethereum: {
       const provider = mpp.getProvider(chain);
       const gasPrice = await (provider.provider as Provider).getGasPrice();

@@ -2,7 +2,7 @@
 
 use access_control::AccessControl;
 use account_utils::{verify_rent_exempt, SizedData};
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
 use hyperlane_core::{
     accumulator::incremental::IncrementalMerkle as MerkleTree, Decode, Encode, HyperlaneMessage,
     H256,
@@ -17,9 +17,9 @@ use solana_program::{
     program::{get_return_data, invoke, invoke_signed, set_return_data},
     program_error::ProgramError,
     pubkey::Pubkey,
-    system_instruction,
     sysvar::{clock::Clock, rent::Rent, Sysvar},
 };
+use solana_system_interface::{instruction as system_instruction, program as system_program};
 
 use account_utils::{create_pda_account, verify_account_uninitialized};
 use hyperlane_sealevel_interchain_security_module_interface::{
@@ -46,12 +46,21 @@ use crate::{
 #[cfg(not(feature = "no-entrypoint"))]
 entrypoint!(process_instruction);
 
+/// Marker type for PackageVersioned trait implementation.
+pub struct MailboxProgram;
+impl package_versioned::PackageVersioned for MailboxProgram {}
+
 /// Entrypoint for the Mailbox program.
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    // Universal version query — discriminator-based, independent of instruction enum.
+    if package_versioned::is_get_program_version(instruction_data) {
+        return package_versioned::process_get_program_version::<MailboxProgram>();
+    }
+
     match MailboxIxn::from_instruction_data(instruction_data)? {
         MailboxIxn::Init(init) => initialize(program_id, accounts, init),
         MailboxIxn::InboxProcess(process) => inbox_process(program_id, accounts, process),
@@ -92,7 +101,7 @@ fn initialize(program_id: &Pubkey, accounts: &[AccountInfo], init: Init) -> Prog
 
     // Account 0: The system program.
     let system_program_info = next_account_info(accounts_iter)?;
-    if system_program_info.key != &solana_program::system_program::id() {
+    if system_program_info.key != &system_program::ID {
         return Err(ProgramError::InvalidArgument);
     }
 
@@ -209,7 +218,7 @@ fn inbox_process(
 
     // Account 1: The system program.
     let system_program_info = next_account_info(accounts_iter)?;
-    if system_program_info.key != &solana_program::system_program::id() {
+    if system_program_info.key != &system_program::ID {
         return Err(ProgramError::InvalidArgument);
     }
 
@@ -253,7 +262,7 @@ fn inbox_process(
         return Err(Error::MessageAlreadyProcessed.into());
     }
 
-    let spl_noop_id = spl_noop::id();
+    let spl_noop_id = account_utils::SPL_NOOP_PROGRAM_ID;
 
     // Accounts 5..N: the accounts required for getting the ISM the recipient wants to use.
     let mut get_ism_infos = vec![];
@@ -350,6 +359,22 @@ fn inbox_process(
         });
     }
 
+    // Derive a per-ISM process-authority PDA so that ISMs that require the
+    // Mailbox to co-sign (e.g. RateLimited) receive a proper signer account.
+    // Including the ISM program ID in the seeds binds this authority to the
+    // specific ISM being called, preventing a malicious recipient-selected ISM
+    // from forwarding the signer to a victim ISM via a nested CPI.
+    let (process_authority_key, process_authority_bump) =
+        Pubkey::find_program_address(&[b"process_authority", ism.as_ref()], program_id);
+
+    // If the ISM requested its process-authority PDA, mark it as a signer in
+    // the CPI so that invoke_signed can grant signing authority.
+    for meta in &mut ism_verify_account_metas {
+        if meta.pubkey == process_authority_key {
+            meta.is_signer = true;
+        }
+    }
+
     // Call into the ISM to verify the message.
     let verify_instruction = InterchainSecurityModuleInstruction::Verify(VerifyInstruction {
         metadata: process.metadata,
@@ -357,7 +382,15 @@ fn inbox_process(
     });
     let verify =
         Instruction::new_with_bytes(ism, &verify_instruction.encode()?, ism_verify_account_metas);
-    invoke(&verify, &ism_verify_infos)?;
+    invoke_signed(
+        &verify,
+        &ism_verify_infos,
+        &[&[
+            b"process_authority",
+            ism.as_ref(),
+            &[process_authority_bump],
+        ]],
+    )?;
 
     // Mark the message as delivered by creating the processed message account.
     let processed_message_account_data = ProcessedMessageAccount::from(ProcessedMessage::new(
@@ -382,10 +415,10 @@ fn inbox_process(
     inbox.processed_count += 1;
     InboxAccount::from(inbox)
         .store_in_slice(&mut inbox_data_refmut)
-        .map_err(|e| ProgramError::BorshIoError(e.to_string()))?;
+        .map_err(|_| ProgramError::BorshIoError)?;
 
     // Now call into the recipient program with the verified message!
-    let handle_intruction = Instruction::new_with_bytes(
+    let handle_instruction = Instruction::new_with_bytes(
         recipient_program_id,
         &MessageRecipientInstruction::Handle(HandleInstruction::new(
             message.origin,
@@ -396,7 +429,7 @@ fn inbox_process(
         recipient_account_metas,
     );
     invoke_signed(
-        &handle_intruction,
+        &handle_instruction,
         &recipient_infos,
         &[mailbox_process_authority_pda_seeds!(
             &recipient_program_id,
@@ -407,7 +440,7 @@ fn inbox_process(
     #[cfg(not(feature = "no-spl-noop"))]
     {
         let noop_cpi_log = Instruction {
-            program_id: spl_noop::id(),
+            program_id: account_utils::SPL_NOOP_PROGRAM_ID,
             accounts: vec![],
             data: format!("Hyperlane inbox: {:?}", message_id).into_bytes(),
         };
@@ -422,11 +455,11 @@ fn inbox_process(
 /// Gets the ISM to use for a recipient program and sets it as return data.
 ///
 /// Accounts:
-/// 0.    `[]` - The Inbox PDA.
-/// 1.    `[]` - The recipient program.
-/// 2..N. [??] - The accounts required to make the CPI into the recipient program.
-///             These can be retrieved from the recipient using the
-///             `MessageRecipientInstruction::InterchainSecurityModuleAccountMetas` instruction.
+/// - 0: `[]` - The Inbox PDA.
+/// - 1: `[]` - The recipient program.
+/// - 2..N: `[??]` - The accounts required to make the CPI into the recipient program.
+///   These can be retrieved from the recipient using the
+///   `MessageRecipientInstruction::InterchainSecurityModuleAccountMetas` instruction.
 fn inbox_get_recipient_ism(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -460,9 +493,7 @@ fn inbox_get_recipient_ism(
 
     // Return the borsh serialized ISM pubkey.
     set_return_data(
-        &SimulationReturnData::new(ism)
-            .try_to_vec()
-            .map_err(|err| ProgramError::BorshIoError(err.to_string()))?[..],
+        &borsh::to_vec(&SimulationReturnData::new(ism)).map_err(|_| ProgramError::BorshIoError)?[..],
     );
 
     Ok(())
@@ -499,7 +530,7 @@ fn get_recipient_ism(
             // If they returned an encoded Option::<Pubkey>::None, then use
             // the default ISM.
             Option::<Pubkey>::try_from_slice(&returned_data[..])
-                .map_err(|err| ProgramError::BorshIoError(err.to_string()))?
+                .map_err(|_| ProgramError::BorshIoError)?
                 .unwrap_or(default_ism)
         }
     } else {
@@ -600,13 +631,13 @@ fn outbox_dispatch(
 
     // Account 2: System program.
     let system_program_info = next_account_info(accounts_iter)?;
-    if system_program_info.key != &solana_program::system_program::id() {
+    if system_program_info.key != &system_program::ID {
         return Err(ProgramError::InvalidArgument);
     }
 
     // Account 3: SPL Noop program.
     let spl_noop_info = next_account_info(accounts_iter)?;
-    if spl_noop_info.key != &spl_noop::id() {
+    if spl_noop_info.key != &account_utils::SPL_NOOP_PROGRAM_ID {
         return Err(ProgramError::InvalidArgument);
     }
 
@@ -750,9 +781,8 @@ fn outbox_get_count(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRes
     // may end with zero byte(s), which are incorrectly truncated as
     // simulated transaction return data.
     // See `SimulationReturnData` for details.
-    let bytes = SimulationReturnData::new(count.to_le_bytes())
-        .try_to_vec()
-        .map_err(|err| ProgramError::BorshIoError(err.to_string()))?;
+    let bytes = borsh::to_vec(&SimulationReturnData::new(count.to_le_bytes()))
+        .map_err(|_| ProgramError::BorshIoError)?;
     set_return_data(&bytes[..]);
     Ok(())
 }
@@ -779,16 +809,15 @@ fn outbox_get_latest_checkpoint(program_id: &Pubkey, accounts: &[AccountInfo]) -
         .expect("Too many messages in outbox tree");
 
     let mut ret_buf = [0; 36];
-    ret_buf[0..31].copy_from_slice(root.as_ref());
+    ret_buf[0..32].copy_from_slice(root.as_ref());
     ret_buf[32..].copy_from_slice(&count.to_le_bytes());
 
     // Wrap it in the SimulationReturnData because serialized ret_buf
     // may end with zero byte(s), which are incorrectly truncated as
     // simulated transaction return data.
     // See `SimulationReturnData` for details.
-    let bytes = SimulationReturnData::new(ret_buf.to_vec())
-        .try_to_vec()
-        .map_err(|err| ProgramError::BorshIoError(err.to_string()))?;
+    let bytes = borsh::to_vec(&SimulationReturnData::new(ret_buf.to_vec()))
+        .map_err(|_| ProgramError::BorshIoError)?;
     set_return_data(&bytes[..]);
     Ok(())
 }
@@ -814,9 +843,8 @@ fn outbox_get_root(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResu
     // may end with zero byte(s), which are incorrectly truncated as
     // simulated transaction return data.
     // See `SimulationReturnData` for details.
-    let bytes = SimulationReturnData::new(root)
-        .try_to_vec()
-        .map_err(|err| ProgramError::BorshIoError(err.to_string()))?;
+    let bytes =
+        borsh::to_vec(&SimulationReturnData::new(root)).map_err(|_| ProgramError::BorshIoError)?;
     set_return_data(&bytes[..]);
     Ok(())
 }
@@ -836,9 +864,8 @@ fn get_owner(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // may end with zero byte(s), which are incorrectly truncated as
     // simulated transaction return data.
     // See `SimulationReturnData` for details.
-    let bytes = SimulationReturnData::new(outbox.owner)
-        .try_to_vec()
-        .map_err(|err| ProgramError::BorshIoError(err.to_string()))?;
+    let bytes = borsh::to_vec(&SimulationReturnData::new(outbox.owner))
+        .map_err(|_| ProgramError::BorshIoError)?;
     set_return_data(&bytes[..]);
     Ok(())
 }

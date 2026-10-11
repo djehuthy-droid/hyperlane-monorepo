@@ -4,6 +4,43 @@
  */
 import { z } from 'zod';
 
+/**
+ * Creates a forward-compatible Zod schema for enums that normalizes unknown values.
+ *
+ * When registry is updated with new enum values, older SDK versions will parse
+ * the unknown value as the specified `unknownValue` instead of failing entirely.
+ *
+ * This enables:
+ * - Old SDK + New Registry: Works - unknown values become `Unknown` variant
+ * - New SDK + Old Registry: Works - known values parse normally
+ * - TypeScript exhaustiveness checking forces explicit handling of unknown cases
+ *
+ * @param enumObj - The enum or const object to validate against
+ * @param unknownValue - The value to use for unknown/new enum variants
+ * @returns A Zod schema that accepts any string but normalizes unknown values
+ *
+ * @example
+ * ```ts
+ * const zProtocolType = forwardCompatibleEnum(ProtocolType, ProtocolType.Unknown);
+ * zProtocolType.parse('ethereum'); // => ProtocolType.Ethereum
+ * zProtocolType.parse('newprotocol'); // => ProtocolType.Unknown
+ * ```
+ */
+export function forwardCompatibleEnum<T extends Record<string, string>>(
+  enumObj: T,
+  unknownValue: T[keyof T],
+) {
+  const validValues = new Set(Object.values(enumObj));
+  const isEnumValue = (value: string): value is T[keyof T] =>
+    validValues.has(value);
+  return z
+    .enum(enumObj)
+    .or(z.string())
+    .transform((val): T[keyof T] => {
+      return isEnumValue(val) ? val : unknownValue;
+    });
+}
+
 /** Zod uint schema */
 export const ZUint = z.number().int().nonnegative();
 /** Zod NonZeroUint schema */
@@ -24,6 +61,13 @@ export const ZBigNumberish = z
   .or(ZUint)
   .or(z.string().regex(/^[0-9]+$/))
   .transform(BigInt);
+
+/** Zod BPS (basis points) schema — accepts number or decimal string, transforms to number.
+ *  Supports fractional values (e.g., 1.5 bps). */
+export const ZBps = z
+  .union([z.number().nonnegative(), z.string().regex(/^\d+(\.\d+)?$/)])
+  .transform((val) => Number(val))
+  .refine((val) => Number.isFinite(val), 'bps must be a finite number');
 
 export const ZBytes32String = z
   .string()

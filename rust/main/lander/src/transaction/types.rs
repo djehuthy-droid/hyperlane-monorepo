@@ -1,7 +1,7 @@
 // TODO: re-enable clippy warnings
 #![allow(dead_code)]
 
-use std::{collections::HashMap, ops::Deref};
+use std::ops::Deref;
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -11,7 +11,9 @@ use hyperlane_core::{identifiers::UniqueIdentifier, H256, H512};
 #[cfg(feature = "aleo")]
 use crate::adapter::chains::AleoTxPrecursor;
 use crate::{
-    adapter::chains::{EthereumTxPrecursor, RadixTxPrecursor, SealevelTxPrecursor},
+    adapter::chains::{
+        tron::TronTxPrecursor, EthereumTxPrecursor, RadixTxPrecursor, SealevelTxPrecursor,
+    },
     payload::PayloadDetails,
     LanderError,
 };
@@ -107,6 +109,72 @@ impl TransactionStatus {
     pub fn classify_tx_status_from_hash_statuses(
         statuses: Vec<Result<TransactionStatus, LanderError>>,
     ) -> TransactionStatus {
+        let mut included = false;
+        let mut mempool = false;
+        let mut pending = false;
+        let mut dropped = false;
+
+        // Only category presence matters; counts and cloned drop reasons are unused.
+        for status in statuses.into_iter().flatten() {
+            match status {
+                TransactionStatus::Finalized => return TransactionStatus::Finalized,
+                TransactionStatus::Included => included = true,
+                TransactionStatus::Mempool => mempool = true,
+                TransactionStatus::PendingInclusion => pending = true,
+                TransactionStatus::Dropped(_) => dropped = true,
+            }
+        }
+
+        if included {
+            TransactionStatus::Included
+        } else if mempool {
+            TransactionStatus::Mempool
+        } else if pending || !dropped {
+            // Empty or entirely failed reads retain the existing pending fallback.
+            TransactionStatus::PendingInclusion
+        } else {
+            TransactionStatus::Dropped(DropReason::DroppedByChain)
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Hash)]
+pub enum DropReason {
+    /// currently only assigned when a reorg is detected
+    DroppedByChain,
+    /// dropped by the submitter
+    FailedSimulation,
+    /// dropped because of some other reason we are not aware of
+    Other(String),
+}
+
+impl DropReason {
+    pub fn to_metrics_label(&self) -> String {
+        match self {
+            Self::DroppedByChain => "DroppedByChain".to_string(),
+            Self::FailedSimulation => "FailedSimulation".to_string(),
+            Self::Other(_) => "Other".to_string(),
+        }
+    }
+}
+// add nested enum entries as we add VMs
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub enum VmSpecificTxData {
+    #[cfg(feature = "aleo")]
+    Aleo(Box<AleoTxPrecursor>),
+    CosmWasm,
+    Evm(Box<EthereumTxPrecursor>),
+    Radix(Box<RadixTxPrecursor>),
+    Svm(Box<SealevelTxPrecursor>),
+    Tron(Box<TronTxPrecursor>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn legacy_classify(statuses: Vec<Result<TransactionStatus, LanderError>>) -> TransactionStatus {
         let mut status_counts = HashMap::<TransactionStatus, usize>::new();
 
         // count the occurrences of each successfully queried hash status
@@ -142,40 +210,55 @@ impl TransactionStatus {
         // otherwise, return `PendingInclusion`, assuming the rpc is down temporarily and returns errors
         TransactionStatus::PendingInclusion
     }
-}
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, Hash)]
-pub enum DropReason {
-    /// currently only assigned when a reorg is detected
-    DroppedByChain,
-    /// dropped by the submitter
-    FailedSimulation,
-    /// dropped because of some other reason we are not aware of
-    Other(String),
-}
-
-impl DropReason {
-    pub fn to_metrics_label(&self) -> String {
-        match self {
-            Self::DroppedByChain => "DroppedByChain".to_string(),
-            Self::FailedSimulation => "FailedSimulation".to_string(),
-            Self::Other(_) => "Other".to_string(),
+    fn classification_input(category: usize) -> Result<TransactionStatus, LanderError> {
+        match category {
+            0 => Err(LanderError::NetworkError("unavailable".to_owned())),
+            1 => Ok(TransactionStatus::PendingInclusion),
+            2 => Ok(TransactionStatus::Mempool),
+            3 => Ok(TransactionStatus::Included),
+            4 => Ok(TransactionStatus::Finalized),
+            5 => Ok(TransactionStatus::Dropped(DropReason::DroppedByChain)),
+            6 => Ok(TransactionStatus::Dropped(DropReason::FailedSimulation)),
+            7 => Ok(TransactionStatus::Dropped(DropReason::Other(
+                "first reason".to_owned(),
+            ))),
+            _ => Ok(TransactionStatus::Dropped(DropReason::Other(
+                "second reason".to_owned(),
+            ))),
         }
     }
-}
-// add nested enum entries as we add VMs
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-pub enum VmSpecificTxData {
-    #[cfg(feature = "aleo")]
-    Aleo(Box<AleoTxPrecursor>),
-    CosmWasm,
-    Evm(Box<EthereumTxPrecursor>),
-    Radix(Box<RadixTxPrecursor>),
-    Svm(Box<SealevelTxPrecursor>),
-}
 
-#[cfg(test)]
-mod tests {
+    #[test]
+    fn classification_matches_legacy_for_all_small_category_sequences() {
+        for length in 0..=4 {
+            for mut sequence in 0..9usize.pow(length) {
+                let categories: Vec<_> = (0..length)
+                    .map(|_| {
+                        let category = sequence % 9;
+                        sequence /= 9;
+                        category
+                    })
+                    .collect();
+                let legacy = legacy_classify(
+                    categories
+                        .iter()
+                        .copied()
+                        .map(classification_input)
+                        .collect(),
+                );
+                let actual = TransactionStatus::classify_tx_status_from_hash_statuses(
+                    categories
+                        .iter()
+                        .copied()
+                        .map(classification_input)
+                        .collect(),
+                );
+                assert_eq!(actual, legacy, "categories: {categories:?}");
+            }
+        }
+    }
+
     #[test]
     fn test_transaction_status_classification_finalized() {
         use super::*;

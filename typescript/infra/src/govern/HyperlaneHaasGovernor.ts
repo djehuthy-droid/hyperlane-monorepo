@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import { BigNumber } from 'ethers';
 
 import {
   ChainName,
@@ -9,22 +10,28 @@ import {
   InterchainAccount,
   ViolationType,
 } from '@hyperlane-xyz/sdk';
-import { ProtocolType, rootLogger } from '@hyperlane-xyz/utils';
+import {
+  formatStandardHookMetadata,
+  hasValidRefundAddress,
+  isEVMLike,
+  isZeroishAddress,
+  parseStandardHookMetadata,
+  rootLogger,
+} from '@hyperlane-xyz/utils';
 
 import { chainsToSkip } from '../config/chain.js';
 
-import {
-  AnnotatedCallData,
-  HyperlaneAppGovernor,
-} from './HyperlaneAppGovernor.js';
+import { HyperlaneAppGovernor } from './HyperlaneAppGovernor.js';
 import { HyperlaneCoreGovernor } from './HyperlaneCoreGovernor.js';
 import { HyperlaneICAChecker } from './HyperlaneICAChecker.js';
 import { ProxiedRouterGovernor } from './ProxiedRouterGovernor.js';
+import { AnnotatedCallData } from './types.js';
 
 export class HyperlaneHaasGovernor extends HyperlaneAppGovernor<
   HyperlaneCore,
   CoreConfig
 > {
+  static readonly CHAIN_CHECK_CONCURRENCY = 10;
   protected readonly icaGovernor: ProxiedRouterGovernor<any, any>;
   protected readonly coreGovernor: HyperlaneCoreGovernor;
 
@@ -103,21 +110,33 @@ export class HyperlaneHaasGovernor extends HyperlaneAppGovernor<
         chalk.yellow('Skipping chains:', chainsToSkip.join(', ')),
       );
     }
+    const evmChainsToCheck = chains.filter(
+      (chain) =>
+        isEVMLike(
+          this.coreChecker.multiProvider.getChainMetadata(chain).protocol,
+        ) && !chainsToSkip.includes(chain),
+    );
+
+    let nextChainIndex = 0;
+    const workerCount = Math.min(
+      HyperlaneHaasGovernor.CHAIN_CHECK_CONCURRENCY,
+      evmChainsToCheck.length,
+    );
+
     await Promise.allSettled(
-      chains
-        .filter(
-          (chain) =>
-            this.coreChecker.multiProvider.getChainMetadata(chain).protocol ===
-              ProtocolType.Ethereum && !chainsToSkip.includes(chain),
-        )
-        .map(async (chain) => {
+      Array.from({ length: workerCount }, async () => {
+        while (nextChainIndex < evmChainsToCheck.length) {
+          const chain = evmChainsToCheck[nextChainIndex];
+          nextChainIndex += 1;
+
           try {
             await this.checkChain(chain);
           } catch (err) {
             rootLogger.error(chalk.red(`Failed to check chain ${chain}:`, err));
             failedChains.push(chain);
           }
-        }),
+        }
+      }),
     );
 
     if (failedChains.length > 0) {
@@ -170,12 +189,24 @@ export class HyperlaneHaasGovernor extends HyperlaneAppGovernor<
       for (const call of calls) {
         if (!call.callRemoteArgs) continue;
 
-        // Create a key based on all callRemoteArgs properties except innerCalls
+        const hookMetadata = call.callRemoteArgs.hookMetadata;
+        const normalizedHookMetadata =
+          typeof hookMetadata === 'string'
+            ? parseStandardHookMetadata(hookMetadata)
+            : hookMetadata;
+        const hookMetadataIdentity = normalizedHookMetadata
+          ? {
+              msgValue: BigInt(normalizedHookMetadata.msgValue ?? 0).toString(),
+              refundAddress: normalizedHookMetadata.refundAddress,
+            }
+          : hookMetadata;
+
+        // Gas limits differ per inner call and must be recomputed for the batch.
         const key = [
           call.callRemoteArgs.chain,
           call.callRemoteArgs.destination,
           JSON.stringify(call.callRemoteArgs.config),
-          JSON.stringify(call.callRemoteArgs.hookMetadata),
+          JSON.stringify(hookMetadataIdentity),
         ].join('|');
 
         if (!callGroups.has(key)) {
@@ -214,22 +245,65 @@ export class HyperlaneHaasGovernor extends HyperlaneAppGovernor<
           return call.callRemoteArgs.innerCalls;
         });
 
-        // Create the combined callRemoteArgs
-        const combinedCallRemoteArgs = {
+        let combinedCallRemoteArgs = {
           ...baseCallRemoteArgs,
           innerCalls: combinedInnerCalls,
         };
+
+        const baseHookMetadata = baseCallRemoteArgs.hookMetadata;
+        const normalizedBaseHookMetadata =
+          typeof baseHookMetadata === 'string'
+            ? parseStandardHookMetadata(baseHookMetadata)
+            : baseHookMetadata;
+        if (normalizedBaseHookMetadata) {
+          const gasLimit = await this.interchainAccount.estimateIcaHandleGas({
+            origin: combinedCallRemoteArgs.chain,
+            destination: combinedCallRemoteArgs.destination,
+            innerCalls: combinedInnerCalls,
+            config: combinedCallRemoteArgs.config,
+          });
+          combinedCallRemoteArgs = {
+            ...combinedCallRemoteArgs,
+            hookMetadata: formatStandardHookMetadata({
+              gasLimit: gasLimit.toBigInt(),
+              msgValue: BigInt(normalizedBaseHookMetadata.msgValue ?? 0),
+              refundAddress: normalizedBaseHookMetadata.refundAddress,
+            }),
+          };
+        }
 
         // Get the callRemote transaction
         const callRemote = await this.interchainAccount.getCallRemote(
           combinedCallRemoteArgs,
         );
 
+        const hookMetadata = combinedCallRemoteArgs.hookMetadata;
+        const shouldBuffer =
+          typeof hookMetadata === 'string'
+            ? hasValidRefundAddress(hookMetadata)
+            : hookMetadata?.refundAddress &&
+              !isZeroishAddress(hookMetadata.refundAddress);
+        if (!shouldBuffer) {
+          rootLogger.warn(
+            {
+              chain,
+              destination: combinedCallRemoteArgs.destination,
+            },
+            'Skipping 2x gas buffer: hookMetadata missing valid refund address. Overpayment refunds may go to router contract.',
+          );
+        }
+
+        // Apply 2x buffer to quote to handle gas price fluctuations between tx creation and execution
+        // only when the hook metadata includes a refundable address.
+        const bufferedValue = callRemote.value
+          ? BigNumber.from(callRemote.value).mul(shouldBuffer ? 2 : 1)
+          : undefined;
+
         // Create a new combined call that represents all the grouped calls
         const combinedCall: AnnotatedCallData = {
           to: callRemote.to!,
           data: callRemote.data!,
-          value: callRemote.value,
+          value: bufferedValue,
           description: `Combined ${groupedCalls.length} ICA calls`,
           expandedDescription: `Combined calls: ${groupedCalls.map((c) => c.description).join(', ')}`,
           callRemoteArgs: combinedCallRemoteArgs,
@@ -238,7 +312,7 @@ export class HyperlaneHaasGovernor extends HyperlaneAppGovernor<
         };
 
         newCalls.push(combinedCall);
-        console.log(
+        rootLogger.info(
           `Combined ${groupedCalls.length} calls into single ICA transaction for chain ${chain}`,
         );
       }

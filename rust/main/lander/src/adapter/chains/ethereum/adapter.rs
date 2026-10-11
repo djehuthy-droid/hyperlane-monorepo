@@ -55,7 +55,18 @@ mod gas_limit_estimator;
 mod gas_price;
 mod tx_status_checker;
 
-const NONCE_TOO_LOW_ERROR: &str = "nonce too low";
+/// Geth's reply when the exact signed transaction is already in its pool.
+const ALREADY_KNOWN_ERROR: &str = "already known";
+
+/// Error strings that indicate a nonce conflict or duplicate transaction.
+/// Matched case-insensitively against the lowercased error message.
+const NONCE_TOO_LOW_ERRORS: [&str; 4] = [
+    "nonce too low",
+    // Ethermint/CometBFT chains (e.g. ENI) return non-standard errors for nonce conflicts.
+    "gas wanted -1, gas fee is insufficient",
+    "tx already exists in tx pool cache",
+    "tx already exist in the fetch queue",
+];
 const DEFAULT_MINIMUM_TIME_BETWEEN_RESUBMISSIONS: Duration = Duration::from_secs(1);
 
 pub struct EthereumAdapter {
@@ -184,18 +195,17 @@ impl EthereumAdapter {
             return Ok(());
         }
 
-        // Transaction has been submitted before, check if the new gas price has not
-        // reached limit yet
-
         if gas_price == &tx_gas_price {
-            // If new gas price is the same as the old one, no point in resubmitting
+            // Missing receipts put the transaction back in PendingInclusion, even if it
+            // was previously accepted by the node. Rebroadcast at the same price so a
+            // transaction evicted from the mempool cannot leave a permanent nonce gap.
             info!(
                 ?tx,
-                "not resubmitting transaction since new gas price is the same as the old one"
+                "transaction gas price is unchanged; rebroadcasting if still pending"
             );
 
             return match &tx.status {
-                PendingInclusion => Err(LanderError::TxGasCapReached),
+                PendingInclusion => Ok(()),
                 Dropped(reason) => Err(LanderError::TxDropped(reason.clone())),
                 Mempool | Included | Finalized => Err(LanderError::TxAlreadyExists),
             };
@@ -649,19 +659,31 @@ impl AdaptsChain for EthereumAdapter {
         use super::transaction::Precursor;
         use LanderError::TxAlreadyExists;
 
-        let tx_for_nonce = tx.clone();
-        let tx_for_gas_price = tx.clone();
+        let (nonce, gas_price) = try_join!(self.calculate_nonce(tx), self.estimate_gas_price(tx))?;
+        let gas_price_unchanged =
+            gas_price != GasPrice::None && tx.precursor().extract_gas_price() == gas_price;
 
-        let (nonce, gas_price) = try_join!(
-            self.calculate_nonce(&tx_for_nonce),
-            self.estimate_gas_price(&tx_for_gas_price)
-        )?;
+        let previous_nonce: Option<U256> = tx.precursor().tx.nonce().map(|n| (*n).into());
+        let nonce_changed = previous_nonce != Some(nonce);
 
         // Update the transaction with nonce before checking if resubmission makes sense
         // This ensures the nonce is stored even if we decide not to resubmit due to gas price limits
         Self::update_tx_nonce(tx, nonce);
 
-        Self::check_if_resubmission_makes_sense(tx, &gas_price)?;
+        // Existing hashes were signed for the previous nonce, so an unchanged gas price
+        // does not mean this nonce has been broadcast. The nonce manager has already
+        // persisted the reassigned nonce: skipping this send would leave it unused and
+        // stall later transactions, while a duplicate delivery only reverts.
+        if nonce_changed {
+            info!(
+                ?tx,
+                ?previous_nonce,
+                ?nonce,
+                "nonce changed, broadcasting regardless of gas price"
+            );
+        } else {
+            Self::check_if_resubmission_makes_sense(tx, &gas_price)?;
+        }
 
         Self::update_tx_gas_price(tx, gas_price);
 
@@ -674,15 +696,48 @@ impl AdaptsChain for EthereumAdapter {
             Ok(hash) => hash,
             Err(e) => {
                 warn!(?e, "submitting transaction error");
-                return if e.to_string().contains(NONCE_TOO_LOW_ERROR) {
+                if nonce_changed {
+                    // Nothing was broadcast for the new nonce. Keep the previous nonce so the
+                    // next attempt still treats the nonce as changed and broadcasts it.
+                    match previous_nonce {
+                        Some(previous_nonce) => {
+                            tx.precursor_mut().tx.set_nonce(previous_nonce);
+                        }
+                        None => clear_nonce(&mut tx.precursor_mut().tx),
+                    }
+                }
+                // Resending identical signed bytes whose hash is already recorded. A
+                // failed resend is never a reason to drop the transaction or free its
+                // nonce: it was broadcast before and may still land.
+                let rebroadcast = !nonce_changed && gas_price_unchanged;
+                let err_str = e.to_string().to_lowercase();
+                // "already known" only proves an existing hash for a rebroadcast. On a
+                // first send it can follow a lost response, with no hash recorded yet.
+                let already_exists = NONCE_TOO_LOW_ERRORS.iter().any(|s| err_str.contains(s))
+                    || (rebroadcast && err_str.contains(ALREADY_KNOWN_ERROR));
+                return if already_exists {
                     Err(TxAlreadyExists)
                 } else {
-                    Err(e.into())
+                    let error = LanderError::from(e);
+                    if rebroadcast {
+                        // Poll recorded hashes after a failed same-nonce rebroadcast.
+                        // A changed-nonce failure must keep retrying its reservation
+                        // before an older hash can finalize the transaction.
+                        Err(LanderError::TxGasCapReached)
+                    } else {
+                        Err(error)
+                    }
                 };
             }
         };
 
-        tx.tx_hashes.push(hash.into());
+        // A rebroadcast from a deterministic signer returns an existing hash. Avoid
+        // reading its receipt more than once per status scan, while retaining
+        // distinct replacement hashes.
+        let hash = hash.into();
+        if !tx.tx_hashes.contains(&hash) {
+            tx.tx_hashes.push(hash);
+        }
 
         info!(?tx, "submitted transaction");
 
@@ -694,6 +749,17 @@ impl AdaptsChain for EthereumAdapter {
         hash: hyperlane_core::H512,
     ) -> Result<TransactionStatus, LanderError> {
         tx_status_checker::get_tx_hash_status(&self.provider, hash, &self.reorg_period).await
+    }
+
+    async fn tx_statuses(
+        &self,
+        txs: &[Transaction],
+    ) -> Vec<Result<TransactionStatus, LanderError>> {
+        tx_status_checker::get_tx_statuses(&self.provider, txs, &self.reorg_period).await
+    }
+
+    fn tx_status_batch_size(&self) -> usize {
+        tx_status_checker::STATUS_READ_BATCH_SIZE
     }
 
     async fn reverted_payloads(
@@ -723,6 +789,17 @@ impl AdaptsChain for EthereumAdapter {
         Ok(reverted)
     }
 
+    async fn payload_delivered(&self, payload: &PayloadDetails) -> Result<bool, LanderError> {
+        let Some(precursor) = EthereumTxPrecursor::from_success_criteria(payload, self.signer)
+        else {
+            return Ok(false);
+        };
+        Ok(self
+            .provider
+            .check(&precursor.tx, &precursor.function)
+            .await?)
+    }
+
     fn reprocess_txs_poll_rate(&self) -> Option<Duration> {
         // if the block time is too short, we want to cap it at 5s because we don't want
         // to query the nonce too much. 5s should be quick enough for a reorg
@@ -730,33 +807,20 @@ impl AdaptsChain for EthereumAdapter {
     }
 
     async fn get_reprocess_txs(&self) -> Result<Vec<Transaction>, LanderError> {
-        let old_finalized_nonce = self
-            .nonce_manager
-            .state
-            .get_finalized_nonce()
-            .await?
-            .unwrap_or_default();
         self.nonce_manager.nonce_updater.update_boundaries().await?;
-        let new_finalized_nonce = self
-            .nonce_manager
-            .state
-            .get_finalized_nonce()
-            .await?
-            .unwrap_or_default();
-
-        if new_finalized_nonce >= old_finalized_nonce {
+        let Some(reorged_nonce_range) = self.nonce_manager.state.get_reorged_nonce_range().await?
+        else {
             return Ok(Vec::new());
-        }
+        };
 
         warn!(
-            ?old_finalized_nonce,
-            ?new_finalized_nonce,
-            "New finalized nonce is lower than old finalized nonce"
+            ?reorged_nonce_range,
+            "Reprocessing transactions from a persisted finalized nonce regression"
         );
 
         let mut txs = Vec::new();
-        let mut nonce = new_finalized_nonce.saturating_add(U256::one());
-        while nonce <= old_finalized_nonce {
+        let mut nonce = reorged_nonce_range.start;
+        while nonce <= reorged_nonce_range.end {
             let tx_uuid = self.nonce_manager.state.get_tracked_tx_uuid(&nonce).await?;
             if tx_uuid == TransactionUuid::default() {
                 debug!(
@@ -772,8 +836,12 @@ impl AdaptsChain for EthereumAdapter {
                     "No transaction found for nonce in reorg range"
                 );
             }
+            if nonce == reorged_nonce_range.end {
+                break;
+            }
             nonce = nonce.saturating_add(U256::one());
         }
+
         Ok(txs)
     }
 
@@ -790,6 +858,14 @@ impl AdaptsChain for EthereumAdapter {
         metrics.set_post_inclusion_metrics(&metrics_source, self.domain.as_ref());
     }
 
+    async fn post_finalized(&self) -> Result<(), LanderError> {
+        self.nonce_manager
+            .nonce_updater
+            .update_boundaries()
+            .await
+            .map_err(Into::into)
+    }
+
     async fn run_command(&self, action: AdaptsChainAction) -> Result<(), LanderError> {
         match action {
             AdaptsChainAction::OverwriteUpperNonce { nonce } => {
@@ -800,6 +876,14 @@ impl AdaptsChain for EthereumAdapter {
             }
         }
         Ok(())
+    }
+}
+
+fn clear_nonce(tx: &mut TypedTransaction) {
+    match tx {
+        TypedTransaction::Legacy(request) => request.nonce = None,
+        TypedTransaction::Eip2930(request) => request.tx.nonce = None,
+        TypedTransaction::Eip1559(request) => request.nonce = None,
     }
 }
 

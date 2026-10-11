@@ -17,7 +17,7 @@ use crate::adapter::chains::aleo::AleoAdapter;
 use crate::adapter::{
     chains::{
         cosmos::CosmosAdapter, ethereum::EthereumAdapter, radix::adapter::RadixAdapter,
-        sealevel::SealevelAdapter,
+        sealevel::SealevelAdapter, tron::adapter::TronAdapter,
     },
     AdaptsChain,
 };
@@ -45,7 +45,6 @@ impl AdapterFactory {
                 )
                 .await?,
             ),
-            ChainConnectionConf::Fuel(_) => todo!(),
             ChainConnectionConf::Sealevel(_) => Arc::new(SealevelAdapter::new(
                 conf.clone(),
                 raw_conf.clone(),
@@ -65,7 +64,16 @@ impl AdapterFactory {
                 let adapter = AleoAdapter::from_conf(conf, core_metrics, &connection_conf)?;
                 Arc::new(adapter)
             }
-            other => return Err(eyre::eyre!("unsupported chain connection protocol={:?}", other.protocol())),
+            ChainConnectionConf::Tron(connection_conf) => {
+                let adapter = TronAdapter::from_conf(conf, core_metrics, &connection_conf).await?;
+                Arc::new(adapter)
+            }
+            #[cfg(feature = "kaspa")]
+            ChainConnectionConf::Kaspa(_) => {
+                return Err(eyre::eyre!(
+                    "unsupported chain connection protocol=Kaspa; use the classic submitter"
+                ));
+            }
         };
         Ok(adapter)
     }

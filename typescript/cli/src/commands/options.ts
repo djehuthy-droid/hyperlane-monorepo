@@ -6,6 +6,25 @@ import { LogFormat, LogLevel } from '@hyperlane-xyz/utils';
 
 import { ENV } from '../utils/env.js';
 
+/**
+ * Coerce function for string array options.
+ * Trims whitespace and filters out empty strings.
+ */
+export const coerceStringArray = (values: string[]): string[] =>
+  values.map((v) => v.trim()).filter((v) => v.length > 0);
+
+/**
+ * Creates a string array option with automatic trimming and empty string filtering.
+ */
+export const stringArrayOptionConfig = (
+  options: Omit<Options, 'type' | 'string' | 'coerce'>,
+): Options => ({
+  ...options,
+  type: 'array',
+  string: true,
+  coerce: coerceStringArray,
+});
+
 /* Global options */
 
 export const DEFAULT_LOCAL_REGISTRY = `${os.homedir()}/.hyperlane`;
@@ -75,16 +94,9 @@ export const disableProxyCommandOption: Options = {
 
 /* Command-specific options */
 
-export const coreTargetsCommandOption: Options = {
-  type: 'string',
-  description:
-    'Comma separated list of chain names to which contracts will be deployed',
-};
-
-export const agentTargetsCommandOption: Options = {
-  type: 'string',
-  description: 'Comma separated list of chains to relay between',
-};
+export const agentTargetsCommandOption: Options = stringArrayOptionConfig({
+  description: 'List of chains to relay between',
+});
 
 export const ismCommandOption: Options = {
   type: 'string',
@@ -104,25 +116,17 @@ export const DEFAULT_WARP_ROUTE_DEPLOYMENT_CONFIG_PATH =
 export const DEFAULT_CORE_DEPLOYMENT_CONFIG_PATH = './configs/core-config.yaml';
 export const DEFAULT_STRATEGY_CONFIG_PATH = `${os.homedir()}/.hyperlane/strategies/default-strategy.yaml`;
 
-export const warpDeploymentConfigCommandOption: Options = {
+export const warpRouteIdCommandOption: Options = {
   type: 'string',
   description:
-    'A path to a JSON or YAML file with a warp route deployment config.',
-  demandOption: false,
-  alias: 'wd',
+    'Warp route ID from registry (e.g., ETH/hyperlane). Aliases: -w, --id',
+  alias: ['w', 'id'],
 };
 
-export const warpCoreConfigCommandOption: Options = {
-  type: 'string',
-  description: 'File path to Warp Route config',
-  alias: 'wc',
-};
-
-export const chainTargetsCommandOption: Options = {
-  type: 'string',
-  description: 'Comma-separated list of chain names',
+export const chainTargetsCommandOption: Options = stringArrayOptionConfig({
+  description: 'List of chain names',
   alias: 'c',
-};
+});
 
 export const outputFileCommandOption = (
   defaultPath?: string,
@@ -136,8 +140,10 @@ export const outputFileCommandOption = (
   demandOption,
 });
 
-interface InputFileCommandOptionConfig
-  extends Pick<Options, 'demandOption' | 'alias' | 'description'> {
+interface InputFileCommandOptionConfig extends Pick<
+  Options,
+  'demandOption' | 'alias' | 'description'
+> {
   defaultPath?: string;
 }
 
@@ -165,16 +171,10 @@ export const chainCommandOption: Options = {
   description: 'The specific chain to perform operations with.',
 };
 
-export const symbolCommandOption: Options = {
-  type: 'string',
-  description: 'Token symbol (e.g. ETH, USDC)',
-};
-
-export const validatorCommandOption: Options = {
-  type: 'string',
-  description: 'Comma separated list of validator addresses',
+export const validatorCommandOption: Options = stringArrayOptionConfig({
+  description: 'List of validator addresses',
   demandOption: true,
-};
+});
 
 export const transactionsCommandOption: Options = {
   type: 'string',
@@ -243,23 +243,17 @@ export const avsChainCommandOption: Options = {
   choices: ['ethereum'],
 };
 
-export const warpRouteIdCommandOption: Options = {
-  type: 'string',
-  description: 'Warp route ID to specify the warp route',
-  alias: 'id',
-};
-
 export const forkCommandOptions: Record<string, Options> = {
   port: {
     type: 'number',
     description:
-      'Port to be used as initial port from which assign port numbers to all anvil instances',
+      'Initial port from which to assign port numbers to all fork node instances',
     default: 8545,
   },
   'fork-config': {
     type: 'string',
     description:
-      'The path to a configuration file that specifies how to build the forked chains',
+      "The path to a configuration file that specifies how to build the forked chains. Sealevel chains fork the datasource's current head (no fork-at-slot)",
   },
   kill: {
     type: 'boolean',

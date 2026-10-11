@@ -1,5 +1,580 @@
 # @hyperlane-xyz/aleo-sdk
 
+## 45.0.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@45.0.1
+- @hyperlane-xyz/provider-sdk@11.0.1
+
+## 45.0.0
+
+### Major Changes
+
+- 1925ccb: The Aleo SDK was migrated to the stricter shared TypeScript configuration.
+
+### Patch Changes
+
+- c52b728: ARC-22 token imports were recognized when reading v2 Aleo warp routes.
+- a90a845: Fixed Aleo synthetic warp deployments to derive remote decimals from the configured scale instead of always using local decimals. Invalid scales and decimal ranges were rejected before deployment.
+- 4975a40: The Provable SDK dependency was upgraded to 0.12.0 for Aleo mainnet consensus V21 and Varuna V3 proof support.
+- 1c1737e: Updated the Provable SDK and WASM dependencies to use the current Aleo consensus fee model.
+- Updated dependencies [ee50f43]
+- Updated dependencies [12678bc]
+- Updated dependencies [9a59116]
+- Updated dependencies [28eda66]
+- Updated dependencies [43f89c6]
+- Updated dependencies [4e2ab65]
+- Updated dependencies [4ad4577]
+- Updated dependencies [f64f992]
+  - @hyperlane-xyz/provider-sdk@11.0.0
+  - @hyperlane-xyz/utils@45.0.0
+
+## 44.0.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@44.0.2
+- @hyperlane-xyz/provider-sdk@10.0.2
+
+## 44.0.1
+
+### Patch Changes
+
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/utils@44.0.1
+
+## 44.0.0
+
+### Patch Changes
+
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+
+## 43.0.0
+
+### Patch Changes
+
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/utils@43.0.0
+
+## 42.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@42.0.0
+- @hyperlane-xyz/provider-sdk@8.1.3
+
+## 41.3.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.1
+- @hyperlane-xyz/provider-sdk@8.1.2
+
+## 41.3.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.0
+- @hyperlane-xyz/provider-sdk@8.1.1
+
+## 41.2.0
+
+### Patch Changes
+
+- Updated dependencies [bd4e5f0]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/utils@41.2.0
+
+## 41.1.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.1.0
+- @hyperlane-xyz/provider-sdk@8.0.4
+
+## 41.0.0
+
+### Patch Changes
+
+- 178614d: The Aleo warp token reader no longer throws when a v1 token is absent from token_registry.aleo. Decimals now fall back to the authoritative app_metadata.local_decimals value and name/symbol degrade to empty strings on a registry miss, so legacy synthetics (e.g. USAD) can be read by check-warp-deploy. The fallback is scoped to a genuine registry miss only; v2 ARC-20 read failures and RPC/transport/decode errors continue to propagate rather than being masked as healthy. The miss stays recoverable so an empty read is retried across the bounded budget — covering a just-registered mapping that has not finalized/indexed yet — and only falls back once those retries are exhausted. The exception boundary is covered by unit tests.
+- Updated dependencies [fa19409]
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+
+## 40.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@40.0.0
+- @hyperlane-xyz/provider-sdk@8.0.2
+
+## 39.1.0
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.1
+
+## 39.0.0
+
+### Major Changes
+
+- 4ef1fde: - `getMinGasForWarpDeploy` now lives on `IProvider` (per-chain) instead of the stateless `ProtocolProvider`. It is `async` and returns a FINAL native-denom amount rather than a mix of gas units and native amounts. It composes the base router deploy cost with additive deltas for detected features (cross-collateral extras, fee program deploy, custom ISM / hook / IGP deploy) driven by the warp config shape, and for gas-metered protocols multiplies gas units by the chain gas price.
+  - `ChainMetadataForAltVM` gained an optional `gasPrice` field.
+  - `ProviderBuilderFn` now takes a full `ChainMetadata` instead of `(rpcUrls, network)`.
+  - The AltVM `IProvider.connect` and `ISigner.connectWithSigner` static factories now take `ChainMetadataForAltVM` as their first argument, replacing the previous `(rpcUrls, chainId, extraParams)` shape and the metadata-through-`extraParams` indirection.
+  - The CLI warp-deploy preflight now sizes AltVM native-balance requirements from the composed per-chain deploy cost, so feature-heavy deploys are no longer silently under-funded, and chains without a gas price are no longer skipped for the warp-deploy path.
+  - The AltVM warp-deploy base gas costs were calibrated from measured deploys (Sealevel from mainnet; Starknet, Aleo, and Radix from devnet base-router floors with safety margin), replacing the previous catastrophically-low placeholder constants that let preflight pass under-funded accounts.
+  - The Starknet test fixture native token was corrected from ETH to STRK to match the production registry and the token the devnet actually charges fees in.
+
+### Patch Changes
+
+- f41f9fd: Removed Aleo deployment artifacts, the Provable runtime, and the Shield wallet adapter from eager browser bundles. Lightweight constants and program metadata stayed synchronous, while browser providers and wallet integrations loaded their protocol runtimes on first use. Aleo mainnet and testnet runtimes were split so browser providers only downloaded the configured network.
+- Updated dependencies [4ef1fde]
+- Updated dependencies [735793b]
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/utils@39.0.0
+
+## 38.0.0
+
+### Patch Changes
+
+- Updated dependencies [961a89d]
+  - @hyperlane-xyz/provider-sdk@7.2.0
+  - @hyperlane-xyz/utils@38.0.0
+
+## 37.0.0
+
+### Minor Changes
+
+- 9c8b435: Added altvm support in warp check
+
+### Patch Changes
+
+- 3771b2b: Fixed aleo warp send with retries
+- Updated dependencies [df34a68]
+- Updated dependencies [cc4bdb6]
+- Updated dependencies [31f8b51]
+- Updated dependencies [97e8ca1]
+  - @hyperlane-xyz/provider-sdk@7.1.0
+  - @hyperlane-xyz/utils@37.0.0
+
+## 36.0.0
+
+### Major Changes
+
+- 70586aa: Added aleo ARC20 token support
+
+### Patch Changes
+
+- aa41ce4: SVM fee program management was added to the SVM SDK with full create, read, and update support for all 6 fee types (linear, regressive, progressive, offchainQuotedLinear, routing, crossCollateralRouting). The provider-sdk fee types were refactored with a FeeParams discriminated union (bps vs raw), PascalCase FeeType/FeeStrategyType values, expanded DerivedFeeConfig with resolved bigint fields, and a required FeeReadContext parameter on createFeeArtifactManager. Shared BPS fee utilities (computeBps, bpsToRawFeeParams, constants) were consolidated into provider-sdk as the single source of truth — sdk and svm-sdk now import from provider-sdk. The EVM SDK TokenFeeType was converted from enum to const object for structural compatibility. Legacy pre-fee program bytes were preserved for upgrade testing. The repeated account-decoding boilerplate in the fee and token decoders was consolidated into a shared decodeDiscriminatedAccount helper.
+- Updated dependencies [9cd7606]
+- Updated dependencies [aa41ce4]
+- Updated dependencies [2f9d783]
+- Updated dependencies [9bdab1d]
+  - @hyperlane-xyz/utils@36.0.0
+  - @hyperlane-xyz/provider-sdk@7.0.0
+
+## 35.2.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@35.2.0
+- @hyperlane-xyz/provider-sdk@6.1.1
+
+## 35.1.0
+
+### Minor Changes
+
+- d1b6f0a: Added new hook deploy command
+
+### Patch Changes
+
+- Updated dependencies [d1b6f0a]
+  - @hyperlane-xyz/provider-sdk@6.1.0
+  - @hyperlane-xyz/utils@35.1.0
+
+## 35.0.1
+
+### Patch Changes
+
+- Updated dependencies [da1cfb1]
+  - @hyperlane-xyz/utils@35.0.1
+  - @hyperlane-xyz/provider-sdk@6.0.4
+
+## 35.0.0
+
+### Minor Changes
+
+- 631d7e7: `ICoreAdapter.extractMessageIds` was made async (returns `Promise`). Callers must add `await` at call sites.
+
+  `AleoCoreAdapter` extracted message IDs by querying on-chain mappings. Because Aleo's mailbox nonce counter is a single shared mapping entry, at most one dispatch is accepted per block; a confirmed transaction with type `"execute"` was the accepted dispatch, and the dispatched nonce is `mailbox.nonce - 1`. Unlike EVM/SVM adapters that parsed receipt logs, Aleo extraction required on-chain mapping queries. Callers constructing `MultiProtocolCore` for an Aleo origin chain had to supply a real mailbox address (not a stub); passing no address caused extraction to return an empty result rather than throw.
+
+  Aleo warp token writers (native, collateral, synthetic) verified that the mailbox is initialized before deploying warp tokens. Previously, running `warp deploy` against an uninitialized mailbox produced a cryptic "transaction rejected" error from the on-chain finalize assertion; now a clear error is thrown immediately.
+
+- f3851a3: Fixed aleo token adapters to support new transfer_as_signer methods and fix aleo-sdk for correct warp token names
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@35.0.0
+- @hyperlane-xyz/provider-sdk@6.0.3
+
+## 34.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@34.0.0
+- @hyperlane-xyz/provider-sdk@6.0.2
+
+## 33.1.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@33.1.1
+- @hyperlane-xyz/provider-sdk@6.0.1
+
+## 33.1.0
+
+### Patch Changes
+
+- Updated dependencies [bfe4d2e]
+  - @hyperlane-xyz/provider-sdk@6.0.0
+  - @hyperlane-xyz/utils@33.1.0
+
+## 33.0.2
+
+### Patch Changes
+
+- b864cca: Multi-VM fee type support was added to provider-sdk and deploy-sdk. Fee types (linear, regressive, progressive, offchainQuotedLinear, routing, crossCollateralRouting) were defined with Config API and Artifact API variants. FeeReader and FeeWriter with required FeeReadContext were added to deploy-sdk. Fee was integrated into warp types and the warp writer update flow. All protocol providers received createFeeArtifactManager stubs.
+- Updated dependencies [b864cca]
+- Updated dependencies [1f918d0]
+  - @hyperlane-xyz/provider-sdk@5.1.0
+  - @hyperlane-xyz/utils@33.0.2
+
+## 33.0.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@33.0.1
+- @hyperlane-xyz/provider-sdk@5.0.3
+
+## 33.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@33.0.0
+- @hyperlane-xyz/provider-sdk@5.0.2
+
+## 32.0.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@32.0.1
+- @hyperlane-xyz/provider-sdk@5.0.1
+
+## 32.0.0
+
+### Major Changes
+
+- 3dc6367: Core query methods (getIsmType, getRoutingIsm, getHookType, etc.) were removed from the IProvider interface and extracted into standalone query functions in each SDK. isMessageDelivered was kept on the interface to enforce all providers implement it.
+
+  Starknet get\*Transaction methods were extracted into standalone tx builder functions (mailbox-tx.ts, ism-tx.ts, hook-tx.ts, warp-tx.ts) with their own parameter types, removing the dependency on provider-sdk Req/Res types.
+
+  Tron and Aleo providers and signers had all get\*Transaction and action methods removed. Old e2e tests replaced with artifact API equivalents.
+
+  76 Req/Res types were removed from provider-sdk altvm.ts, reducing it from 587 to 243 lines.
+
+- fa08f2a: IProvider and ISigner interfaces were slimmed to their minimal surface. IProvider was reduced from 53 to 22 query-only methods by removing all get\*Transaction methods. ISigner was reduced from 36 to 5 infrastructure methods by removing all action methods (createMailbox, setDefaultIsm, enrollRemoteRouter, etc.). Transaction building is now handled exclusively by artifact managers using concrete class methods or standalone helper functions.
+
+  Throwing stubs were removed from SVM, Cosmos, Radix, and Starknet provider/signer implementations. Old action-method-based e2e tests were replaced with artifact API equivalents. Cosmos routing ISM writer was fixed to handle domain route updates correctly via remove + re-add.
+
+### Patch Changes
+
+- Updated dependencies [3dc6367]
+- Updated dependencies [fa08f2a]
+  - @hyperlane-xyz/provider-sdk@5.0.0
+  - @hyperlane-xyz/utils@32.0.0
+
+## 31.2.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@31.2.1
+- @hyperlane-xyz/provider-sdk@4.3.4
+
+## 31.2.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@31.2.0
+- @hyperlane-xyz/provider-sdk@4.3.3
+
+## 31.1.0
+
+### Patch Changes
+
+- 8a082af: Added runtime entrypoints for non-EVM SDKs and avoided bundling heavy deploy-time modules in UI wallet integrations.
+  - @hyperlane-xyz/utils@31.1.0
+  - @hyperlane-xyz/provider-sdk@4.3.2
+
+## 31.0.1
+
+### Patch Changes
+
+- Updated dependencies [d5168fc]
+  - @hyperlane-xyz/utils@31.0.1
+  - @hyperlane-xyz/provider-sdk@4.3.1
+
+## 31.0.0
+
+### Patch Changes
+
+- Updated dependencies [44626fb]
+  - @hyperlane-xyz/provider-sdk@4.3.0
+  - @hyperlane-xyz/utils@31.0.0
+
+## 30.1.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@30.1.1
+- @hyperlane-xyz/provider-sdk@4.2.5
+
+## 30.1.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@30.1.0
+- @hyperlane-xyz/provider-sdk@4.2.4
+
+## 30.0.0
+
+### Patch Changes
+
+- Updated dependencies [37255ba]
+- Updated dependencies [7646819]
+  - @hyperlane-xyz/provider-sdk@4.2.3
+  - @hyperlane-xyz/utils@30.0.0
+
+## 29.1.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@29.1.0
+- @hyperlane-xyz/provider-sdk@4.2.2
+
+## 29.0.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@29.0.1
+- @hyperlane-xyz/provider-sdk@4.2.1
+
+## 29.0.0
+
+### Patch Changes
+
+- 084c6b6: The TypeScript packages were updated to support TypeScript 6.0 and to make ambient type loading explicit so the future TypeScript 7.0 upgrade is smoother.
+- Updated dependencies [3c6b1ad]
+- Updated dependencies [084c6b6]
+  - @hyperlane-xyz/utils@29.0.0
+  - @hyperlane-xyz/provider-sdk@4.2.0
+
+## 28.1.0
+
+### Patch Changes
+
+- 5caac66: Added `crossCollateral` warp token type to the provider-sdk type system. All protocol SDK artifact managers were updated to handle the new type in their exhaustive switches.
+- Updated dependencies [5caac66]
+  - @hyperlane-xyz/provider-sdk@4.1.0
+  - @hyperlane-xyz/utils@28.1.0
+
+## 28.0.0
+
+### Minor Changes
+
+- 26d08de: Implemented mailbox and validator announce artifact API for Aleo protocol, enabling deployment and configuration management through the unified artifact pattern.
+
+### Patch Changes
+
+- Updated dependencies [83767b9]
+- Updated dependencies [a6b7bf3]
+  - @hyperlane-xyz/provider-sdk@4.0.0
+  - @hyperlane-xyz/utils@28.0.0
+
+## 27.1.0
+
+### Patch Changes
+
+- Updated dependencies [b892e61]
+- Updated dependencies [b892e61]
+- Updated dependencies [b892e61]
+  - @hyperlane-xyz/provider-sdk@3.1.0
+  - @hyperlane-xyz/utils@27.1.0
+
+## 27.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@27.0.0
+- @hyperlane-xyz/provider-sdk@3.0.1
+
+## 26.0.0
+
+### Patch Changes
+
+- Updated dependencies [06aacac]
+- Updated dependencies [1d116d8]
+  - @hyperlane-xyz/utils@26.0.0
+  - @hyperlane-xyz/provider-sdk@3.0.0
+
+## 25.5.0
+
+### Patch Changes
+
+- e197331: Added WarpTokenReader and WarpTokenWriter for artifact API-based warp token operations.
+
+  New exports:
+  - createWarpTokenReader: Factory for reading warp tokens
+  - createWarpTokenWriter: Factory for creating/updating warp tokens
+  - WarpTokenReader: Artifact for reading warp tokens with nested ISM/hook expansion
+  - WarpTokenWriter: Artifact for deploying and updating warp tokens
+
+  Protocol providers now support createWarpArtifactManager method.
+
+- Updated dependencies [e197331]
+- Updated dependencies [840fb33]
+  - @hyperlane-xyz/provider-sdk@2.0.0
+  - @hyperlane-xyz/utils@25.5.0
+
+## 25.4.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@25.4.1
+- @hyperlane-xyz/provider-sdk@1.4.1
+
+## 25.4.0
+
+### Minor Changes
+
+- 1f021bf: Implemented warp token artifact API for Aleo. Added warp token readers and writers for native, collateral, and synthetic tokens, with AleoWarpArtifactManager providing factory methods for type-specific operations. Writers support creating new warp tokens with ISM and Hook configuration, enrolling remote routers, and transferring ownership. Update operations generate transaction arrays for ISM and Hook changes, router enrollment/unenrollment, and ownership transfers.
+
+### Patch Changes
+
+- Updated dependencies [1f021bf]
+- Updated dependencies [1f021bf]
+  - @hyperlane-xyz/utils@25.4.0
+  - @hyperlane-xyz/provider-sdk@1.4.0
+
+## 25.3.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@25.3.2
+- @hyperlane-xyz/provider-sdk@1.3.6
+
+## 25.3.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@25.3.1
+- @hyperlane-xyz/provider-sdk@1.3.5
+
+## 25.3.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@25.3.0
+- @hyperlane-xyz/provider-sdk@1.3.4
+
+## 25.2.0
+
+### Minor Changes
+
+- 6091a31: Fix USAD getBridgedSupply query
+
+### Patch Changes
+
+- Updated dependencies [360db52]
+- Updated dependencies [ccd638d]
+  - @hyperlane-xyz/utils@25.2.0
+  - @hyperlane-xyz/provider-sdk@1.3.3
+
+## 25.1.0
+
+### Patch Changes
+
+- Updated dependencies [b930534]
+  - @hyperlane-xyz/utils@25.1.0
+  - @hyperlane-xyz/provider-sdk@1.3.2
+
+## 25.0.0
+
+### Patch Changes
+
+- Updated dependencies [52ce778]
+  - @hyperlane-xyz/utils@25.0.0
+  - @hyperlane-xyz/provider-sdk@1.3.1
+
+## 24.0.0
+
+### Patch Changes
+
+- b1b941e: Testcontainer startup timeout increased to 120s to prevent CI flakes when Docker image pulls are slow.
+- Updated dependencies [57461b2]
+- Updated dependencies [d580bb6]
+- Updated dependencies [9dc71fe]
+- Updated dependencies [bde05e9]
+  - @hyperlane-xyz/utils@24.0.0
+  - @hyperlane-xyz/provider-sdk@1.3.0
+
+## 23.0.0
+
+### Major Changes
+
+- 80f3635: feat: aleo nexus ui support
+
+### Patch Changes
+
+- c8f6f6c: Fixed routing ISM creation to correctly transfer ownership to the correct owner.
+- 0b8c4ea: Fixed hook update logic for warp routes. The warp route reader now properly reads hook addresses from deployed contracts instead of hardcoding zero address. Hook update idempotency check fixed to use deepEquals with config normalization instead of reference equality, preventing unnecessary redeployments when applying identical configs. Aleo provider updated to handle null/zero hook addresses correctly. Protocol capability check added to restrict hook updates to Aleo only. Comprehensive test suite added covering hook type transitions (none→MerkleTree, MerkleTree→IGP, MerkleTree→none), IGP config updates (gas configs, beneficiary), and idempotency validation.
+- a10cfc8: ISM update test coverage was improved by creating a shared test factory that works across AltVM protocols (Cosmos, Aleo, Radix). The factory supports explicit test skipping configuration through a `skipTests` parameter, making protocol-specific limitations clear in test configuration rather than hidden in implementation.
+
+  Aleo address handling was fixed to properly support ISM unsetting. The `isZeroishAddress` regex now matches Aleo null addresses both with and without program ID prefix. The `fromAleoAddress` helper was updated to handle addresses without the '/' separator. The `getSetTokenIsmTransaction` method now converts zero addresses to `ALEO_NULL_ADDRESS` before processing.
+
+- Updated dependencies [0b8c4ea]
+- Updated dependencies [52fd0f8]
+- Updated dependencies [a10cfc8]
+  - @hyperlane-xyz/provider-sdk@1.2.1
+  - @hyperlane-xyz/utils@23.0.0
+
+## 22.0.0
+
+### Minor Changes
+
+- ade2653: Implemented hook artifact API for Aleo. Added hook query functions, transaction builders, and artifact readers/writers for IGP and MerkleTree hooks. The AleoHookArtifactManager provides factory methods for creating type-specific hook readers and writers, with optional mailbox address that is validated only when creating writers for deployment. Hook writers support creating new hooks and updating mutable configurations (IGP owner and gas configs). Existing provider implementation was refactored to use the new shared query and transaction functions, reducing code duplication. Comprehensive e2e tests verify all hook operations following the established artifact API patterns.
+- 8b3f8da: Implemented ISM writers for Aleo SDK. Added Test ISM, MessageId Multisig ISM, and Routing ISM writers with full CRUD support through the artifact API.
+- 0acaa0e: The Aleo SDK e2e test infrastructure was refactored to use testcontainers and expose reusable testing utilities for client packages. A new testing module (`@hyperlane-xyz/aleo-sdk/testing`) exports test chain metadata, node management functions, and signer creation helpers following the Cosmos SDK pattern. The testcontainers library replaced docker-compose for automatic container lifecycle management with proper port binding and environment configuration. A global test setup file handles before/after hooks for starting and stopping the devnode. All 54 e2e tests pass with the new infrastructure, and the shell script was simplified to only set environment variables while testcontainers manages the container.
+- 7f31d77: Migrated deploy-sdk to use Hook Artifact API, replacing AltVMHookReader and AltVMHookModule with unified reader/writer pattern. The migration adds deployment context support (mailbox address, nativeTokenDenom) for hook creation, following the same pattern as the ISM artifact migration. Key changes include new factory functions (createHookReader, createHookWriter), config conversion utilities (hookConfigToArtifact, shouldDeployNewHook), and removal of deprecated hook module classes.
+
+### Patch Changes
+
+- 44fbfd6: fix: aleo wasm runtime error
+- Updated dependencies [66ef635]
+- Updated dependencies [7f31d77]
+- Updated dependencies [3aec1c4]
+- Updated dependencies [b892d63]
+  - @hyperlane-xyz/utils@22.0.0
+  - @hyperlane-xyz/provider-sdk@1.2.0
+
 ## 21.1.0
 
 ### Minor Changes
@@ -36,7 +611,6 @@
 ### Minor Changes
 
 - 11fa887: Upgrade TypeScript from 5.3.3 to 5.8.3 and compilation target to ES2023
-
   - Upgraded TypeScript from 5.3.3 to 5.8.3 across all packages
   - Updated compilation target from ES2022 to ES2023 (Node 16+ fully supported)
   - Converted internal const enums to 'as const' pattern for better compatibility

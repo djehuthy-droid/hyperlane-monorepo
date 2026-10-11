@@ -6,7 +6,7 @@ use eyre::Result;
 
 use hyperlane_core::{
     ChainCommunicationError, ContractSyncCursor, CursorAction, HyperlaneDomain,
-    HyperlaneSequenceAwareIndexerStoreReader, IndexMode, Indexed, LogMeta, SequenceAwareIndexer,
+    HyperlaneSequenceAwareIndexerStore, IndexMode, Indexed, LogMeta, SequenceAwareIndexer,
 };
 
 mod backward;
@@ -79,20 +79,23 @@ pub(crate) struct ForwardBackwardSequenceAwareSyncCursor<T> {
     forward: ForwardSequenceAwareSyncCursor<T>,
     backward: BackwardSequenceAwareSyncCursor<T>,
     last_direction: SyncDirection,
+    idle_sleep_duration: Duration,
 }
 
 impl<T: Debug + Indexable + Clone + Sync + Send + 'static>
     ForwardBackwardSequenceAwareSyncCursor<T>
 {
     /// Construct a new contract sync helper.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         domain: &HyperlaneDomain,
         metrics: Arc<CursorMetrics>,
         latest_sequence_querier: Arc<dyn SequenceAwareIndexer<T>>,
-        store: Arc<dyn HyperlaneSequenceAwareIndexerStoreReader<T>>,
+        store: Arc<dyn HyperlaneSequenceAwareIndexerStore<T>>,
         chunk_size: u32,
         lowest_block_height_or_sequence: i64,
         mode: IndexMode,
+        idle_sleep_duration: Duration,
     ) -> Result<Self> {
         let (sequence_count, tip) = latest_sequence_querier
             .latest_sequence_count_and_tip()
@@ -114,10 +117,16 @@ impl<T: Debug + Indexable + Clone + Sync + Send + 'static>
             metrics_data.clone(),
         );
 
+        let persisted_progress = if matches!(mode, IndexMode::Block) {
+            store.retrieve_backward_cursors().await?
+        } else {
+            Vec::new()
+        };
         let params = BackwardSequenceAwareSyncCursorParams {
             chunk_size,
             latest_sequence_querier: latest_sequence_querier.clone(),
             lowest_block_height_or_sequence,
+            persisted_progress,
             store,
             current_sequence_count: sequence_count,
             start_block: tip,
@@ -129,6 +138,7 @@ impl<T: Debug + Indexable + Clone + Sync + Send + 'static>
             forward: forward_cursor,
             backward: backward_cursor,
             last_direction: SyncDirection::Forward,
+            idle_sleep_duration,
         })
     }
 }
@@ -150,8 +160,7 @@ impl<T: Send + Sync + Clone + Debug + 'static + Indexable> ContractSyncCursor<T>
             self.last_direction = SyncDirection::Backward;
             return Ok((CursorAction::Query(backward_range), eta));
         }
-        // TODO: Define the sleep time from interval flag
-        return Ok((CursorAction::Sleep(Duration::from_secs(5)), eta));
+        return Ok((CursorAction::Sleep(self.idle_sleep_duration), eta));
     }
 
     fn latest_queried_block(&self) -> u32 {
@@ -172,12 +181,13 @@ impl<T: Send + Sync + Clone + Debug + 'static + Indexable> ContractSyncCursor<T>
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt::Debug, ops::RangeInclusive, sync::Arc};
+    use std::{fmt::Debug, ops::RangeInclusive, sync::Arc, time::Duration};
 
     use hyperlane_core::{
-        ChainResult, HyperlaneDomain, HyperlaneLogStore, HyperlaneSequenceAwareIndexerStoreReader,
-        HyperlaneWatermarkedLogStore, IndexMode, Indexed, Indexer, KnownHyperlaneDomain, LogMeta,
-        SequenceAwareIndexer, H256, H512,
+        BackwardCursorProgress, ChainResult, HyperlaneBackwardCursorStore, HyperlaneDomain,
+        HyperlaneLogStore, HyperlaneSequenceAwareIndexerStore,
+        HyperlaneSequenceAwareIndexerStoreReader, HyperlaneWatermarkedLogStore, IndexMode, Indexed,
+        Indexer, KnownHyperlaneDomain, LogMeta, SequenceAwareIndexer, H256, H512,
     };
 
     use crate::cursors::{CursorMetrics, ForwardBackwardSequenceAwareSyncCursor, Indexable};
@@ -204,6 +214,14 @@ mod tests {
         impl<T: Indexable + Send + Sync> HyperlaneSequenceAwareIndexerStoreReader<T> for Db<T> {
             async fn retrieve_by_sequence(&self, sequence: u32) -> eyre::Result<Option<T>>;
             async fn retrieve_log_block_number_by_sequence(&self, sequence: u32) -> eyre::Result<Option<u64>>;
+        }
+
+        #[async_trait::async_trait]
+        impl<T: Indexable + Send + Sync> HyperlaneBackwardCursorStore<T> for Db<T> {
+            async fn retrieve_backward_cursors(&self) -> eyre::Result<Vec<BackwardCursorProgress>>;
+            async fn store_backward_cursor(&self, progress: BackwardCursorProgress) -> eyre::Result<()>;
+            async fn reset_backward_cursor(&self, progress: BackwardCursorProgress) -> eyre::Result<()>;
+            async fn delete_backward_cursor(&self, sequence: u32) -> eyre::Result<()>;
         }
     }
 
@@ -256,6 +274,23 @@ mod tests {
                 &["event_type", "chain"],
             )
             .unwrap(),
+            cursor_sequence_gap_retries: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("cursor_sequence_gap_retries", "Sequence gap retries")
+                    .namespace("mock")
+                    .subsystem("cursor"),
+                &["event_type", "chain"],
+            )
+            .unwrap(),
+            cursor_sequence_gap_backoff_seconds: prometheus::IntGaugeVec::new(
+                prometheus::Opts::new(
+                    "cursor_sequence_gap_backoff_seconds",
+                    "Sequence gap backoff",
+                )
+                .namespace("mock")
+                .subsystem("cursor"),
+                &["event_type", "chain"],
+            )
+            .unwrap(),
         }
     }
 
@@ -265,7 +300,7 @@ mod tests {
 
         let metrics = mock_cursor_metrics();
 
-        let mut sequencer = MockSequenceAwareIndexerMock::new();
+        let mut sequencer = MockSequenceAwareIndexerMock::<H256>::new();
 
         sequencer
             .expect_latest_sequence_count_and_tip()
@@ -283,7 +318,7 @@ mod tests {
         let lowest_block_height_or_sequence: i64 = -10;
         let mode = IndexMode::Sequence;
 
-        let store_arc: Arc<dyn HyperlaneSequenceAwareIndexerStoreReader<H256>> = Arc::new(store);
+        let store_arc: Arc<dyn HyperlaneSequenceAwareIndexerStore<H256>> = Arc::new(store);
 
         let cursor = ForwardBackwardSequenceAwareSyncCursor::new(
             &domain,
@@ -293,6 +328,7 @@ mod tests {
             chunk_size,
             lowest_block_height_or_sequence,
             mode,
+            Duration::from_secs(5),
         )
         .await
         .expect("Failed to instantiate ForwardBackwardSequenceAwareSyncCursor");
@@ -300,6 +336,44 @@ mod tests {
         assert_eq!(
             cursor.backward.lowest_block_height_or_sequence,
             lowest_block_height_or_sequence
+        );
+    }
+
+    #[tokio::test]
+    async fn restores_backward_block_progress() {
+        let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+        let mut sequencer = MockSequenceAwareIndexerMock::<H256>::new();
+        sequencer
+            .expect_latest_sequence_count_and_tip()
+            .returning(|| Ok((Some(100), 1_000)));
+
+        let progress = BackwardCursorProgress {
+            sequence: 99,
+            block: 500,
+        };
+        let mut store = MockDb::new();
+        store.expect_retrieve_by_sequence().returning(|_| Ok(None));
+        store
+            .expect_retrieve_backward_cursors()
+            .once()
+            .return_once(move || Ok(vec![progress]));
+
+        let mut cursor = ForwardBackwardSequenceAwareSyncCursor::new(
+            &domain,
+            Arc::new(mock_cursor_metrics()),
+            Arc::new(sequencer),
+            Arc::new(store),
+            20,
+            0,
+            IndexMode::Block,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("restore backward cursor");
+
+        assert_eq!(
+            cursor.backward.get_next_range().await.unwrap(),
+            Some(480..=500)
         );
     }
 }

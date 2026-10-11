@@ -153,12 +153,19 @@ pub trait PendingOperation: Send + Sync + Debug + TryBatchAs<HyperlaneMessage> {
     /// returning `NotReady` if it is too early and matters.
     fn next_attempt_after(&self) -> Option<Instant>;
 
+    /// Whether this operation is ready to be attempted.
+    fn is_ready(&self) -> bool {
+        self.next_attempt_after()
+            .is_none_or(|t| Instant::now() >= t)
+    }
+
     /// Set the next time this operation should be attempted.
     fn set_next_attempt_after(&mut self, delay: Duration);
 
     /// Reset the number of attempts this operation has made, causing it to be
     /// retried immediately.
-    fn reset_attempts(&mut self);
+    /// Reset attempts durably. Returns false when the reset could not be persisted.
+    fn reset_attempts(&mut self) -> bool;
 
     /// Set the number of times this operation has been retried.
     fn set_retries(&mut self, retries: u32);
@@ -170,6 +177,10 @@ pub trait PendingOperation: Send + Sync + Debug + TryBatchAs<HyperlaneMessage> {
     fn try_get_mailbox(&self) -> Option<Arc<dyn Mailbox>> {
         None
     }
+
+    /// Called immediately after the process tx for this operation is successfully submitted.
+    /// Default no-op; override for latency-sensitive follow-up work (e.g. UR reveal).
+    fn on_submitted_success(&self) {}
 
     /// Creates payload for the operation
     async fn payload(&self) -> ChainResult<Vec<u8>>;
@@ -296,9 +307,18 @@ pub enum ReprepareReason {
     #[strum(to_string = "Failed to retrieve payload uuid status by message id")]
     /// Failed to retrieve payload status by message id
     ErrorRetrievingPayloadStatus,
+    #[strum(to_string = "Failed to persist terminal message state")]
+    /// Failed to persist that a message reached a terminal outcome
+    ErrorPersistingTerminalMessage,
     #[strum(to_string = "Failed to create payload success criteria")]
     /// Failed to create payload success criteria
     ErrorCreatingPayloadSuccessCriteria,
+    #[strum(to_string = "Awaiting validator signatures")]
+    /// Validator quorum not yet reached — signatures are still being collected
+    AwaitingValidatorSignatures,
+    #[strum(to_string = "Awaiting ICA reveal commit confirmation")]
+    /// ICA reveal commit not yet confirmed on-chain; polling until visible
+    AwaitingIcaReveal,
 }
 
 #[derive(Display, Debug, Clone, Serialize, Deserialize, PartialEq)]

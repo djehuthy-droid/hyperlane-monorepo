@@ -2,14 +2,15 @@ import {
   CallData,
   InvokeTransactionReceiptResponse,
   ParsedEvents,
+  createAbiParser,
   events as eventsUtils,
 } from 'starknet';
 
-import { getCompiledContract } from '@hyperlane-xyz/starknet-core';
+import { getContractAbi } from '@hyperlane-xyz/starknet-core/runtime';
 import { Address, HexString, pollAsync } from '@hyperlane-xyz/utils';
 
 import { BaseStarknetAdapter } from '../../app/MultiProtocolApp.js';
-import { MultiProtocolProvider } from '../../providers/MultiProtocolProvider.js';
+import type { MultiProviderAdapter } from '../../providers/MultiProviderAdapter.js';
 import {
   ProviderType,
   StarknetJsTransactionReceipt,
@@ -28,15 +29,15 @@ export class StarknetCoreAdapter
 {
   constructor(
     public readonly chainName: ChainName,
-    public readonly multiProvider: MultiProtocolProvider,
+    public readonly multiProvider: MultiProviderAdapter,
     public readonly addresses: { mailbox: Address },
   ) {
     super(chainName, multiProvider, addresses);
   }
 
-  extractMessageIds(
+  async extractMessageIds(
     sourceTx: StarknetJsTransactionReceipt,
-  ): Array<{ messageId: string; destination: ChainName }> {
+  ): Promise<Array<{ messageId: string; destination: ChainName }>> {
     if (sourceTx.type !== ProviderType.Starknet) {
       throw new Error(
         `Unsupported provider type for StarknetCoreAdapter ${sourceTx.type}`,
@@ -45,7 +46,7 @@ export class StarknetCoreAdapter
 
     let parsedEvents: ParsedEvents = [];
     sourceTx.receipt.match({
-      success: (txR) => {
+      SUCCEEDED: (txR) => {
         const emittedEvents =
           (txR as InvokeTransactionReceiptResponse).events?.map((event) => {
             return {
@@ -57,12 +58,13 @@ export class StarknetCoreAdapter
           }) || [];
 
         if (emittedEvents.length === 0) return;
-        const mailboxAbi = getCompiledContract('mailbox').abi;
+        const mailboxAbi = getContractAbi('mailbox');
         parsedEvents = eventsUtils.parseEvents(
           emittedEvents,
           eventsUtils.getAbiEvents(mailboxAbi),
           CallData.getAbiStruct(mailboxAbi),
           CallData.getAbiEnum(mailboxAbi),
+          createAbiParser(mailboxAbi),
         );
       },
       _: () => {
@@ -123,5 +125,17 @@ export class StarknetCoreAdapter
     );
 
     return true;
+  }
+
+  async isDelivered(
+    messageId: HexString,
+    _blockTag?: string | number,
+  ): Promise<boolean> {
+    const mailboxContract = getStarknetMailboxContract(
+      this.addresses.mailbox,
+      this.getProvider(),
+    );
+    const result = await mailboxContract.call('delivered', [messageId]);
+    return Boolean(result);
   }
 }

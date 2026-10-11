@@ -11,15 +11,24 @@ export const TokenType = {
   collateralUri: 'collateralUri',
   collateralCctp: 'collateralCctp',
   collateralEverclear: 'collateralEverclear',
+  collateralDepositAddress: 'collateralDepositAddress',
+  collateralOft: 'collateralOft',
+  // Same-chain atomic local rebalancing bridge (bare ITokenBridge adapter)
+  atomicLocalRebalancing: 'atomicLocalRebalancing',
   native: 'native',
   nativeOpL2: 'nativeOpL2',
   nativeOpL1: 'nativeOpL1',
   ethEverclear: 'ethEverclear',
   // backwards compatible alias to native
   nativeScaled: 'nativeScaled',
+  // Canonical value for cross-collateral routing tokens
+  crossCollateral: 'crossCollateral',
+  unknown: 'unknown',
 } as const;
 
 export type TokenType = (typeof TokenType)[keyof typeof TokenType];
+
+export type DeployableTokenType = Exclude<TokenType, typeof TokenType.unknown>;
 
 // A token is defined movable collateral if its solidity contract implementation
 // is a subclass of MovableCollateralRouter
@@ -41,6 +50,12 @@ const isMovableCollateralTokenTypeMap = {
   [TokenType.syntheticUri]: false,
   [TokenType.ethEverclear]: false,
   [TokenType.collateralEverclear]: false,
+  [TokenType.collateralDepositAddress]: false,
+  [TokenType.collateralOft]: false,
+  // Bare ITokenBridge adapter, not a MovableCollateralRouter subclass
+  [TokenType.atomicLocalRebalancing]: false,
+  [TokenType.crossCollateral]: true, // CrossCollateralRouter extends HypERC20Collateral
+  [TokenType.unknown]: false,
 } as const;
 
 export type MovableTokenType = {
@@ -57,6 +72,18 @@ export function isMovableCollateralTokenType(type: TokenType): boolean {
   return !!isMovableCollateralTokenTypeMap[type];
 }
 
+const syntheticTokenTypes = new Set<TokenType>([
+  TokenType.synthetic,
+  TokenType.syntheticRebase,
+  TokenType.syntheticUri,
+]);
+
+export function isSyntheticTokenType(type: TokenType): boolean {
+  return syntheticTokenTypes.has(type);
+}
+
+export const MAX_GAS_OVERHEAD = 68_000;
+
 export const gasOverhead = (tokenType: TokenType): number => {
   switch (tokenType) {
     case TokenType.synthetic:
@@ -65,7 +92,7 @@ export const gasOverhead = (tokenType: TokenType): number => {
     case TokenType.nativeScaled:
       return 44_000;
     default:
-      return 68_000;
+      return MAX_GAS_OVERHEAD;
   }
 };
 

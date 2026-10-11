@@ -2,6 +2,7 @@ import { BigNumber, errors as EthersError, providers, utils } from 'ethers';
 import { Logger, pino } from 'pino';
 
 import {
+  isObjEmpty,
   raceWithContext,
   retryAsync,
   rootLogger,
@@ -17,15 +18,68 @@ import {
 } from '../../metadata/chainMetadataTypes.js';
 
 import { HyperlaneEtherscanProvider } from './HyperlaneEtherscanProvider.js';
-import { HyperlaneJsonRpcProvider } from './HyperlaneJsonRpcProvider.js';
+import {
+  HyperlaneJsonRpcProvider,
+  LogBlockRangeTooLargeError,
+} from './HyperlaneJsonRpcProvider.js';
+import {
+  getNestedJsonRpcError,
+  isCallExceptionWithTransientRpcError,
+} from './jsonRpcError.js';
 import { IProviderMethods, ProviderMethod } from './ProviderMethods.js';
+import { getMultiAddressLogs, isMultiAddressFilter } from './logFilters.js';
 import {
   ChainMetadataWithRpcConnectionInfo,
+  HyperlaneLogFilter,
   ProviderPerformResult,
   ProviderStatus,
   ProviderTimeoutResult,
+  RpcConfigWithConnectionInfo,
   SmartProviderOptions,
 } from './types.js';
+import { parseCustomRpcHeaders } from '../../utils/provider.js';
+
+function buildRpcConnections(
+  rawUrl: string,
+  existingConnection?: utils.ConnectionInfo,
+): {
+  url: string;
+  connection?: utils.ConnectionInfo;
+  redactedConnection?: utils.ConnectionInfo;
+} {
+  const { url, headers, redactedHeaders } = parseCustomRpcHeaders(rawUrl);
+  if (isObjEmpty(headers)) {
+    return {
+      url,
+      connection: existingConnection,
+      redactedConnection: existingConnection,
+    };
+  }
+
+  const baseConnection = existingConnection ?? { url };
+  const baseUrl = baseConnection.url === rawUrl ? url : baseConnection.url;
+  const baseHeaders = baseConnection.headers ?? {};
+
+  return {
+    url,
+    connection: {
+      ...baseConnection,
+      url: baseUrl,
+      headers: {
+        ...baseHeaders,
+        ...headers,
+      },
+    },
+    redactedConnection: {
+      ...baseConnection,
+      url: baseUrl,
+      headers: {
+        ...baseHeaders,
+        ...redactedHeaders,
+      },
+    },
+  };
+}
 
 export function getSmartProviderErrorMessage(errorMsg: string): string {
   return `${errorMsg}: RPC request failed. Check RPC validity. To override RPC URLs, see: https://docs.hyperlane.xyz/docs/deploy-hyperlane-troubleshooting#override-rpc-urls`;
@@ -41,6 +95,7 @@ const RPC_SERVER_ERRORS = [
 const RPC_BLOCKCHAIN_ERRORS = [
   EthersError.CALL_EXCEPTION,
   EthersError.INSUFFICIENT_FUNDS,
+  EthersError.INVALID_ARGUMENT, // Ethers decode failure (e.g., calling method on wrong contract type)
   EthersError.NETWORK_ERROR,
   EthersError.NONCE_EXPIRED,
   EthersError.NOT_IMPLEMENTED,
@@ -55,6 +110,27 @@ const DEFAULT_STAGGER_DELAY_MS = 1000; // 1 seconds
 const DEFAULT_PHASE2_WAIT_MULTIPLIER = 20;
 
 type HyperlaneProvider = HyperlaneEtherscanProvider | HyperlaneJsonRpcProvider;
+
+function getErrorMessage(error: unknown): string | undefined {
+  return error instanceof Error ? error.message : undefined;
+}
+
+function errorChainHasMessage(error: unknown, message: string): boolean {
+  let current = error;
+  while (current instanceof Error) {
+    if (getErrorMessage(current) === message) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+function isEmptyProviderResponse(error: unknown): boolean {
+  return errorChainHasMessage(error, 'Invalid response from provider');
+}
+
+function getMostDiagnosticUnhandledError(errors: Error[]): Error {
+  return errors.find(isEmptyProviderResponse) ?? errors[0];
+}
 
 export class BlockchainError extends Error {
   public readonly isRecoverable = false;
@@ -121,7 +197,23 @@ export class HyperlaneSmartProvider
 
     if (rpcUrls?.length) {
       this.rpcProviders = rpcUrls.map((rpcConfig) => {
-        const newProvider = new HyperlaneJsonRpcProvider(rpcConfig, network);
+        const existingConnection = (rpcConfig as RpcConfigWithConnectionInfo)
+          .connection;
+        const { url, connection, redactedConnection } = buildRpcConnections(
+          rpcConfig.http,
+          existingConnection,
+        );
+        const configWithRedactedHeaders: RpcConfigWithConnectionInfo = {
+          ...rpcConfig,
+          http: url,
+          connection: redactedConnection,
+        };
+        const newProvider = new HyperlaneJsonRpcProvider(
+          configWithRedactedHeaders,
+          network,
+          undefined,
+          connection,
+        );
         newProvider.supportedMethods.forEach((m) => supportedMethods.add(m));
         return newProvider;
       });
@@ -167,7 +259,12 @@ export class HyperlaneSmartProvider
       maxFeePerGas = block.baseFeePerGas.mul(2).add(maxPriorityFeePerGas);
     }
 
-    return { lastBaseFeePerGas, maxFeePerGas, maxPriorityFeePerGas, gasPrice };
+    return {
+      lastBaseFeePerGas,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      gasPrice,
+    };
   }
 
   static fromChainMetadata(
@@ -207,20 +304,49 @@ export class HyperlaneSmartProvider
     const allProviders = [...this.explorerProviders, ...this.rpcProviders];
     if (!allProviders.length) throw new Error('No providers available');
 
-    const supportedProviders = allProviders.filter((p) =>
-      p.supportedMethods.includes(method as ProviderMethod),
+    const isMultiAddressGetLogs =
+      method === ProviderMethod.GetLogs &&
+      Array.isArray(params?.filter?.address);
+    const supportedProviders = allProviders.filter(
+      (provider) =>
+        provider.supportedMethods.includes(method as ProviderMethod) &&
+        (!isMultiAddressGetLogs || !this.isExplorerProvider(provider)),
     );
     if (!supportedProviders.length)
-      throw new Error(`No providers available for method ${method}`);
+      throw new Error(
+        isMultiAddressGetLogs
+          ? 'No RPC providers available for multi-address getLogs'
+          : `No providers available for method ${method}`,
+      );
 
     this.requestCount += 1;
     const reqId = this.requestCount;
+
+    // SendTransaction must not be retried - it could cause duplicate submissions
+    if (method === ProviderMethod.SendTransaction) {
+      return this.performWithFallback(
+        method,
+        params,
+        supportedProviders,
+        reqId,
+      );
+    }
 
     return retryAsync(
       () => this.performWithFallback(method, params, supportedProviders, reqId),
       this.options?.maxRetries || DEFAULT_MAX_RETRIES,
       this.options?.baseRetryDelayMs || DEFAULT_BASE_RETRY_DELAY_MS,
     );
+  }
+
+  override async getLogs(
+    filter: HyperlaneLogFilter | Promise<HyperlaneLogFilter>,
+  ): Promise<providers.Log[]> {
+    const resolvedFilter = await filter;
+    if (!isMultiAddressFilter(resolvedFilter)) {
+      return super.getLogs(resolvedFilter);
+    }
+    return getMultiAddressLogs(this, resolvedFilter);
   }
 
   /**
@@ -295,10 +421,17 @@ export class HyperlaneSmartProvider
         params,
         reqId,
       );
-      const timeoutPromise = timeoutResult(
-        this.options?.fallbackStaggerMs || DEFAULT_STAGGER_DELAY_MS,
-      );
-      const result = await Promise.race([resultPromise, timeoutPromise]);
+      // SendTransaction must not race against a timeout - we must wait for the
+      // RPC response to avoid losing track of a submitted transaction
+      let result;
+      if (method === ProviderMethod.SendTransaction) {
+        result = await resultPromise;
+      } else {
+        const timeoutPromise = timeoutResult(
+          this.options?.fallbackStaggerMs || DEFAULT_STAGGER_DELAY_MS,
+        );
+        result = await Promise.race([resultPromise, timeoutPromise]);
+      }
 
       const providerMetadata = {
         providerIndex: pIndex,
@@ -321,14 +454,26 @@ export class HyperlaneSmartProvider
           break;
         case ProviderStatus.Error: {
           providerResultErrors.push(result.error);
+
+          // SendTransaction must never fall through to another provider - the tx
+          // may already be in a mempool even if the RPC returned a transient error.
+          if (method === ProviderMethod.SendTransaction) {
+            this.logger.debug(
+              { ...providerMetadata },
+              `SendTransaction error - not falling through to next provider`,
+            );
+            break providerLoop;
+          }
+
           // If this is a blockchain error, stop trying additional providers as it's a permanent failure
-          // Exception: CALL_EXCEPTION without revert data is likely an RPC issue, not a real revert
-          // Note: ethers sets data to "0x" when there's no actual revert data
+          // For CALL_EXCEPTION, we need to distinguish:
+          // 1. Real revert with data - permanent (has revert data like "0x08c379a0...")
+          // 2. Real revert without data - permanent (has nested error.error.code === 3 from JSON-RPC)
+          // 3. Empty return data decode failure - permanent (no nested error, ethers failed to decode "0x")
+          // 4. Actual RPC issue - transient (has nested error but not code 3)
           const errorCode = (result.error as any)?.code;
-          const revertData = (result.error as any)?.data;
-          const hasRevertData = !!revertData && revertData !== '0x';
           const isCallExceptionWithoutData =
-            errorCode === EthersError.CALL_EXCEPTION && !hasRevertData;
+            isCallExceptionWithTransientRpcError(result.error);
           const isPermanentBlockchainError =
             RPC_BLOCKCHAIN_ERRORS.includes(errorCode) &&
             !isCallExceptionWithoutData;
@@ -374,6 +519,7 @@ export class HyperlaneSmartProvider
         `All providers failed on chain ${
           this.network.name
         } for method ${method} and params ${JSON.stringify(params, null, 2)}`,
+        method,
       );
       throw new CombinedError();
     }
@@ -393,15 +539,21 @@ export class HyperlaneSmartProvider
         const CombinedError = this.getCombinedProviderError(
           [result, ...providerResultErrors],
           `All providers timed out on chain ${this.network.name} for method ${method}`,
+          method,
         );
         throw new CombinedError();
       }
       case ProviderStatus.Error: {
         const CombinedError = this.getCombinedProviderError(
-          [result.error, ...providerResultErrors],
+          [
+            result.error,
+            ...(result.otherErrors ?? []),
+            ...providerResultErrors,
+          ],
           `All providers failed on chain ${
             this.network.name
           } for method ${method} and params ${JSON.stringify(params, null, 2)}`,
+          method,
         );
         throw new CombinedError();
       }
@@ -460,18 +612,22 @@ export class HyperlaneSmartProvider
       }
     }
     // If reached, all providers finished unsuccessfully
+    // The first error to arrive stays `error`; the rest are returned in
+    // `otherErrors` so the caller can combine them rather than pick by latency.
+    const [firstError, ...otherErrors] = combinedErrors;
     return {
       status: ProviderStatus.Error,
-      // TODO combine errors
       error: combinedErrors.length
-        ? combinedErrors[0]
+        ? firstError
         : new Error('Unknown error from provider'),
+      otherErrors,
     };
   }
 
   protected getCombinedProviderError(
     errors: any[],
     fallbackMsg: string,
+    method: string,
   ): new () => Error {
     this.logger.debug(fallbackMsg);
     if (errors.length === 0) {
@@ -484,22 +640,60 @@ export class HyperlaneSmartProvider
 
     // Find blockchain errors, but exclude CALL_EXCEPTION without revert data (likely RPC issues)
     // Note: ethers sets data to "0x" when there's no actual revert data
-    const rpcBlockchainError = errors.find(
-      (e) =>
-        RPC_BLOCKCHAIN_ERRORS.includes(e.code) &&
-        !(
-          e.code === EthersError.CALL_EXCEPTION &&
-          (!e.data || e.data === '0x')
-        ),
-    );
+    // However, JSON-RPC error code 3 definitively indicates a contract revert (EIP-1474)
+    // Also, no nested error means ethers failed to decode empty return data - also permanent
+    const rpcBlockchainError = errors.find((e) => {
+      const errorCode = e?.code;
+      if (!errorCode || !RPC_BLOCKCHAIN_ERRORS.includes(errorCode)) {
+        return false;
+      }
+      if (errorCode !== EthersError.CALL_EXCEPTION) return true;
+      // For CALL_EXCEPTION, check if it's a real revert or decode failure
+      const hasRevertData = !!e.data && e.data !== '0x';
+      // Check for JSON-RPC error code 3. Ethers nesting varies and some
+      // providers put the JSON-RPC error only in the response body.
+      const jsonRpcErrorCode = getNestedJsonRpcError(e).code;
+      const isJsonRpcRevert = jsonRpcErrorCode === 3;
+      // No nested error means ethers failed to decode empty return data - permanent
+      const isEmptyReturnDecodeFailure = !e.error;
+      return hasRevertData || isJsonRpcRevert || isEmptyReturnDecodeFailure;
+    });
 
-    const rpcServerError = errors.find((e) =>
-      RPC_SERVER_ERRORS.includes(e.code),
+    const rpcServerError = errors.find(
+      (e) =>
+        (e?.code ? RPC_SERVER_ERRORS.includes(e.code) : false) ||
+        isCallExceptionWithTransientRpcError(e),
     );
 
     const timedOutError = errors.find(
-      (e) => e.status === ProviderStatus.Timeout,
+      (e) => e?.status === ProviderStatus.Timeout,
     );
+
+    // retryAsync reads the flag off the error it is handed and not off its
+    // cause, so a failure the producing layer declared unretryable has to carry
+    // it through this wrapper or perform() spends its whole retry budget, and
+    // the backoffs between the attempts, re-deriving the same answer. Only when
+    // every provider says so: one refusing does not stop another from
+    // succeeding on a second attempt.
+    //
+    // Which of them becomes the cause decides what a caller reading the chain
+    // does next, so it cannot be left to the order the providers happen to sit
+    // in. A range rejection is the one refusal here that is still actionable:
+    // `getLogsFromRpc` answers it by halving its chunk, which may get under the
+    // cap of whichever provider raised it. Every other refusal in this branch,
+    // a history floor above all, holds at any chunk size. Surfacing the range
+    // rejection therefore costs nothing where the read was doomed anyway, and
+    // preferring a floor over it gives up a read that would have completed.
+    //
+    // Matched by type rather than through `isBlockRangeError` in
+    // `rpc/evm/utils.ts`, which cannot be imported here without an import
+    // cycle. Its message matching is what covers external providers, and none
+    // of those set `isRecoverable`, so inside this branch the type check it
+    // also performs is the whole of what applies.
+    const nonRecoverableError = errors.every((e) => e?.isRecoverable === false)
+      ? (errors.find((e) => e instanceof LogBlockRangeTooLargeError) ??
+        errors[0])
+      : undefined;
 
     if (rpcBlockchainError) {
       // All blockchain errors are non-retryable and take priority
@@ -510,13 +704,30 @@ export class HyperlaneSmartProvider
           });
         }
       };
+    } else if (nonRecoverableError) {
+      return class extends Error {
+        readonly isRecoverable = false;
+
+        constructor() {
+          super(fallbackMsg, { cause: nonRecoverableError });
+        }
+      };
     } else if (rpcServerError) {
       return class extends Error {
         constructor() {
           super(
-            rpcServerError.error?.message ?? // Server errors sometimes will not have an error.message
+            getNestedJsonRpcError(rpcServerError).message ??
+              rpcServerError.error?.message ?? // Server errors sometimes will not have an error.message
               getSmartProviderErrorMessage(rpcServerError.code),
-            { cause: rpcServerError },
+            {
+              // An empty response from one provider is the more diagnostic
+              // answer whatever else failed alongside it, matching the
+              // timeout branch below.
+              cause:
+                errors.find(
+                  (e) => e instanceof Error && isEmptyProviderResponse(e),
+                ) ?? rpcServerError,
+            },
           );
         }
       };
@@ -524,17 +735,34 @@ export class HyperlaneSmartProvider
       return class extends Error {
         constructor() {
           super(fallbackMsg, {
-            cause: timedOutError,
+            cause:
+              errors.find(
+                (e) => e instanceof Error && isEmptyProviderResponse(e),
+              ) ?? timedOutError,
           });
         }
       };
     } else {
-      this.logger.error(
-        'Unhandled error case in combined provider error handler',
-      );
+      if (
+        method !== ProviderMethod.Call ||
+        !errors.every(isEmptyProviderResponse)
+      ) {
+        this.logger.warn(
+          {
+            errors: errors.map((e) => ({
+              code: e?.code,
+              message: e?.message,
+              name: e?.name,
+            })),
+          },
+          'Unhandled error case in combined provider error handler',
+        );
+      }
       return class extends Error {
         constructor() {
-          super(fallbackMsg);
+          super(fallbackMsg, {
+            cause: getMostDiagnosticUnhandledError(errors),
+          });
         }
       };
     }

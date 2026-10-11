@@ -24,10 +24,13 @@ ethers.workspace = true
 eyre.workspace = true
 futures.workspace = true
 futures-util.workspace = true
+hyper.workspace = true
 itertools.workspace = true
 maplit.workspace = true
+moka = { workspace = true, features = ["future"] }
 num-derive.workspace = true
 num-traits.workspace = true
+parking_lot.workspace = true
 prometheus.workspace = true
 rand.workspace = true
 regex.workspace = true
@@ -40,6 +43,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = [
     "rt",
     "macros",
+    "net",
     "parking_lot",
     "rt-multi-thread",
 ] }
@@ -47,19 +51,27 @@ tokio-metrics.workspace = true
 tracing-futures.workspace = true
 tracing.workspace = true
 typetag.workspace = true
+url.workspace = true
 uuid.workspace = true
+tower-http = { version = "0.6", features = ["cors"] }
 
 hyperlane-base = { path = "../../hyperlane-base", features = ["test-utils"] }
 hyperlane-core = { path = "../../hyperlane-core", features = [
     "agent",
     "async",
+    "matching-list",
 ] }
+hyperlane-aleo = { path = "../../chains/hyperlane-aleo", optional = true }
 hyperlane-ethereum = { path = "../../chains/hyperlane-ethereum" }
+hyperlane-sealevel = { path = "../../chains/hyperlane-sealevel" }
+solana-sdk.workspace = true
+hex.workspace = true
 hyperlane-metric = { path = "../../hyperlane-metric" }
 hyperlane-operation-verifier = { path = "../../applications/hyperlane-operation-verifier" }
 lander = { path = "../../lander" }
 
 [dev-dependencies]
+tokio-tungstenite.workspace = true
 axum = { workspace = true, features = ["macros"] }
 http-body-util.workspace = true
 once_cell.workspace = true
@@ -70,7 +82,7 @@ tracing-test.workspace = true
 tracing-subscriber.workspace = true
 hyperlane-test = { path = "../../hyperlane-test" }
 hyperlane-base = { path = "../../hyperlane-base", features = ["test-utils"] }
-hyperlane-core = { path = "../../hyperlane-core", features = ["agent", "async", "test-utils"] }
+hyperlane-core = { path = "../../hyperlane-core", features = ["agent", "async", "matching-list", "test-utils"] }
 ethers-prometheus = { path = "../../ethers-prometheus", features = ["serde"] }
 tempfile.workspace = true
 
@@ -80,5 +92,5 @@ oneline-errors = ["hyperlane-base/oneline-errors"]
 color-eyre = ["hyperlane-base/color-eyre"]
 test-utils = ["hyperlane-base/test-utils"]
 memory-profiling = ["dep:ctrlc", "dep:dhat"]
-aleo = ["hyperlane-base/aleo", "lander/aleo"]
-kaspa = ["hyperlane-base/kaspa"]
+aleo = ["dep:hyperlane-aleo", "hyperlane-base/aleo", "lander/aleo"]
+kaspa = ["hyperlane-base/kaspa", "lander/kaspa"]

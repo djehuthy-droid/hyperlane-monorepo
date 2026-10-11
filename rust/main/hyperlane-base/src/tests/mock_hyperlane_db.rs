@@ -1,10 +1,13 @@
 use std::fmt::Debug;
 
-use crate::db::{DbResult, HyperlaneDb, InterchainGasExpenditureData, InterchainGasPaymentData};
+use crate::db::{
+    DbResult, HyperlaneDb, InterchainGasExpenditureData, InterchainGasPaymentData,
+    PendingMessageRetryState,
+};
 use hyperlane_core::{
     identifiers::UniqueIdentifier, GasPaymentKey, HyperlaneDomain, HyperlaneMessage,
     HyperlaneProvider, InterchainGasPayment, InterchainGasPaymentMeta, MerkleTreeInsertion,
-    PendingOperationStatus, H256,
+    PendingOperationStatus, H256, H512,
 };
 
 mockall::mock! {
@@ -21,6 +24,7 @@ mockall::mock! {
 
     impl HyperlaneDb for HyperlaneDb {
         fn retrieve_highest_seen_message_nonce(&self) -> DbResult<Option<u32>>;
+        fn retrieve_highest_message_nonce(&self) -> DbResult<Option<u32>>;
         fn retrieve_message_by_nonce(&self, nonce: u32) -> DbResult<Option<HyperlaneMessage>>;
         fn retrieve_processed_by_nonce(&self, nonce: &u32) -> DbResult<Option<bool>>;
         fn domain(&self) -> &HyperlaneDomain;
@@ -95,6 +99,21 @@ mockall::mock! {
             &self,
             message_id: &H256,
         ) -> DbResult<Option<u32>>;
+        fn store_pending_message_retry_state_by_message_id(
+            &self,
+            message_id: &H256,
+            state: &PendingMessageRetryState,
+        ) -> DbResult<()>;
+        fn store_pending_message_retry_state_and_status_by_message_id(
+            &self,
+            message_id: &H256,
+            state: &PendingMessageRetryState,
+            status: &PendingOperationStatus,
+        ) -> DbResult<()>;
+        fn retrieve_pending_message_retry_state_by_message_id(
+            &self,
+            message_id: &H256,
+        ) -> DbResult<Option<PendingMessageRetryState>>;
         fn store_merkle_tree_insertion_by_leaf_index(
             &self,
             leaf_index: &u32,
@@ -123,5 +142,7 @@ mockall::mock! {
         fn retrieve_highest_seen_message_nonce_number(&self) -> DbResult<Option<u32>>;
         fn store_payload_uuids_by_message_id(&self, message_id: &H256, payload_uuids: Vec<UniqueIdentifier>) -> DbResult<()>;
         fn retrieve_payload_uuids_by_message_id(&self, message_id: &H256) -> DbResult<Option<Vec<UniqueIdentifier>>>;
+        fn store_dispatched_tx_hash_by_message_id(&self, message_id: &H256, tx_hash: &H512) -> DbResult<()>;
+        fn retrieve_dispatched_tx_hash_by_message_id(&self, message_id: &H256) -> DbResult<Option<H512>>;
     }
 }

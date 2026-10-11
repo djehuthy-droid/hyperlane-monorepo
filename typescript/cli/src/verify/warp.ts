@@ -3,11 +3,12 @@ import { type ContractFactory } from 'ethers';
 import { buildArtifact } from '@hyperlane-xyz/core/buildArtifact.js';
 import {
   type ChainMap,
-  EvmERC20WarpRouteReader,
+  type DeployableTokenType,
+  EvmWarpRouteReader,
   ExplorerLicenseType,
   type MultiProvider,
   PostDeploymentContractVerifier,
-  type TokenType,
+  TokenType,
   type VerificationInput,
   type WarpCoreConfig,
   hypERC20contracts,
@@ -18,7 +19,7 @@ import {
 } from '@hyperlane-xyz/sdk';
 import { type Address, assert, objFilter } from '@hyperlane-xyz/utils';
 
-import { requestAndSaveApiKeys } from '../context/context.js';
+import { requestAndSaveApiKeys } from '../context/apiKeys.js';
 import { type CommandContext } from '../context/types.js';
 import { logBlue, logGray, logGreen } from '../logger.js';
 
@@ -113,24 +114,27 @@ export async function runVerifyWarpRoute({
   return logGreen('Finished contract verification');
 }
 
+type VerifiableTokenType = Exclude<
+  DeployableTokenType,
+  typeof TokenType.syntheticUri | typeof TokenType.collateralUri
+>;
+
 async function getWarpRouteFactory(
   multiProvider: MultiProvider,
   chainName: string,
   warpRouteAddress: Address,
 ): Promise<{
   factory: ContractFactory;
-  tokenType: Exclude<
-    TokenType,
-    typeof TokenType.syntheticUri | typeof TokenType.collateralUri
-  >;
+  tokenType: VerifiableTokenType;
 }> {
-  const warpRouteReader = new EvmERC20WarpRouteReader(multiProvider, chainName);
-  const tokenType = (await warpRouteReader.deriveTokenType(
-    warpRouteAddress,
-  )) as Exclude<
-    TokenType,
-    typeof TokenType.syntheticUri | typeof TokenType.collateralUri
-  >;
+  const warpRouteReader = new EvmWarpRouteReader(multiProvider, chainName);
+  const tokenType = await warpRouteReader.deriveTokenType(warpRouteAddress);
+  assert(
+    tokenType !== TokenType.unknown &&
+      tokenType !== TokenType.syntheticUri &&
+      tokenType !== TokenType.collateralUri,
+    `Cannot verify warp route with token type: ${tokenType}`,
+  );
 
   const factory = objFilter(
     hypERC20factories,

@@ -1,0 +1,807 @@
+import { expect } from 'chai';
+import { pino } from 'pino';
+import { type Address, type Hex, verifyTypedData } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+
+import {
+  DEFAULT_ROUTER_KEY,
+  type DerivedTokenRouterConfig,
+  FeeQuotingCommand,
+  HookType,
+  TokenFeeType,
+} from '@hyperlane-xyz/sdk';
+import { ProtocolType } from '@hyperlane-xyz/provider-sdk';
+
+import type { QuoteMode } from '../../src/config.js';
+import {
+  EIP712_DOMAIN,
+  SIGNED_QUOTE_TYPES,
+  ZERO_ADDRESS,
+} from '../../src/constants.js';
+import { EvmQuoteService } from '../../src/services/evmQuoteService.js';
+import { QuoteService } from '../../src/services/quoteService.js';
+
+// Foundry/Hardhat default test account #0
+const TEST_PRIVATE_KEY =
+  '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80' as Hex;
+const TEST_ACCOUNT = privateKeyToAccount(TEST_PRIVATE_KEY);
+const TEST_SIGNER = TEST_ACCOUNT.address;
+
+const QUOTED_CALLS = '0x4444444444444444444444444444444444444444' as Address;
+const FEE_CONTRACT = '0x1111111111111111111111111111111111111111' as Address;
+const IGP_ADDRESS = '0x2222222222222222222222222222222222222222' as Address;
+const FEE_TOKEN = '0x3333333333333333333333333333333333333333' as Address;
+const ROUTER = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as Address;
+const RECIPIENT =
+  '0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' as Hex;
+const SALT =
+  '0x0000000000000000000000000000000000000000000000000000000000000001' as Hex;
+const DESTINATION = 42161;
+
+const mockMultiProvider = {
+  getChainName: (d: number) => (d === 42161 ? 'arbitrum' : `chain-${d}`),
+  getChainId: () => 1,
+} as any;
+
+const mockDerivedConfig = {
+  hook: {
+    type: HookType.INTERCHAIN_GAS_PAYMASTER,
+    address: IGP_ADDRESS,
+    owner: ZERO_ADDRESS,
+    beneficiary: ZERO_ADDRESS,
+    oracleKey: ZERO_ADDRESS,
+    overhead: {},
+    oracleConfig: {},
+    quoteSigners: [TEST_SIGNER],
+  },
+  tokenFee: {
+    type: TokenFeeType.OffchainQuotedLinearFee,
+    address: FEE_CONTRACT,
+    token: FEE_TOKEN,
+    owner: ZERO_ADDRESS,
+    maxFee: 0n,
+    halfAmount: 1n,
+    bps: 0n,
+    quoteSigners: [TEST_SIGNER],
+  },
+} as any;
+
+interface TestServiceOverrides {
+  /** Per-route derivedConfig override (replaces `mockDerivedConfig`). */
+  derivedConfig?: any;
+  quoteMode?: QuoteMode;
+  quoteExpiry?: number;
+  transientBuffer?: number;
+}
+
+function createTestService(overrides: TestServiceOverrides = {}): QuoteService {
+  const logger = pino({ level: 'silent' });
+  const evm = EvmQuoteService.fromState({
+    signerKey: TEST_PRIVATE_KEY,
+    logger,
+    routes: [
+      {
+        origin: 'ethereum',
+        warpRouter: ROUTER,
+        chainId: 1,
+        quotedCallsAddress: QUOTED_CALLS,
+        feeToken: FEE_TOKEN,
+        derivedConfig: (overrides.derivedConfig ??
+          mockDerivedConfig) as DerivedTokenRouterConfig,
+      },
+    ],
+  });
+  return new QuoteService({
+    services: new Map([[ProtocolType.Ethereum, evm]]),
+    protocolByChain: new Map([['ethereum', ProtocolType.Ethereum]]),
+    quoteMode: overrides.quoteMode ?? 'transient',
+    quoteExpiry: overrides.quoteExpiry ?? 300,
+    transientBuffer: overrides.transientBuffer ?? 240,
+    multiProvider: mockMultiProvider,
+    logger,
+  });
+}
+
+describe('QuoteService', () => {
+  describe('transient mode', () => {
+    let service: QuoteService;
+    beforeEach(() => {
+      service = createTestService();
+    });
+
+    it('returns warp fee + IGP quotes', async () => {
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      expect(res.quotes).to.be.an('array').with.lengthOf(2);
+    });
+
+    it('expiry equals issuedAt', async () => {
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      for (const q of res.quotes) {
+        expect(q.quote.expiry).to.equal(q.quote.issuedAt);
+      }
+    });
+
+    it('submitter is QuotedCalls address', async () => {
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      for (const q of res.quotes) {
+        expect(q.quote.submitter).to.equal(QUOTED_CALLS);
+      }
+    });
+
+    it('uses provided salt', async () => {
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      for (const q of res.quotes) {
+        expect(q.quote.salt).to.equal(SALT);
+      }
+    });
+
+    it('ICA returns IGP only', async () => {
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.CallRemoteWithOverrides,
+        ROUTER,
+        DESTINATION,
+        SALT,
+      );
+      expect(res.quotes).to.have.lengthOf(1);
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        IGP_ADDRESS.toLowerCase(),
+      );
+    });
+  });
+
+  describe('standing mode', () => {
+    let service: QuoteService;
+    beforeEach(() => {
+      service = createTestService({ quoteMode: 'standing', quoteExpiry: 300 });
+    });
+
+    it('expiry > issuedAt', async () => {
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      for (const q of res.quotes) {
+        expect(q.quote.expiry).to.be.greaterThan(q.quote.issuedAt);
+      }
+    });
+
+    it('submitter is address(0)', async () => {
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      for (const q of res.quotes) {
+        expect(q.quote.submitter).to.equal(ZERO_ADDRESS);
+      }
+    });
+
+    it('uses provided salt', async () => {
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      for (const q of res.quotes) {
+        expect(q.quote.salt).to.equal(SALT);
+      }
+    });
+  });
+
+  describe('signature', () => {
+    it('is valid EIP-712', async () => {
+      const service = createTestService();
+      const res = await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      const { quote, signature } = res.quotes[0];
+      const valid = await verifyTypedData({
+        address: TEST_ACCOUNT.address,
+        domain: {
+          ...EIP712_DOMAIN,
+          chainId: 1n,
+          verifyingContract: FEE_CONTRACT,
+        },
+        types: SIGNED_QUOTE_TYPES,
+        primaryType: 'SignedQuote',
+        message: {
+          context: quote.context,
+          data: quote.data,
+          issuedAt: quote.issuedAt,
+          expiry: quote.expiry,
+          salt: quote.salt,
+          submitter: quote.submitter,
+        },
+        signature,
+      });
+      expect(valid).to.be.true;
+    });
+  });
+
+  describe('routing resolution', () => {
+    const DEST_IGP = '0x7777777777777777777777777777777777777777' as Address;
+    const FALLBACK_IGP =
+      '0x8888888888888888888888888888888888888888' as Address;
+    const DEST_FEE = '0x9999999999999999999999999999999999999999' as Address;
+
+    function makeIgpConfig(address: Address) {
+      return {
+        type: HookType.INTERCHAIN_GAS_PAYMASTER,
+        address,
+        owner: ZERO_ADDRESS,
+        beneficiary: ZERO_ADDRESS,
+        oracleKey: ZERO_ADDRESS,
+        overhead: {},
+        oracleConfig: {},
+        quoteSigners: [TEST_SIGNER],
+      };
+    }
+
+    function svcWithHook(hook: any) {
+      return createTestService({
+        derivedConfig: { ...mockDerivedConfig, hook },
+      });
+    }
+
+    it('resolves destination-specific IGP from routing hook', async () => {
+      const svc = svcWithHook({
+        type: HookType.ROUTING,
+        address: '0x0000000000000000000000000000000000000001',
+        owner: ZERO_ADDRESS,
+        domains: { arbitrum: makeIgpConfig(DEST_IGP) },
+      });
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.CallRemoteWithOverrides,
+        ROUTER,
+        DESTINATION,
+        SALT,
+      );
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        DEST_IGP.toLowerCase(),
+      );
+    });
+
+    it('uses fallback hook when destination not in domains', async () => {
+      const svc = svcWithHook({
+        type: HookType.FALLBACK_ROUTING,
+        address: '0x0000000000000000000000000000000000000001',
+        owner: ZERO_ADDRESS,
+        domains: {},
+        fallback: makeIgpConfig(FALLBACK_IGP),
+      });
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.CallRemoteWithOverrides,
+        ROUTER,
+        DESTINATION,
+        SALT,
+      );
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        FALLBACK_IGP.toLowerCase(),
+      );
+    });
+
+    it('finds IGP inside aggregation hook', async () => {
+      const svc = svcWithHook({
+        type: HookType.AGGREGATION,
+        address: '0x0000000000000000000000000000000000000001',
+        hooks: [
+          {
+            type: HookType.MERKLE_TREE,
+            address: '0x0000000000000000000000000000000000000002',
+          },
+          makeIgpConfig(DEST_IGP),
+        ],
+      });
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.CallRemoteWithOverrides,
+        ROUTER,
+        DESTINATION,
+        SALT,
+      );
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        DEST_IGP.toLowerCase(),
+      );
+    });
+
+    it('resolves CCRF default fee for transferRemote', async () => {
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          tokenFee: {
+            type: TokenFeeType.CrossCollateralRoutingFee,
+            address: FEE_CONTRACT,
+            token: FEE_TOKEN,
+            owner: ZERO_ADDRESS,
+            feeContracts: {
+              arbitrum: {
+                [DEFAULT_ROUTER_KEY]: {
+                  type: TokenFeeType.OffchainQuotedLinearFee,
+                  address: DEST_FEE,
+                  token: FEE_TOKEN,
+                  owner: ZERO_ADDRESS,
+                  maxFee: 0n,
+                  halfAmount: 1n,
+                  bps: 0n,
+                  quoteSigners: [TEST_SIGNER],
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      const feeQuote = res.quotes.find(
+        (q) => q.quoter.toLowerCase() === DEST_FEE.toLowerCase(),
+      );
+      expect(feeQuote).to.exist;
+    });
+
+    it('resolves CCRF router-specific fee for transferRemoteTo', async () => {
+      const ROUTER_FEE =
+        '0x6666666666666666666666666666666666666666' as Address;
+      const TARGET_ROUTER =
+        '0x000000000000000000000000cccccccccccccccccccccccccccccccccccccccc' as Hex;
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          tokenFee: {
+            type: TokenFeeType.CrossCollateralRoutingFee,
+            address: FEE_CONTRACT,
+            token: FEE_TOKEN,
+            owner: ZERO_ADDRESS,
+            feeContracts: {
+              arbitrum: {
+                [DEFAULT_ROUTER_KEY]: {
+                  type: TokenFeeType.OffchainQuotedLinearFee,
+                  address: DEST_FEE,
+                  token: FEE_TOKEN,
+                  owner: ZERO_ADDRESS,
+                  maxFee: 0n,
+                  halfAmount: 1n,
+                  bps: 0n,
+                  quoteSigners: [TEST_SIGNER],
+                },
+                [TARGET_ROUTER]: {
+                  type: TokenFeeType.OffchainQuotedLinearFee,
+                  address: ROUTER_FEE,
+                  token: FEE_TOKEN,
+                  owner: ZERO_ADDRESS,
+                  maxFee: 0n,
+                  halfAmount: 1n,
+                  bps: 0n,
+                  quoteSigners: [TEST_SIGNER],
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemoteTo,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+        TARGET_ROUTER,
+      );
+      const feeQuote = res.quotes.find(
+        (q) => q.quoter.toLowerCase() === ROUTER_FEE.toLowerCase(),
+      );
+      expect(feeQuote).to.exist;
+    });
+
+    it('resolves CCRF router-specific fee for an uppercase-hex targetRouter', async () => {
+      const ROUTER_FEE =
+        '0x6666666666666666666666666666666666666666' as Address;
+      const TARGET_ROUTER =
+        '0x000000000000000000000000cccccccccccccccccccccccccccccccccccccccc' as Hex;
+      const TARGET_ROUTER_UPPER =
+        '0x000000000000000000000000CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC' as Hex;
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          tokenFee: {
+            type: TokenFeeType.CrossCollateralRoutingFee,
+            address: FEE_CONTRACT,
+            token: FEE_TOKEN,
+            owner: ZERO_ADDRESS,
+            feeContracts: {
+              arbitrum: {
+                [DEFAULT_ROUTER_KEY]: {
+                  type: TokenFeeType.OffchainQuotedLinearFee,
+                  address: DEST_FEE,
+                  token: FEE_TOKEN,
+                  owner: ZERO_ADDRESS,
+                  maxFee: 0n,
+                  halfAmount: 1n,
+                  bps: 0n,
+                  quoteSigners: [TEST_SIGNER],
+                },
+                [TARGET_ROUTER]: {
+                  type: TokenFeeType.OffchainQuotedLinearFee,
+                  address: ROUTER_FEE,
+                  token: FEE_TOKEN,
+                  owner: ZERO_ADDRESS,
+                  maxFee: 0n,
+                  halfAmount: 1n,
+                  bps: 0n,
+                  quoteSigners: [TEST_SIGNER],
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemoteTo,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+        TARGET_ROUTER_UPPER,
+      );
+      const feeQuote = res.quotes.find(
+        (q) => q.quoter.toLowerCase() === ROUTER_FEE.toLowerCase(),
+      );
+      expect(feeQuote, 'uppercase targetRouter should hit the specific leaf').to
+        .exist;
+    });
+
+    it('falls back to CCRF default when targetRouter not in routers', async () => {
+      const UNKNOWN_ROUTER =
+        '0x000000000000000000000000dddddddddddddddddddddddddddddddddddddddd' as Hex;
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          tokenFee: {
+            type: TokenFeeType.CrossCollateralRoutingFee,
+            address: FEE_CONTRACT,
+            token: FEE_TOKEN,
+            owner: ZERO_ADDRESS,
+            feeContracts: {
+              arbitrum: {
+                [DEFAULT_ROUTER_KEY]: {
+                  type: TokenFeeType.OffchainQuotedLinearFee,
+                  address: DEST_FEE,
+                  token: FEE_TOKEN,
+                  owner: ZERO_ADDRESS,
+                  maxFee: 0n,
+                  halfAmount: 1n,
+                  bps: 0n,
+                  quoteSigners: [TEST_SIGNER],
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemoteTo,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+        UNKNOWN_ROUTER,
+      );
+      const feeQuote = res.quotes.find(
+        (q) => q.quoter.toLowerCase() === DEST_FEE.toLowerCase(),
+      );
+      expect(feeQuote).to.exist;
+    });
+
+    it('skips warp fee quote when destination not in RoutingFee.feeContracts', async () => {
+      // RoutingFee doesn't extend AbstractOffchainQuoter on-chain so it has no
+      // `quoteSigners` of its own — when the destination isn't in the routing
+      // map, there's no offchain-quoted leaf to sign against and the server
+      // must skip the warp quote (returning only the IGP quote).
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          tokenFee: {
+            type: TokenFeeType.RoutingFee,
+            address: FEE_CONTRACT,
+            token: FEE_TOKEN,
+            owner: ZERO_ADDRESS,
+            feeContracts: {
+              optimism: {
+                type: TokenFeeType.OffchainQuotedLinearFee,
+                address: DEST_FEE,
+                token: FEE_TOKEN,
+                owner: ZERO_ADDRESS,
+                maxFee: 0n,
+                halfAmount: 1n,
+                bps: 0n,
+                quoteSigners: [TEST_SIGNER],
+              },
+            },
+          },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      const feeQuote = res.quotes.find(
+        (q) => q.quoter.toLowerCase() === FEE_CONTRACT.toLowerCase(),
+      );
+      expect(feeQuote).to.not.exist;
+      // IGP quote is still produced.
+      expect(res.quotes).to.have.lengthOf(1);
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        IGP_ADDRESS.toLowerCase(),
+      );
+    });
+  });
+
+  describe('signer authorization', () => {
+    const OTHER_SIGNER =
+      '0x5555555555555555555555555555555555555555' as Address;
+
+    it('skips IGP quote when quoteSigners is empty (not upgraded)', async () => {
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          hook: { ...mockDerivedConfig.hook, quoteSigners: [] },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      expect(res.quotes).to.have.lengthOf(1);
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        FEE_CONTRACT.toLowerCase(),
+      );
+    });
+
+    it('skips IGP quote when quoteSigners is undefined (not upgraded)', async () => {
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          hook: { ...mockDerivedConfig.hook, quoteSigners: undefined },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      expect(res.quotes).to.have.lengthOf(1);
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        FEE_CONTRACT.toLowerCase(),
+      );
+    });
+
+    it('skips warp fee quote when signer not authorized', async () => {
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          tokenFee: {
+            ...mockDerivedConfig.tokenFee,
+            quoteSigners: [OTHER_SIGNER],
+          },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      expect(res.quotes).to.have.lengthOf(1);
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        IGP_ADDRESS.toLowerCase(),
+      );
+    });
+
+    it('skips IGP quote when signer not authorized', async () => {
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          hook: { ...mockDerivedConfig.hook, quoteSigners: [OTHER_SIGNER] },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      expect(res.quotes).to.have.lengthOf(1);
+      expect(res.quotes[0].quoter.toLowerCase()).to.equal(
+        FEE_CONTRACT.toLowerCase(),
+      );
+    });
+
+    it('returns empty quotes when not authorized on any quoter', async () => {
+      const svc = createTestService({
+        derivedConfig: {
+          ...mockDerivedConfig,
+          hook: { ...mockDerivedConfig.hook, quoteSigners: [OTHER_SIGNER] },
+          tokenFee: {
+            ...mockDerivedConfig.tokenFee,
+            quoteSigners: [OTHER_SIGNER],
+          },
+        },
+      });
+
+      const res = await svc.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      expect(res.quotes).to.have.lengthOf(0);
+    });
+  });
+
+  it('throws for unknown origin', async () => {
+    const service = createTestService();
+    try {
+      await service.getQuote(
+        'unknown',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      expect.fail('Should have thrown');
+    } catch (e: any) {
+      expect(e.message).to.include('Unknown origin');
+    }
+  });
+
+  it('accepts EVM-like (Tron) origins for v1 quotes', async () => {
+    const logger = pino({ level: 'silent' });
+    const evm = EvmQuoteService.fromState({
+      signerKey: TEST_PRIVATE_KEY,
+      logger,
+      routes: [
+        {
+          origin: 'tron',
+          warpRouter: ROUTER,
+          chainId: 1,
+          quotedCallsAddress: QUOTED_CALLS,
+          feeToken: FEE_TOKEN,
+          derivedConfig: mockDerivedConfig as DerivedTokenRouterConfig,
+        },
+      ],
+    });
+    const service = new QuoteService({
+      services: new Map([[ProtocolType.Ethereum, evm]]),
+      protocolByChain: new Map([['tron', ProtocolType.Tron]]),
+      quoteMode: 'transient',
+      quoteExpiry: 300,
+      transientBuffer: 240,
+      multiProvider: mockMultiProvider,
+      logger,
+    });
+
+    const res = await service.getQuote(
+      'tron',
+      FeeQuotingCommand.TransferRemote,
+      ROUTER,
+      DESTINATION,
+      SALT,
+      RECIPIENT,
+    );
+    expect(res.quotes).to.be.an('array').with.lengthOf(2);
+  });
+
+  it('throws for unknown router', async () => {
+    const service = createTestService();
+    try {
+      await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        '0x9999999999999999999999999999999999999999',
+        DESTINATION,
+        SALT,
+        RECIPIENT,
+      );
+      expect.fail('Should have thrown');
+    } catch (e: any) {
+      expect(e.message).to.include('Unknown router');
+    }
+  });
+
+  it('throws without recipient for warp command', async () => {
+    const service = createTestService();
+    try {
+      await service.getQuote(
+        'ethereum',
+        FeeQuotingCommand.TransferRemote,
+        ROUTER,
+        DESTINATION,
+        SALT,
+      );
+      expect.fail('Should have thrown');
+    } catch (e: any) {
+      expect(e.message).to.include('recipient required');
+    }
+  });
+});

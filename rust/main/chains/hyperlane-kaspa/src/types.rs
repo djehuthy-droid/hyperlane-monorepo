@@ -280,7 +280,7 @@ pub struct TxOutput {
 /// Parse hex string to H256
 pub fn parse_h256(s: &str) -> Result<H256, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {}", e))?;
+    let bytes = hex::decode(s).map_err(|e| format!("invalid hex: {e}"))?;
     if bytes.len() != 32 {
         return Err(format!("expected 32 bytes, got {}", bytes.len()));
     }
@@ -302,5 +302,5 @@ pub fn parse_u256(s: &str) -> Result<U256, String> {
     }
     // Try parsing as hex
     let s = s.strip_prefix("0x").unwrap_or(s);
-    U256::from_str_radix(s, 16).map_err(|e| format!("invalid U256: {}", e))
+    U256::from_str_radix(s, 16).map_err(|e| format!("invalid U256: {e}"))
 }

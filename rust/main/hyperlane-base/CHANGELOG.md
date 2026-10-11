@@ -1,3 +1,42 @@
+## [2.3.0] - 2026-07-20
+
+* feat(tron): migrate Tron agents from gRPC to HTTP API (#8370)
+* feat: cache AWS KMS signer construction (#9030)
+* feat: enforce S3 checkpoint object size cap during download, not before (#9029)
+* feat: index same chain ccr swaps (#8796)
+* feat: relayer api (#8364)
+* feat: sealevel metaswaps reveals (#8930)
+* feat: static interval override for idle indexing and validator checkpoint polling (#8989)
+* feat: tron ccip support (#8849)
+* fix(agents): remove rusoto-based AWS region validation for signer config (#8670)
+* fix(agents): scale wallet balance metric by configured native token decimals (#9017)
+* fix: install explicit rustls CryptoProvider to fix TLS backend regression (#9001)
+* fix: process gas estimation for trusted relayer isms (#8457)
+* fix: skip scraper lookup for txHash (#8517)
+* refactor(evm): remove evm tron techstack (#8408)
+
+## [2.2.0] - 2026-03-09
+
+* chore: migrate spellchecker from codespell to typos (#8214)
+
+## [2.1.0] - 2026-03-04
+
+* feat(agents): add chain configuration metrics (#8185)
+* feat(tron): add ethereum compatibility & tron aws signer (#8222)
+* feat(tron): contract indexer (#7829)
+* feat(tron): isms (#7830)
+* feat(tron): lander (#7846)
+* feat(tron): mailbox (#7831)
+* feat(tron): merkle tree hook (#7833)
+* feat(tron): protocol type (#7827)
+* feat(tron): tron provider (#7828)
+* feat(tron): validator announce (#7832)
+* feat: Allow fetching aws signer keys with container provider (#7695)
+* feat: Set Lander as the default submitter for Aleo (#7741)
+* fix: Backward cursor handling single message (#7826)
+* fix: aleo metadata builder (#7954)
+* refactor(metrics): remove remote label from hyperlane_last_known_message_nonce (#7992)
+
 ## [2.0.0] - 2026-01-06
 
 * feat(rust): feature-gate Aleo chain support to reduce CI build times (#7569)
